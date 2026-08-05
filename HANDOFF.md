@@ -15,7 +15,12 @@
 minimal_agent.py            主程序：Agent Loop + REPL 多轮 + 记忆审查 + 工具系统
 approval.py                 危险命令审批：模式检测 + 会话/永久批准 + 交互提示（对齐 tools/approval.py）
 approval_allowlist.json     永久允许列表（已 gitignore，运行时生成）
+tool_dispatch.py            工具并行执行：批分段规划 + 并发执行 + 路径重叠检测（对齐 tool_dispatch_helpers.py）
+skills.py                   Skills：frontmatter 解析 + 发现 + 技能索引 + skills_list/skill_view（对齐 skills_tool.py）
+skills/                     示例技能包：weather-answer（播报规范）、release-check（发版清单），含 references/
 tests/test_approval.py      审批回归测试（零依赖，python tests/test_approval.py 直接跑）
+tests/test_tool_dispatch.py 并行执行回归测试（零依赖，python tests/test_tool_dispatch.py 直接跑）
+tests/test_skills.py        Skills 回归测试（零依赖，python tests/test_skills.py 直接跑）
 context_compressor.py       上下文压缩（阈值 50%、protect_last_n、交接摘要）
 memory_provider.py          MemoryProvider 抽象基类 + LLM 事实提取助手
 memory_manager.py           外部 provider 编排（加载/召回/同步/工具路由）
@@ -45,6 +50,16 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
    （删除/提权/SQL/git 破坏性操作/覆盖 .env 等）+ once/session/always/deny 交互选择 +
    会话级与永久级允许列表持久化（`approval_allowlist.json`，对齐 `tools/approval.py` 的
    DANGEROUS_PATTERNS / HARDLINE_PATTERNS / prompt_dangerous_approval / command_allowlist）
+9. **工具并行执行**：`tool_dispatch.py` 对齐 Hermes `agent/tool_dispatch_helpers.py` 的
+   `_plan_tool_batch_segments` + `agent/tool_executor.py` 的 `execute_tool_calls_segmented`；
+   只读工具（get_weather / session_search / memory_search / vector_search）并发，
+   memory / terminal 顺序屏障，路径重叠逻辑预留（读者↔读者可并行、含写者重叠关闭并行段），
+   结果按原始顺序回填；vector provider 本地嵌入懒加载已加锁保证线程安全
+10. **Skills（按需加载）**：`skills.py` + `skills/` 目录，对齐 Hermes 的渐进披露设计——
+    系统提示词只注入技能索引（name + description），`skills_list` 列元信息、
+    `skill_view` 加载 SKILL.md 全文或 references/ 子文件；frontmatter 零依赖解析
+    （BOM 剥离、引号、列表、platforms 平台过滤），名字/路径穿越校验防越界；
+    skill_view / skills_list 已加入并行白名单
 
 ## 运行方式
 
@@ -75,21 +90,28 @@ python minimal_agent.py --resume session-xxx
 - 审批流：deny 返回 BLOCKED 且不执行；session 记忆同类模式；always 写盘并重启后仍生效；
   terminal 安全命令正常执行（退出码 + 输出）
 - 回归测试脚本 `tests/test_approval.py`：41 条断言全过（检测/硬性禁止/审批分支/终端工具）
+- 回归测试脚本 `tests/test_tool_dispatch.py`：21 条断言全过（分段规划/整批可并行语义/
+  路径重叠/并发真实发生/结果顺序回填）+ 假 client 端到端冒烟（2 个只读工具并行峰值=2）
+- 回归测试脚本 `tests/test_skills.py`：28 条断言全过（frontmatter/BOM/平台过滤/发现/索引/
+  加载/路径穿越拒绝）+ 假 client 端到端冒烟（skill_view 加载后模型据此回答）
 
 ## 已知限制 / 下一步候选
 
-- 工具并行执行（对齐 `_should_parallelize_tool_batch`）
-- Skills（`SKILL.md` 按需加载）
 - `sync_turn` 是同步 LLM 调用（Hermes 用后台异步 + 节流）
 - 会话历史无清理策略（磁盘会增长，运维问题）
 - 审批增强：Smart Approval（辅助 LLM）/ 连续拒绝熔断 / 命令混淆检测（base64、$() 等）/
   cron 与 gateway 审批上下文（对齐 `tools/approval.py` 剩余部分）
 - 敏感文本脱敏（Hermes 用 `agent/redact.py`，审批面板与日志会显示原始命令）
+- 文件工具 + 敏感路径保护（对齐 `tools/file_tools.py` 的 `_check_sensitive_path`；
+  并行规划器的路径重叠接口已就绪，只等文件工具加入白名单）
+- 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）
+- Skills 增强：上下文压缩时的技能 prune/reinject、前置条件检查、技能 hub 同步
+  （Hermes 有，骨架简化掉了）
 
 ## 给新会话的起始指令（可直接粘贴）
 
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里：危险命令审批（已完成：`approval.py` + `terminal` 工具）。
-> 下一步候选：工具并行执行（对齐 `_should_parallelize_tool_batch`）。
+> 我们上次停在这里：Skills（已完成：`skills.py` + `skills/` 示例技能 + skills_list/skill_view）。
+> 下一步候选：文件工具 + 敏感路径保护（并行规划器路径重叠接口已就绪）。

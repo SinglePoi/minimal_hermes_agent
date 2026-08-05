@@ -45,6 +45,12 @@ from rich.panel import Panel
 from memory_manager import MemoryManager, build_memory_context_block, load_provider
 from context_compressor import compress_context, record_usage, should_compress
 from approval import check_dangerous_command
+from tool_dispatch import (
+    execute_tool_calls_segmented,
+    tool_arguments,
+    tool_name,
+)
+from skills import build_skills_index, skills_list, skill_view
 
 load_dotenv()
 
@@ -80,7 +86,9 @@ SYSTEM_PROMPT = """你是「小助手」，一个乐于助人的 AI 助手。
 6. 回答前优先使用已注入的上下文（项目上下文、记忆、召回的向量知识）——
    这些内容已经在你的上下文里，直接据此回答，不要为了"确认"而调用搜索工具。
 7. session_search 只搜"历史对话记录"（过去聊过什么），不包含记忆库和项目知识。
-   只有问题确实需要回忆某次具体对话的细节时，才调用它。"""
+   只有问题确实需要回忆某次具体对话的细节时，才调用它。
+8. 需要专业技能（如发版检查、话术规范）时：先用 skills_list 查看可用技能，
+   再用 skill_view 加载技能内容；技能内容加载进上下文后直接据此回答。"""
 
 
 def load_system_prompt() -> str:
@@ -188,6 +196,9 @@ def build_system_prompt(manager: MemoryManager | None = None) -> str:
     context_block = load_context_files()
     if context_block:
         prompt += "\n\n" + context_block
+    skills_block = build_skills_index()
+    if skills_block:
+        prompt += "\n\n" + skills_block
     for target in ("memory", "user"):
         block = render_memory_block(target, load_entries(target))
         if block:
@@ -556,6 +567,35 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "skills_list",
+            "description": (
+                "列出所有可用技能（名称 + 一句话描述，最小元数据）。"
+                "需要专业技能时先用它查看有什么，再用 skill_view 加载。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_view",
+            "description": (
+                "按需加载技能全文（SKILL.md 正文）或技能包内子文件（如 references/xxx.md）。"
+                "参数 name 是技能名，file_path 是技能目录内的相对路径（可省略）。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "技能名，如 weather-answer"},
+                    "file_path": {"type": "string", "description": "技能包内相对路径（可选）"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 
@@ -656,6 +696,13 @@ def run_tool(
             session_key=session_key,
             timeout=int(args.get("timeout", 120) or 120),
         )
+    if name == "skills_list":
+        return skills_list()
+    if name == "skill_view":
+        return skill_view(
+            name=args.get("name", ""),
+            file_path=args.get("file_path", ""),
+        )
     if manager is not None and manager.has_tool(name):
         # 外部 provider 自带工具（如 keyword 的 memory_search）
         return manager.handle_tool_call(name, args)
@@ -711,21 +758,37 @@ def run_agent_turn(
         if msg.tool_calls:
             # 模型要求调用工具：先把 assistant 消息（含 tool_calls）放回历史
             messages.append(msg.model_dump(exclude_none=True))
+            tool_calls = list(msg.tool_calls)
 
-            for tc in msg.tool_calls:
-                name = tc.function.name
-                args = json.loads(tc.function.arguments or "{}")
+            # 先按顺序展示模型要调用的工具（对齐 Hermes：调用开始即展示）
+            for tc in tool_calls:
+                name = tool_name(tc)
+                args = tool_arguments(tc) or {}
                 console.print(f"  [yellow]🔧 模型要调用工具：[/yellow]{name}({args})")
 
-                result = run_tool(name, args, manager, session_key)
-                console.print(f"  [green]📦 工具返回：[/green]{result}")
+            def run_one(tc) -> str:
+                """执行单个工具调用（parallel 段的工作线程也会调用它）。"""
+                name = tool_name(tc)
+                args = tool_arguments(tc) or {}
+                return run_tool(name, args, manager, session_key)
 
-                # 关键一步：把工具结果放回对话历史
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
+            def on_segment(kind: str, calls: list) -> None:
+                """每段执行前提示（对齐 Hermes 并发的"running N tools concurrently"）。"""
+                if kind == "parallel":
+                    console.print(f"  [dim]⚡ 并行执行 {len(calls)} 个工具[/dim]")
+
+            # 分段执行：parallel 并发 / sequential 串行，结果按原始顺序回填进 messages
+            tool_start = len(messages)
+            execute_tool_calls_segmented(
+                tool_calls,
+                messages,
+                run_one,
+                on_segment=on_segment,
+            )
+
+            # 按原始顺序回显工具返回（本段新增的 tool 消息正好一一对应）
+            for tool_msg in messages[tool_start:]:
+                console.print(f"  [green]📦 工具返回：[/green]{tool_msg['content']}")
 
             continue  # 回到循环开头，把结果再发给大模型
 

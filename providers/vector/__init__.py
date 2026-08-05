@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import threading
 import zlib
 from pathlib import Path
 
@@ -81,14 +82,19 @@ class LocalEmbedder:
 
     def __init__(self) -> None:
         self._model = None
+        self._load_lock = threading.Lock()
 
     def _load(self) -> None:
-        from sentence_transformers import SentenceTransformer
+        # 并行工具会多线程同时调 embed()：加锁 + 双重检查，避免重复加载模型
+        with self._load_lock:
+            if self._model is not None:
+                return
+            from sentence_transformers import SentenceTransformer
 
-        model_name = os.environ.get(
-            "EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2"
-        )
-        self._model = SentenceTransformer(model_name)
+            model_name = os.environ.get(
+                "EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2"
+            )
+            self._model = SentenceTransformer(model_name)
 
     def embed(self, text: str) -> list[float]:
         if self._model is None:

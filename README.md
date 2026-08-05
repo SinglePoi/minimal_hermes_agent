@@ -42,6 +42,14 @@
    - 危险模式检测（删除、提权、SQL DROP、git 破坏性操作、覆盖 `.env` 等）
    - 交互选择 once / session / always / deny，会话级与永久级允许列表持久化
    （对齐 Hermes 的 `tools/approval.py`）
+10. **工具并行执行**：同一轮里模型发多个工具调用时，按 Hermes 的规则切成
+    parallel / sequential 段——只读工具（get_weather / session_search / 记忆检索）并发跑，
+    memory / terminal 等有副作用的按顺序屏障执行，结果仍按原始顺序回填
+    （对齐 Hermes 的 `agent/tool_dispatch_helpers.py` + `agent/tool_executor.py`）
+11. **Skills（按需加载）**：技能放 `skills/<技能名>/SKILL.md`（frontmatter 含
+    name/description/platforms）；系统提示词只注入「技能索引」（名称 + 描述），
+    模型需要时用 `skills_list` 查看、`skill_view` 加载全文或 references/ 子文件
+    （对齐 Hermes 的 `agent/skill_utils.py` + `tools/skills_tool.py` 渐进披露设计）
 
 ## 你需要准备的
 
@@ -266,10 +274,52 @@ python minimal_agent.py
 
 ```powershell
 python tests/test_approval.py
+python tests/test_tool_dispatch.py
+python tests/test_skills.py
 ```
 
 覆盖危险/硬性模式检测、deny/session/always 审批分支、允许列表落盘重载、
-terminal 工具的执行与拦截。Windows 控制台无需手动设编码，脚本会自动切换 UTF-8。
+terminal 工具的执行与拦截；并行批分段、路径重叠、并发真实发生与结果顺序回填；
+Skills 的 frontmatter 解析、发现、索引、加载与路径安全。
+Windows 控制台无需手动设编码，脚本会自动切换 UTF-8。
+
+## 体验 Skills（按需加载）
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+python minimal_agent.py
+
+# 问：夜莺项目发版前要检查什么？
+# 模型会先 skills_list 看到 release-check，再 skill_view 加载检查清单回答
+```
+
+技能放在 `skills/<技能名>/SKILL.md`，头部 frontmatter：
+
+```text
+---
+name: release-check
+description: 夜莺项目发版前的检查清单与发布步骤。
+platforms: [windows, linux, macos]
+---
+```
+
+说明：索引只注入名称 + 描述，不占上下文；`skill_view` 可加载 SKILL.md 全文，
+也可加载技能包内的 references/templates/scripts 等子文件；声明的 platforms
+与当前系统不匹配的技能不会出现在索引里。
+
+## 体验工具并行执行
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+python minimal_agent.py
+
+# 一次问多个独立的事，模型会在一轮里发多个工具调用：
+# "查一下北京和上海的天气，再搜搜历史里有没有聊过产品评审会"
+# 输出里会出现：⚡ 并行执行 3 个工具
+```
+
+并行只发生在「只读、无共享状态」的工具之间；写记忆、执行命令的工具始终按顺序
+执行，保证 side effect 边界与全串行一致（对齐 Hermes 的分段规划器）。
 
 ## 与 Hermes 源码的对应关系
 
@@ -293,10 +343,14 @@ terminal 工具的执行与拦截。Windows 控制台无需手动设编码，脚
 | 危险命令审批 `approval.py` | `tools/approval.py`（DANGEROUS_PATTERNS、HARDLINE_PATTERNS、prompt_dangerous_approval） |
 | `terminal` 工具（先审批再执行） | `tools/terminal_tool.py`（check_all_command_guards + subprocess） |
 | 永久允许列表 `approval_allowlist.json` | `config.yaml` 的 `command_allowlist`（JSON 免去 YAML 依赖） |
+| 工具并行执行 `tool_dispatch.py` | `agent/tool_dispatch_helpers.py`（_plan_tool_batch_segments）+ `agent/tool_executor.py`（execute_tool_calls_segmented） |
+| Skills `skills.py` + `skills/` 目录 | `agent/skill_utils.py`（发现/frontmatter）+ `tools/skills_tool.py`（skills_list/skill_view）+ `agent/prompt_builder.py`（技能索引） |
 
 骨架简化掉了的工业级细节：文件锁、注入威胁扫描、外部漂移检测、可插拔 MemoryProvider、
 会话压缩后的 lineage 去重（压缩黑洞处理）、记忆主动 nudge、审批的 cron/gateway 上下文、
-Smart Approval（辅助 LLM 审批）与连续拒绝熔断、命令混淆检测——这些是后续深入源码时值得关注的点。
+Smart Approval（辅助 LLM 审批）与连续拒绝熔断、命令混淆检测、工具并行里的中断语义与
+turn 级 budget 收尾、Skills 的 hub/组织同步/插件命名空间/前置条件检查、压缩时的技能
+prune/reinject——这些是后续深入源码时值得关注的点。
 
 ## 加新工具
 
@@ -304,7 +358,8 @@ Smart Approval（辅助 LLM 审批）与连续拒绝熔断、命令混淆检测�
 
 ## 下一步可以加什么
 
-- 工具并行执行（对齐 Hermes 的 `_should_parallelize_tool_batch`）
-- Skills（`SKILL.md` 按需加载）
 - 审批增强：Smart Approval / 连续拒绝熔断 / 命令混淆检测（对齐 `tools/approval.py` 剩余部分）
 - `sync_turn` 异步化与节流（Hermes 用后台异步 + 节流）
+- 文件工具 + 敏感路径保护（对齐 `tools/file_tools.py` 的 `_check_sensitive_path`，
+  并行规划器里的路径重叠逻辑已预留好接口）
+- Skills 增强：上下文压缩时的技能 prune/reinject、前置条件检查（对齐 Hermes 剩余部分）
