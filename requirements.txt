@@ -1,3 +1,6 @@
 openai>=1.68.0
 python-dotenv>=1.0.0
 rich>=13.0.0
+
+# 本地语义向量检索（可选，按需启用）：pip install sentence-transformers
+# sentence-transformers>=3.0.0

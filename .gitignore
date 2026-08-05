@@ -1,2 +1,8 @@
 __pycache__/
-memory.json
+.env
+MEMORY.md
+USER.md
+sessions.db
+approval_allowlist.json
+providers/keyword/memory.json
+providers/vector/vectors.json

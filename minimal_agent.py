@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-最简单的 Agent 骨架（第二步：系统提示词 + 简单记忆）
+最简单的 Agent 骨架（第六步：多轮对话完整版）
 —— DeepSeek 版
 
 使用业内常用依赖：
@@ -16,16 +16,24 @@
     （可选）DEEPSEEK_BASE_URL=https://api.deepseek.com
     （可选）MODEL=deepseek-chat
 
-新增功能：
-    1. 系统提示词：集中管理角色/规则（也可用 SYSTEM_PROMPT.md 覆盖）
-    2. 简单记忆：对话结束后让模型提取值得记住的信息，存到 memory.json，
-       下次运行时自动注入系统提示词（跨会话学习）
+记忆设计参考 Hermes Agent（D:\\space\\hermes-agent-main）：
+    - 两个 Markdown 文件：MEMORY.md（自己学到的知识）、USER.md（用户画像）
+    - 条目之间用 "\\n§\\n" 分隔（对应 tools/memory_tool.py 的 ENTRY_DELIMITER）
+    - 模型在对话中主动调用 memory 工具写入（对应 Hermes 的 memory 工具）
+    - 对话结束再做一次"记忆审查"提取遗漏信息（对应 Hermes 的 turn-end review）
+    - AGENTS.md 项目上下文文件常驻注入（对应 Hermes 的 context files / context 层）
+    - 多轮对话：同一会话内连续问答，历史消息逐轮累积并增量落库；
+      --resume <session_id> 恢复历史会话（对应 Hermes CLI 会话循环 + /resume）
+    - 简化掉了：文件锁、注入威胁扫描、外部漂移检测、可插拔 MemoryProvider
 """
 
 import json
 import os
 import re
+import sqlite3
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +42,10 @@ from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
 
+from memory_manager import MemoryManager, build_memory_context_block, load_provider
+from context_compressor import compress_context, record_usage, should_compress
+from approval import check_dangerous_command
+
 load_dotenv()
 
 # ---------------- 配置 ----------------
@@ -41,98 +53,404 @@ API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 MODEL = os.environ.get("MODEL", "deepseek-chat")
 
-# 文件都放在脚本同目录，方便查看
 BASE_DIR = Path(__file__).parent
-MEMORY_FILE = BASE_DIR / "memory.json"
-MAX_MEMORIES = 50  # 记忆条数上限，防止无限增长
+
+# 记忆文件（Hermes 风格：两个 md 文件，条目用 § 分隔）
+MEMORY_FILE = BASE_DIR / "MEMORY.md"      # 自己学到的知识
+USER_FILE = BASE_DIR / "USER.md"          # 用户画像
+SESSION_DB = BASE_DIR / "sessions.db"     # 会话历史库（SQLite + FTS5 全文索引）
+ENTRY_DELIMITER = "\n§\n"
+CHAR_LIMIT = {"memory": 2200, "user": 1375}  # 字符上限，对齐 Hermes 默认值
 
 console = Console()
 
 
 # ---------------- 系统提示词 ----------------
-# 集中管理"你是谁、怎么做事、什么时候用工具"
 SYSTEM_PROMPT = """你是「小助手」，一个乐于助人的 AI 助手。
 
 ## 行为规则
 1. 回答要简洁、准确、友好。
 2. 需要实时信息（如天气）时，必须先调用 get_weather 工具，再基于工具结果回答。
 3. 不确定的信息要如实说明，不要编造。
-4. 如果用户提到了关于自己的信息（名字、偏好、习惯），在对话结束时我会帮你记住。"""
+4. 用户提到关于自己的信息（名字、偏好、习惯）时，用 memory 工具主动记下来：
+   - 用户个人信息 → memory(target=user, action=add, content=...)
+   - 你自己学到的知识 → memory(target=memory, action=add, content=...)
+5. 当记忆占用率接近上限时，用 memory(action=replace) 合并相关旧条目，
+   用 memory(action=remove) 删除不再需要的内容，保持记忆精简。
+6. 回答前优先使用已注入的上下文（项目上下文、记忆、召回的向量知识）——
+   这些内容已经在你的上下文里，直接据此回答，不要为了"确认"而调用搜索工具。
+7. session_search 只搜"历史对话记录"（过去聊过什么），不包含记忆库和项目知识。
+   只有问题确实需要回忆某次具体对话的细节时，才调用它。"""
 
 
 def load_system_prompt() -> str:
-    """优先读取同目录下的 SYSTEM_PROMPT.md（方便不改代码直接改人设），否则用内置的。"""
+    """优先读取同目录下的 SYSTEM_PROMPT.md（不改代码改人设），否则用内置的。"""
     prompt_file = BASE_DIR / "SYSTEM_PROMPT.md"
     if prompt_file.exists():
         return prompt_file.read_text(encoding="utf-8").strip()
     return SYSTEM_PROMPT
 
 
-# ---------------- 简单记忆 ----------------
-def load_memory() -> list[str]:
-    """从 memory.json 读取已记住的信息，没有则返回空列表。"""
-    if MEMORY_FILE.exists():
-        try:
-            data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
-            return [str(item) for item in data] if isinstance(data, list) else []
-        except Exception:
-            return []
-    return []
+# ---------------- 记忆存储（Hermes 风格） ----------------
+def _path_for(target: str) -> Path:
+    """target=user → USER.md，其余 → MEMORY.md。"""
+    return USER_FILE if target == "user" else MEMORY_FILE
 
 
-def save_memory(memory: list[str]) -> None:
-    """把记忆列表写回 memory.json。"""
-    MEMORY_FILE.write_text(
-        json.dumps(memory, ensure_ascii=False, indent=2), encoding="utf-8"
+def load_entries(target: str) -> list[str]:
+    """读取一个记忆文件，按 § 分隔解析成条目列表。"""
+    path = _path_for(target)
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8")
+        return [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
+    except Exception:
+        return []
+
+
+def save_entries(target: str, entries: list[str]) -> None:
+    """把条目列表写回文件（条目用 § 连接，和 Hermes 一致）。"""
+    _path_for(target).write_text(
+        ENTRY_DELIMITER.join(entries) + "\n", encoding="utf-8"
     )
 
 
-def build_system_prompt(memory: list[str]) -> str:
-    """组装系统提示词：基础人设 + 已记住的用户信息。"""
+def memory_tool(action: str, target: str, content: str, old_text: str = "") -> str:
+    """memory 工具的实现：add 新增 / replace 替换 / remove 删除。
+
+    对应 Hermes 的 tools/memory_tool.py：mid-session 写入立即落盘（durable）。
+    replace/remove 用 old_text 做子串定位（Hermes 也是"短唯一子串匹配"）。
+    """
+    target = "user" if target == "user" else "memory"
+    entries = load_entries(target)
+    added = False
+
+    if action == "add":
+        content = content.strip()
+        if content and content not in entries:
+            entries.append(content)
+            added = True
+    elif action == "replace":
+        if old_text:
+            entries = [content.strip() if old_text in e else e for e in entries]
+    elif action == "remove":
+        if old_text:
+            entries = [e for e in entries if old_text not in e]
+
+    # 字符上限保护：超出时从最旧的开始丢弃（Hermes 用 char limit 约束）
+    total = 0
+    kept: list[str] = []
+    for entry in reversed(entries):
+        if total + len(entry) + len(ENTRY_DELIMITER) > CHAR_LIMIT[target]:
+            continue
+        kept.insert(0, entry)
+        total += len(entry) + len(ENTRY_DELIMITER)
+
+    save_entries(target, kept)
+    current = sum(len(e) + len(ENTRY_DELIMITER) for e in kept)
+    limit = CHAR_LIMIT[target]
+    pct = min(100, int(current / limit * 100)) if limit > 0 else 0
+    return json.dumps(
+        {
+            "success": True,
+            "target": target,
+            "count": len(kept),
+            "added": added,
+            "usage": f"{pct}% — {current:,}/{limit:,} chars",
+        },
+        ensure_ascii=False,
+    )
+
+
+def render_memory_block(target: str, entries: list[str]) -> str:
+    """渲染带占用率的记忆块，对齐 Hermes 的 MemoryStore._render_block()。
+
+    头部展示当前占用百分比和字符数，让模型知道记忆快满、需要合并。
+    """
+    if not entries:
+        return ""
+    content = ENTRY_DELIMITER.join(entries)
+    current = len(content)
+    limit = CHAR_LIMIT[target]
+    pct = min(100, int(current / limit * 100)) if limit > 0 else 0
+    title = "用户画像" if target == "user" else "记忆（你学到的）"
+    return f"## {title} [{pct}% — {current:,}/{limit:,} chars]\n{content}"
+
+
+def build_system_prompt(manager: MemoryManager | None = None) -> str:
+    """组装系统提示词：基础人设 + 项目上下文（AGENTS.md）+ 记忆/用户画像 + 外部 provider。
+
+    对齐 Hermes 的 system_prompt.py 分层：stable（人设）→ context（context files）
+    → volatile（记忆快照 + USER.md）。
+    """
     prompt = load_system_prompt()
-    if memory:
-        facts = "\n".join(f"- {item}" for item in memory)
-        prompt += f"\n\n## 你记住的用户信息\n{facts}"
+    context_block = load_context_files()
+    if context_block:
+        prompt += "\n\n" + context_block
+    for target in ("memory", "user"):
+        block = render_memory_block(target, load_entries(target))
+        if block:
+            prompt += "\n\n" + block
+    if manager:
+        ext_block = manager.build_system_prompt()
+        if ext_block:
+            prompt += "\n\n" + ext_block
     return prompt
 
 
-def extract_memories(client: OpenAI, messages: list[dict[str, Any]]) -> list[str]:
-    """让模型从本次对话中提取"值得长期记住的用户信息"。
+def _covered_by(existing: list[str], fact: str) -> bool:
+    """新事实是否已被已有条目覆盖（子串重叠）——防止审查环节重复记入。"""
+    return any(fact in e or e in fact for e in existing)
 
-    返回 JSON 数组，例如 ["用户喜欢喝美式咖啡"]。
-    提取失败时返回空列表（不让记忆问题影响主流程）。
+
+CONTEXT_FILE_MAX_CHARS = 20_000  # 对齐 Hermes 的 CONTEXT_FILE_MAX_CHARS 下限
+
+
+def _truncate_context(content: str, filename: str) -> str:
+    """超长截断：保留头尾 + 中间省略标记（对齐 Hermes 的 _truncate_content）。"""
+    if len(content) <= CONTEXT_FILE_MAX_CHARS:
+        return content
+    head_chars = int(CONTEXT_FILE_MAX_CHARS * 0.6)
+    tail_chars = int(CONTEXT_FILE_MAX_CHARS * 0.4)
+    head = content[:head_chars]
+    tail = content[-tail_chars:]
+    marker = (
+        f"\n\n[...已截断 {filename}：保留前 {head_chars} + 后 {tail_chars} 字符，"
+        f"共 {len(content)} 字符。如需完整内容请查看文件 {filename}]\n\n"
+    )
+    return head + marker + tail
+
+
+def load_context_files() -> str:
+    """发现并加载项目上下文文件（AGENTS.md）。
+
+    对齐 Hermes：context files 扫描 TERMINAL_CWD 下的 AGENTS.md / .cursorrules 等，
+    注入系统提示词的 context 层（stable → context → volatile 的中间层）。
+    这里简化：扫描当前目录和脚本目录的 AGENTS.md。
     """
-    extract_prompt = (
-        "从上面的对话中，提取值得长期记住的用户信息（名字、偏好、身份、习惯等）。\n"
-        "不要提取一次性信息（例如某次查询的天气结果）。\n"
-        '只输出 JSON 字符串数组，例如：["用户喜欢喝美式咖啡"]。\n'
-        "如果没有值得记住的，输出 []。"
+    sections = []
+    seen: set[Path] = set()
+    for base in (Path.cwd(), BASE_DIR):
+        path = base / "AGENTS.md"
+        try:
+            resolved = path.resolve()
+        except Exception:
+            continue
+        if resolved in seen or not path.exists():
+            continue
+        seen.add(resolved)
+        content = path.read_text(encoding="utf-8")
+        sections.append(
+            f"## 项目上下文（{path.name}@{base.name}）\n{_truncate_context(content, path.name)}"
+        )
+    return "\n\n".join(sections)
+
+
+def _db_conn() -> sqlite3.Connection:
+    """打开会话数据库并建表（messages + FTS5 全文索引）。"""
+    conn = sqlite3.connect(SESSION_DB)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS messages ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "session_id TEXT NOT NULL,"
+        "role TEXT NOT NULL,"
+        "content TEXT NOT NULL,"
+        "created_at TEXT DEFAULT (datetime('now')))"
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(search_text)"
+    )
+    return conn
+
+
+def _search_tokens(text: str) -> list[str]:
+    """检索分词：英文按单词、中文按相邻双字（2-gram）。
+
+    对齐 Hermes 的 CJK tokenizer 思路——FTS5 默认 tokenizer 不切分中文，
+    Hermes 为此加载了原生 CJK 扩展，我们用 Python 侧 bigram 模拟。
+    """
+    tokens = []
+    for word in re.findall(r"[a-zA-Z0-9_]+", text.lower()):
+        tokens.append(word)
+    for run in re.findall(r"[\u4e00-\u9fff]+", text):
+        tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
+    return tokens
+
+
+def persist_messages(
+    session_id: str, messages: list[dict[str, Any]], start: int = 0
+) -> None:
+    """把（新增的）消息写入会话库。
+
+    对齐 Hermes：只索引 user/assistant 角色（默认 role 过滤），
+    搜索文本用 bigram 预分词后进 FTS5；start 用于多轮对话增量落库，
+    避免每一轮都把整段历史重复写入。
+    """
+    conn = _db_conn()
+    try:
+        for msg in messages[start:]:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role not in ("user", "assistant") or not content:
+                continue
+            if isinstance(content, list):  # 多模态 content 只取文本块
+                content = " ".join(
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            if role == "user":
+                # 持久化时剥离注入的 <memory-context> 召回围栏，保留干净内容
+                # （Hermes 用 api_content sidecar 实现同样的"干净存储"目标）
+                content = re.sub(
+                    r"\n*<memory-context>.*?</memory-context>", "", content, flags=re.S
+                ).strip()
+            if not content:
+                continue
+            cur = conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                (session_id, role, content),
+            )
+            conn.execute(
+                "INSERT INTO messages_fts (rowid, search_text) VALUES (?, ?)",
+                (cur.lastrowid, " ".join(_search_tokens(content))),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_session_history(session_id: str) -> list[dict[str, Any]]:
+    """从会话库加载历史消息，作为 conversation_history（对齐 Hermes 的 /resume）。"""
+    conn = _db_conn()
+    try:
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        return [{"role": r[0], "content": r[1]} for r in rows]
+    finally:
+        conn.close()
+
+
+def search_messages_db(query: str, limit: int = 10) -> list[dict[str, Any]]:
+    """FTS5 全文检索，BM25 相关性排序（对齐 Hermes 的 db.search_messages）。"""
+    tokens = _search_tokens(query)
+    if not tokens:
+        return []
+    match_expr = " ".join(tokens)  # FTS5 中空格 = AND
+    conn = _db_conn()
+    try:
+        rows = conn.execute(
+            """SELECT m.id, m.session_id, m.role, m.content
+               FROM messages_fts
+               JOIN messages m ON m.id = messages_fts.rowid
+               WHERE messages_fts MATCH ?
+               ORDER BY rank
+               LIMIT ?""",
+            (match_expr, limit),
+        ).fetchall()
+        return [
+            {"id": r[0], "session_id": r[1], "role": r[2], "content": r[3]}
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def _anchored_window(
+    conn: sqlite3.Connection, session_id: str, anchor_id: int, window: int = 3
+) -> list[dict[str, Any]]:
+    """返回命中消息前后各 window 条，作为上下文窗口（对齐 Hermes 的 get_anchored_view）。"""
+    rows = conn.execute(
+        """SELECT role, content FROM messages
+           WHERE session_id = ? AND id BETWEEN ? AND ?
+           ORDER BY id""",
+        (session_id, anchor_id - window, anchor_id + window),
+    ).fetchall()
+    return [{"role": r[0], "content": r[1]} for r in rows]
+
+
+def session_search_tool(query: str, limit: int = 3) -> str:
+    """session_search 工具：搜索历史会话，每个命中会话返回上下文窗口。"""
+    hits = search_messages_db(query, limit=max(limit * 5, 5))
+    conn = _db_conn()
+    try:
+        seen: set[str] = set()
+        results = []
+        for hit in hits:
+            sid = hit["session_id"]
+            if sid in seen:  # 每个会话只取最相关的一条命中
+                continue
+            seen.add(sid)
+            window = _anchored_window(conn, sid, hit["id"])
+            results.append({
+                "session_id": sid,
+                "matched": hit["content"][:100],
+                "window": [
+                    {"role": m["role"], "content": m["content"][:200]}
+                    for m in window
+                ],
+            })
+            if len(results) >= limit:
+                break
+    finally:
+        conn.close()
+    if not results:
+        return json.dumps(
+            {
+                "success": True,
+                "query": query,
+                "count": 0,
+                "results": [],
+                "message": (
+                    "未在历史对话记录中找到相关内容。"
+                    "注意：session_search 只覆盖对话记录；"
+                    "记忆、项目上下文和召回的知识请直接使用上下文中已有的信息。"
+                ),
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "success": True,
+            "query": query,
+            "count": len(results),
+            "results": results,
+        },
+        ensure_ascii=False,
+    )
+
+
+def review_memories(client: OpenAI, messages: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """对话结束后的记忆审查：让模型补提遗漏的长期信息。
+
+    对应 Hermes 的 turn-end review（MemoryManager.on_session_end / should_review_memory）。
+    输出 JSON：{"memory": [...], "user": [...]}，失败时返回空 dict，不影响主流程。
+    """
+    review_prompt = (
+        "根据上面的对话，补充提取值得长期记住的信息，只输出 JSON：\n"
+        '{"memory": ["自己学到的知识"], "user": ["用户个人信息"]}\n'
+        "要求：不要重复已记住的内容；不要一次性信息（如某次天气结果）；"
+        "没有则对应为空数组。"
     )
     try:
         resp = client.chat.completions.create(
             model=MODEL,
-            messages=messages + [{"role": "user", "content": extract_prompt}],
+            messages=messages + [{"role": "user", "content": review_prompt}],
             temperature=0,
         )
         text = resp.choices[0].message.content or ""
-        # 容错：去掉可能的 ```json 代码块包裹
-        match = re.search(r"\[.*\]", text, re.S)
-        data = json.loads(match.group(0)) if match else []
-        return [str(item).strip() for item in data if str(item).strip()]
+        match = re.search(r"\{.*\}", text, re.S)
+        data = json.loads(match.group(0)) if match else {}
+        return {
+            "memory": [str(x).strip() for x in data.get("memory", []) if str(x).strip()],
+            "user": [str(x).strip() for x in data.get("user", []) if str(x).strip()],
+        }
     except Exception as exc:
-        console.print(f"[dim]（记忆提取失败，已跳过：{exc}）[/dim]")
-        return []
-
-
-def merge_memories(existing: list[str], new: list[str]) -> list[str]:
-    """合并新旧记忆：去掉重复，超限时只保留最新的。"""
-    seen = set(existing)
-    merged = list(existing)
-    for item in new:
-        if item not in seen:
-            seen.add(item)
-            merged.append(item)
-    return merged[-MAX_MEMORIES:]
+        console.print(f"[dim]（记忆审查失败，已跳过：{exc}）[/dim]")
+        return {}
 
 
 # ---------------- 第 1 步：调用大模型 ----------------
@@ -148,6 +466,11 @@ def call_llm(client: OpenAI, messages: list[dict[str, Any]], tools: list[dict[st
         messages=messages,
         tools=tools,
     )
+    # 记录真实 token 用量，供上下文压缩判断（对齐 Hermes：优先用 API 真实值）
+    try:
+        record_usage(response.usage.prompt_tokens)
+    except Exception:
+        pass
     return response.choices[0].message
 
 
@@ -158,7 +481,7 @@ def get_weather(city: str) -> str:
     return fake.get(city, f"{city}：暂无数据，建议看天气预报网站")
 
 
-# 工具清单：这就是告诉模型"你有哪些工具可用"的说明书
+# 工具清单：get_weather 查天气，memory 写记忆（Hermes 的 memory 工具）
 TOOLS = [
     {
         "type": "function",
@@ -173,50 +496,217 @@ TOOLS = [
                 "required": ["city"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory",
+            "description": (
+                "写入或更新长期记忆。target=memory 表示你自己学到的知识；"
+                "target=user 表示用户的个人信息。action=add 新增，"
+                "action=replace 用 old_text 定位后替换，action=remove 用 old_text 定位后删除。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["add", "replace", "remove"]},
+                    "target": {"type": "string", "enum": ["memory", "user"]},
+                    "content": {"type": "string", "description": "要写入的完整内容"},
+                    "old_text": {"type": "string", "description": "replace/remove 时定位的原文片段"},
+                },
+                "required": ["action", "target", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "session_search",
+            "description": (
+                "搜索历史对话记录（仅覆盖过去聊过的内容，不含记忆库/项目知识/召回）。"
+                "当需要回忆某次具体对话说过什么、做过什么时才使用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词，例如：产品评审会"},
+                    "limit": {"type": "integer", "description": "最多返回几个会话的上下文（默认 3）"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal",
+            "description": (
+                "在本地机器上执行一条 shell 命令（Windows 下为系统默认 shell cmd；"
+                "PowerShell 专属命令请写成 powershell -Command \"...\"）。"
+                "危险命令（删除、格式化、关机、SQL DROP 等）会先征求用户批准；"
+                "返回 JSON，含 exit_code 与 output。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "要执行的完整命令"},
+                    "timeout": {"type": "integer", "description": "最长等待秒数（默认 120）"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
 ]
 
 
-def run_tool(name: str, args: dict[str, Any]) -> str:
+def run_terminal(command: str, session_key: str, timeout: int = 120) -> str:
+    """执行本地 shell 命令：先过审批门卫，再运行（对齐 Hermes terminal_tool）。
+
+    审批逻辑在 approval.check_dangerous_command()：危险命令需用户批准
+    （once/session/always/deny），拒绝或超时返回 BLOCKED 消息且不执行。
+    返回结构与 Hermes terminal_tool 一致：JSON 的 output / exit_code / error 字段，
+    用户批准过则附带 approval 说明。
+    """
+    approval = check_dangerous_command(command, session_key)
+    if not approval.get("approved"):
+        console.print(
+            Panel(
+                f"[red]{approval.get('message', '命令未获批准')}[/red]",
+                title="🚫 命令被阻止",
+                border_style="red",
+            )
+        )
+        return json.dumps(
+            {
+                "success": False,
+                "exit_code": -1,
+                "output": "",
+                "error": approval.get("message", "命令未获批准"),
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            errors="replace",
+        )
+        payload: dict[str, Any] = {
+            "success": result.returncode == 0,
+            "exit_code": result.returncode,
+            "output": (result.stdout or "").strip(),
+            "stderr": (result.stderr or "").strip(),
+        }
+        if approval.get("user_approved"):
+            payload["approval"] = (
+                f"Command required approval ({approval.get('description', 'flagged')}) "
+                "and was approved by the user."
+            )
+        return json.dumps(payload, ensure_ascii=False)
+    except subprocess.TimeoutExpired:
+        return json.dumps(
+            {
+                "success": False,
+                "exit_code": -1,
+                "output": "",
+                "error": f"命令超时（>{timeout}s），已终止等待",
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "exit_code": -1,
+                "output": "",
+                "error": f"执行失败：{exc}",
+            },
+            ensure_ascii=False,
+        )
+
+
+def run_tool(
+    name: str,
+    args: dict[str, Any],
+    manager: MemoryManager | None = None,
+    session_key: str = "",
+) -> str:
     """根据工具名找到对应函数并执行。以后加新工具就在这里加一行。"""
     if name == "get_weather":
         return get_weather(args.get("city", ""))
+    if name == "memory":
+        return memory_tool(
+            action=args.get("action", ""),
+            target=args.get("target", "memory"),
+            content=args.get("content", ""),
+            old_text=args.get("old_text", ""),
+        )
+    if name == "session_search":
+        return session_search_tool(
+            query=args.get("query", ""),
+            limit=int(args.get("limit", 3) or 3),
+        )
+    if name == "terminal":
+        return run_terminal(
+            command=args.get("command", ""),
+            session_key=session_key,
+            timeout=int(args.get("timeout", 120) or 120),
+        )
+    if manager is not None and manager.has_tool(name):
+        # 外部 provider 自带工具（如 keyword 的 memory_search）
+        return manager.handle_tool_call(name, args)
     return f"未知工具：{name}"
 
 
+def get_tools(manager: MemoryManager | None = None) -> list[dict[str, Any]]:
+    """核心工具 + 外部 provider 自带工具（对齐 Hermes：TOOLS + get_all_tool_schemas）。"""
+    tools: list[dict[str, Any]] = list(TOOLS)
+    if manager:
+        tools.extend(manager.get_all_tool_schemas())
+    return tools
+
+
 # ---------------- 主循环：Agent Loop ----------------
-def main():
-    if not API_KEY:
-        console.print(
-            "[red]❌ 请先设置 DEEPSEEK_API_KEY[/red]\n"
-            '  PowerShell: [cyan]$env:DEEPSEEK_API_KEY="你的key"[/cyan]\n'
-            "  或在项目根目录创建 .env 文件，参考 README.md"
-        )
-        return
+def show_current_memory() -> None:
+    """启动时展示当前记忆，让用户看到"它记得什么"。"""
+    lines = []
+    for target, title in (("user", "👤 用户画像"), ("memory", "🧠 记忆")):
+        entries = load_entries(target)
+        if entries:
+            lines.append(f"[bold]{title}[/bold]")
+            lines.extend(f"- {e}" for e in entries)
+    if lines:
+        console.print(Panel("\n".join(lines), title="📖 已记住的信息", border_style="yellow"))
 
-    # 支持两种输入方式：命令行参数 或 交互输入
-    user_input = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else console.input("[bold]你说：[/bold] ")
-    if not user_input.strip():
-        console.print("[yellow]没有输入内容。[/yellow]")
-        return
 
-    client = create_client()
+def run_agent_turn(
+    client: OpenAI,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    manager: MemoryManager | None = None,
+    session_key: str = "",
+) -> None:
+    """执行一轮对话：模型 + 工具循环，直到模型给出最终回答。
 
-    # 加载记忆并注入系统提示词（跨会话"记得你"的关键）
-    memory = load_memory()
-    if memory:
-        console.print(Panel("\n".join(f"- {m}" for m in memory), title="🧠 已记住的信息", border_style="yellow"))
-
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": build_system_prompt(memory)},
-        {"role": "user", "content": user_input},
-    ]
-
+    对应 Hermes 的 run_conversation()——一次用户输入驱动整个 while 循环。
+    最终回答也会写回 messages（多轮对话依赖它）。
+    """
     max_turns = 5  # 最大轮数：防止模型无限调工具
 
     for turn in range(max_turns):
+        # 预检压缩：上下文超过阈值 → 中间轮次摘要化（对齐 Hermes 的 preflight compression）
+        if should_compress(messages):
+            compressed = compress_context(client, messages)
+            if compressed is not messages:
+                messages[:] = compressed
+                console.print("[dim]🗜️ 上下文已压缩：中间轮次 → 摘要[/dim]")
+
         console.print(f"\n[bold blue]--- 第 {turn + 1} 轮：调用大模型 ---[/bold blue]")
-        msg = call_llm(client, messages, TOOLS)
+        msg = call_llm(client, messages, tools)
 
         if msg.tool_calls:
             # 模型要求调用工具：先把 assistant 消息（含 tool_calls）放回历史
@@ -227,7 +717,7 @@ def main():
                 args = json.loads(tc.function.arguments or "{}")
                 console.print(f"  [yellow]🔧 模型要调用工具：[/yellow]{name}({args})")
 
-                result = run_tool(name, args)
+                result = run_tool(name, args, manager, session_key)
                 console.print(f"  [green]📦 工具返回：[/green]{result}")
 
                 # 关键一步：把工具结果放回对话历史
@@ -239,20 +729,144 @@ def main():
 
             continue  # 回到循环开头，把结果再发给大模型
 
-        # 模型直接给了文字回答 → 输出并结束
+        # 模型直接给了文字回答 → 写回历史并输出
+        messages.append({"role": "assistant", "content": msg.content or ""})
         console.print()
         console.print(Panel(msg.content or "", title="🤖 助手", border_style="green"))
-        break
-    else:
-        console.print("\n[yellow]（达到最大轮数，循环结束）[/yellow]")
+        return
 
-    # 对话结束后：提取新记忆 → 合并 → 保存（这就是"学习闭环"）
-    new_facts = extract_memories(client, messages)
-    if new_facts:
-        merged = merge_memories(memory, new_facts)
-        if merged != memory:
-            save_memory(merged)
-            console.print(Panel("\n".join(f"+ {m}" for m in new_facts), title="🧠 本次新记住", border_style="cyan"))
+    console.print("\n[yellow]（达到最大轮数，循环结束）[/yellow]")
+
+
+def review_memory_turn(client: OpenAI, messages: list[dict[str, Any]]) -> None:
+    """记忆审查：从对话中补提遗漏信息，写入 MEMORY.md / USER.md。
+
+    对应 Hermes 的 turn-end review / 周期性 memory nudge。
+    """
+    review = review_memories(client, messages)
+    for target in ("memory", "user"):
+        existing = load_entries(target)
+        new_facts = [f for f in review.get(target, []) if not _covered_by(existing, f)]
+        added = []
+        for fact in new_facts:
+            result = json.loads(memory_tool("add", target, fact))
+            if result.get("added"):
+                added.append(fact)
+        if added:
+            title = "🧠 本次新记住（记忆）" if target == "memory" else "👤 本次新记住（用户）"
+            console.print(Panel("\n".join(f"+ {f}" for f in added), title=title, border_style="cyan"))
+
+
+def main():
+    if not API_KEY:
+        console.print(
+            "[red]❌ 请先设置 DEEPSEEK_API_KEY[/red]\n"
+            '  PowerShell: [cyan]$env:DEEPSEEK_API_KEY="你的key"[/cyan]\n'
+            "  或在项目根目录创建 .env 文件，参考 README.md"
+        )
+        return
+
+    client = create_client()
+
+    # 命令行参数：--resume <session_id> [一次性问题]；否则进入交互多轮对话
+    args = sys.argv[1:]
+    resume_id = None
+    one_shot = None
+    if args and args[0] == "--resume":
+        resume_id = args[1] if len(args) > 1 else None
+        one_shot = " ".join(args[2:]) if len(args) > 2 else None
+    elif args:
+        one_shot = " ".join(args)
+    # 一次性问题模式：答完即退出（对齐 Hermes CLI：hermes chat "问题" 单轮退出）
+    one_shot_mode = one_shot is not None
+
+    session_id = resume_id or time.strftime("session-%Y%m%d-%H%M%S")
+    show_current_memory()
+
+    # 外部记忆 provider（可选）：环境变量 MEMORY_PROVIDER=keyword
+    # 对齐 Hermes 的 memory.provider 配置——同时只激活一个外部 provider
+    memory_manager = None
+    provider_name = os.environ.get("MEMORY_PROVIDER", "").strip()
+    if provider_name:
+        try:
+            provider = load_provider(provider_name)
+            if provider.is_available():
+                provider.initialize(session_id=session_id)
+                memory_manager = MemoryManager()
+                memory_manager.add_provider(provider)
+                console.print(f"[dim]🔌 外部记忆 provider：{provider.name}[/dim]")
+            else:
+                console.print(f"[yellow]⚠️ provider {provider_name} 不可用[/yellow]")
+        except Exception as exc:
+            console.print(f"[yellow]⚠️ 加载 provider {provider_name} 失败：{exc}[/yellow]")
+
+    # 恢复历史会话（对齐 Hermes 的 /resume：加载 conversation_history）
+    messages: list[dict[str, Any]] = []
+    if resume_id:
+        history = load_session_history(session_id)
+        if history:
+            console.print(f"[dim]↩️ 已恢复会话 {session_id}（{len(history)} 条历史消息）[/dim]")
+            messages = history
+        else:
+            console.print(f"[yellow]⚠️ 未找到会话 {session_id}，将创建新会话[/yellow]")
+    persisted_count = len(messages)  # 已落库的消息数，增量写入从这里开始
+    tools = get_tools(memory_manager)  # 核心工具 + provider 自带工具
+
+    turn_count = 0
+    while True:
+        if one_shot is not None:
+            user_input = one_shot
+            one_shot = None  # 一次性参数用完后进入交互模式
+        else:
+            try:
+                user_input = console.input("\n[bold]你说（输入 退出 结束）：[/bold] ").strip()
+            except EOFError:  # stdin 结束（如管道输入完毕）
+                break
+        if not user_input:
+            continue
+        if user_input in ("退出", "exit", "quit", "/exit"):
+            break
+
+        turn_count += 1
+
+        # 每轮 prefetch：外部 provider 按当前问题召回（对齐 Hermes 每轮 prefetch_all）
+        user_content = user_input
+        if memory_manager:
+            ext_context = memory_manager.prefetch_all(user_input, session_id=session_id)
+            if ext_context:
+                user_content += "\n\n" + build_memory_context_block(ext_context)
+                console.print(Panel(ext_context[:300], title="🔌 外部记忆召回", border_style="magenta"))
+
+        if not messages:
+            messages.append({"role": "system", "content": build_system_prompt(memory_manager)})
+        messages.append({"role": "user", "content": user_content})
+
+        console.print(f"[dim]📚 会话：{session_id}[/dim]")
+        run_agent_turn(client, messages, tools, memory_manager, session_id)
+
+        # 增量落库（对齐 Hermes：消息逐轮写入 SessionDB，中途退出也不丢）
+        persist_messages(session_id, messages, start=persisted_count)
+        persisted_count = len(messages)
+
+        # 同步本轮对话给外部 provider（对齐 Hermes 的 sync_all）
+        if memory_manager:
+            last = messages[-1] if messages else {}
+            assistant_text = last.get("content", "") if last.get("role") == "assistant" else ""
+            memory_manager.sync_all(
+                user_input, assistant_text, messages=messages, client=client
+            )
+
+        # 记忆审查：每 3 轮一次（对齐 Hermes 的 nudge_interval 概念）
+        if turn_count % 3 == 0:
+            review_memory_turn(client, messages)
+
+        if one_shot_mode:
+            break  # 一次性问题已答完，退出
+
+    # 会话结束：最后一次记忆审查 + 提示如何恢复
+    if turn_count % 3 != 0:
+        review_memory_turn(client, messages)
+    console.print(f"\n[dim]会话已保存。下次用 --resume {session_id} 继续对话。[/dim]")
 
 
 if __name__ == "__main__":
