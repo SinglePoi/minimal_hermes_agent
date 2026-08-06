@@ -123,13 +123,23 @@ DANGEROUS_PATTERNS = [
     (r"\brm\s+(-[^\s]*\s+)*/", "delete in root path"),
     (r"\brm\s+-[^\s]*r", "recursive delete"),
     (r"\brm\s+--recursive\b", "recursive delete (long flag)"),
-    # Windows shell 的破坏性内置命令（仅在经由 cmd/powershell 执行时触发，
-    # 避免普通文本里的 "del"/"rd" 误报）
+    # Windows shell 的破坏性内置命令（经由 cmd/powershell 显式前缀执行时触发）
     (r"\bcmd(?:\.exe)?\s+/(?:c|k)\s+.*\b(?:del|erase|rd|rmdir)\b",
      "Windows cmd destructive delete"),
     (r"\b(?:powershell|pwsh)(?:\.exe)?\b(?:\s+-\S+)*\s+"
      r"(?:-(?:command|c)\s+)?[\"']?(?:remove-item|rmdir|erase|del|rd|ri|rm)\b",
      "Windows PowerShell destructive delete"),
+    # Windows/POSIX 裸命令的破坏性删除（不经 cmd /c 或 powershell 前缀）——
+    # Hermes 只拦显式前缀形式，模型用 `rmdir /s /q`、`rd /s /q`、`del /s`、
+    # 裸 `Remove-Item`、`rm file` 即可绕过审批直接删文件/目录；
+    # 骨架按用户要求补上裸命令拦截（有意超出 Hermes 模式表，属安全加固）。
+    # 锚定在命令起始或分隔符后，避免普通文本里的 "del"/"rd"/"rm" 字样误报。
+    (r"(?:^|[;&|`\n])\s*(?:rmdir|rd|rm)\b[^\n]*",
+     "delete command (bare form)"),
+    (r"(?:^|[;&|`\n])\s*(?:del|erase)\b[^\n]*",
+     "Windows del/erase delete (bare form)"),
+    (r"(?:^|[;&|`\n])\s*(?:remove-item|ri)\b[^\n]*",
+     "PowerShell Remove-Item delete (bare form)"),
     (r"\b(?:powershell|pwsh)(?:\.exe)?\b.*\s-(?:encodedcommand|enc|e)\b",
      "PowerShell encoded command execution"),
     # ---- 权限 ----

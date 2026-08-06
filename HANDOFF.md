@@ -117,6 +117,9 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     0 禁用），人工批准重置；DANGEROUS_PATTERNS 新增 base64|bash、eval $(curl)、
     openssl 解码、heredoc 等混淆检测；LLM client 已串进 run_tool → run_terminal
     → check_dangerous_command
+    另：Windows 裸命令删除加固——rmdir/rd/del/erase/Remove-Item/ri/rm 裸写
+    （锚定命令起始）进危险清单；Hermes 只拦 cmd /c 与 powershell 前缀，此为
+    有意超出 Hermes 的安全加固（修复"模型用 rmdir 绕过审批删目录"的实际问题）
 15. **记忆同步异步化 + 合并节流**：`memory_manager.py` 新增 SyncWorker——
     sync_all 丢给单线程后台 worker 立即返回（对齐 Hermes：慢 provider 不阻塞对话结尾，
     案例：Hindsight daemon 曾阻塞 298s）；串行执行保证第 N 轮先于第 N+1 轮；

@@ -371,8 +371,10 @@ python minimal_agent.py
 硬性禁止的命令（如 `rm -rf /`、`shutdown`）没有批准选项，直接拒绝执行。
 
 > 说明：Windows 下 `terminal` 走系统默认 shell（cmd）。PowerShell 专属命令请显式写成
-> `powershell -Command "..."`——这正是审批模式覆盖的形态（`Remove-Item`、
-> `-EncodedCommand` 等单独裸写不会被当作危险命令，与 Hermes 行为一致）。
+> `powershell -Command "..."`。裸写删除命令（`rmdir` / `rd` / `del` / `erase` /
+> `Remove-Item` / `ri` / `rm`，锚定在命令起始）也已纳入危险清单——Hermes 只拦
+> `cmd /c` 与 `powershell` 前缀形式，本骨架按用户要求补上了裸命令拦截（安全加固，
+> 有意超出 Hermes 模式表）；`-EncodedCommand` 等混淆形式同样拦截。
 
 ## 跑回归测试
 

@@ -63,6 +63,17 @@ def test_dangerous_detection() -> None:
         ("echo x > .env", True),
         ('powershell -Command "Remove-Item -Recurse C:\\temp\\old"', True),
         ("cmd /c del /f /q C:\\temp\\old", True),
+        # 裸命令删除（不经 cmd /c 或 powershell 前缀）也必须拦截
+        ("rmdir /s /q build", True),
+        ("rd /s /q build", True),
+        ("rmdir build", True),
+        ("del /f /q C:\\temp\\old", True),
+        ("Remove-Item -Recurse -Force build", True),
+        ("rm build", True),
+        # 普通文本里的 del/rd/rm 字样不误报（锚定在命令起始）
+        ("echo del build", False),
+        ("echo rd /s /q build", False),
+        ("type del.txt", False),
         ("sudo -S whoami", True),
         ("echo hello", False),
         ("Get-Date", False),
