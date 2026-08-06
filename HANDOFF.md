@@ -49,7 +49,9 @@ tests/test_approval_deny.py   用户 deny 规则回归测试（零依赖，pytho
 tests/test_tirith.py          内容级扫描回归测试（零依赖，python tests/test_tirith.py 直接跑）
 tests/test_gateway_approval.py 网关审批队列回归测试（零依赖，python tests/test_gateway_approval.py 直接跑）
 tests/test_server.py          HTTP 服务化回归测试（零依赖，python tests/test_server.py 直接跑）
-server.py                    HTTP 服务化：/chat + /approvals/pending + /approvals/resolve + /health（零新依赖）
+server.py                    HTTP 服务化：/chat + /chat/stream(SSE) + /approvals/* +
+                             /sessions* + /skills /plugins /tools + 静态托管 web/（零新依赖）
+web/                         前端静态站点（原生 HTML/CSS/JS，零构建）：index.html + app.js + style.css
 context_compressor.py       上下文压缩（阈值 50%、protect_last_n、交接摘要）
 memory_provider.py          MemoryProvider 抽象基类 + LLM 事实提取助手
 memory_manager.py           外部 provider 编排（加载/召回/同步/工具路由）
@@ -183,6 +185,9 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     - 过程活动展示：run_agent_turn/process_turn 新增 events 参数，/chat 响应带
       events（tool/skill/source 三类，参数经 redact 脱敏、结果截断 300 字符），
       前端在消息间渲染活动条目、点击展开详情；外部记忆召回也作为 source 事件
+    - 思考过程回显：每轮模型调用前发 think 事件（"第 N 轮思考"），若模型暴露
+      reasoning_content（如 deepseek-reasoner）则附推理文本（截断 + 脱敏）；
+      deepseek-chat 不返回推理内容，只显示轮次标签
     - SSE 流式：call_llm_stream 累积流式 content/tool_calls/reasoning_content，
       POST /chat/stream 实时推送 activity/token/message/error/done
       （Connection: close 结束，注意别发 keep-alive 否则 http.server 不关连接）；
@@ -223,7 +228,7 @@ python minimal_agent.py "这个项目是做什么的？"
 python minimal_agent.py
 # 恢复会话
 python minimal_agent.py --resume session-xxx
-# HTTP 服务化（/chat + 审批轮询/resolve）
+# HTTP 服务化（/chat + /chat/stream 流式 + 审批轮询/resolve）
 python server.py                    # 默认 127.0.0.1:8000；浏览器打开 http://127.0.0.1:8000/
                                     # 即进入 Web 页面（对话 + 审批按钮）；端点见 README
 # 文件工具离线可视化演示
@@ -234,7 +239,8 @@ python demo_file_tools.py
 - 常用开关：`MEMORY_PROVIDER=vector`（语义召回）、`CONTEXT_WINDOW`、`PROTECT_LAST_N`
 - Windows 中文乱码先设 `$env:PYTHONIOENCODING="utf-8"`
 - 本机测试可用内置 Python：`C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`
-- ⚠️ 当前工作树有大量未提交改动（整个骨架从零开始累积），新会话先看 `git status`
+- 提交策略：由用户手动提交；最近一次提交 `0c7ff4f`（前端完整版 + 过程活动/思考回显 + SSE）
+  之后工作树干净，新会话先看 `git status`
 
 ## 已验证的测试
 
@@ -293,8 +299,9 @@ python demo_file_tools.py
   管道检测、开关与 fail-open、审批集成含 off 旁路）
 - 回归测试脚本 `tests/test_gateway_approval.py`：11 条断言全过（阻塞/唤醒/FIFO/
   超时失败关闭/理由传递/session 持久化/unregister 唤醒为拒绝）
-- 回归测试脚本 `tests/test_server.py`：9 条断言全过（health/pending 空与有挂起/
-  resolve 唤醒阻塞线程/chat 正常对话与 400 校验）
+- 回归测试脚本 `tests/test_server.py`：断言全过（health/pending/resolve/chat 400、
+  静态端点与路径穿越、会话列表与历史、归档含 archived_only、技能/插件/工具列表、
+  过程事件含思考推理与工具结果、SSE 流式 activity/token/message/done 全链路）
 - 回归测试脚本 `tests/test_file_tools.py` 新增 patch 组：唯一替换/多次报错/replace_all/
   已应用 no-change/.env 拒绝/CRLF 保留（修复了 Windows write_text 双换行 bug）；
   并行测试补 patch+write 同路径顺序、不同路径并行
@@ -303,8 +310,13 @@ python demo_file_tools.py
 
 - 审批增强已完成（smart/熔断/混淆/deny/tirith）；剩余仅 cron 审批上下文
   （`approvals.cron_mode`，对齐 `tools/approval.py` 剩余部分）
-- 前端页面已完成（对话 + 审批轮询/按钮 + 侧栏会话列表/新对话入口）；剩余服务增强：
-  SSE 流式响应 / 请求鉴权（token）（Hermes web/ 有完整 dashboard，骨架只做最小聊天页）
+- 前端 + 流式已完成（对话/审批/会话列表/归档/插件技能工具视图/过程活动/思考回显/SSE）；
+  剩余服务增强：请求鉴权（token）、操作审计落库、会话删除/标题/fork
+  （Hermes web/ 有完整 dashboard，骨架只做最小聊天页）
+- 思考内容回显依赖模型暴露 reasoning_content（deepseek-chat 无）；SSE 响应必须
+  Connection: close（keep-alive 会导致 http.server 不关连接）
+- ⚠️ `__pycache__/minimal_agent.cpython-312.pyc` 被 git 跟踪（.gitignore 已含
+  __pycache__/ 但对已跟踪文件无效），建议 `git rm --cached` 一次
 - 文件工具简化：patch 只做 replace 模式（无 V4A 补丁头/模糊匹配/语法检查），
   无陈旧检测/文件锁、无文档抽取；
   搜索仍跳过敏感文件（Hermes 也过滤敏感路径的搜索结果）
@@ -315,8 +327,13 @@ python demo_file_tools.py
 
 ## 下一阶段（前端 / 服务增强）
 
-- 服务增强：SSE 流式响应 / 请求鉴权（token）（会话列表管理已完成）
+- 服务增强：请求鉴权（token）/ 操作审计落库 / 会话删除、标题与 fork（对齐 Hermes
+  api_server 的 DELETE /api/sessions 与 /fork）
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
+- 文件工具增强：V4A patch 头/模糊匹配/语法检查、陈旧检测/文件锁、文档抽取
+- 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有）
+- Skills 增强：前置条件检查、技能 hub 同步
+- 脱敏专项：URL 查询参数、手机号、DB 连接串
 - 运维：服务化下的日志、进程守护（Hermes 用 systemd/gateway daemon）
 
 ## 给新会话的起始指令（可直接粘贴）
@@ -324,6 +341,7 @@ python demo_file_tools.py
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里：前端 Web 页面（已完成：server.py 托管 web/ 静态站点 +
-  对话面板 + 审批轮询/按钮 + allow_permanent 暴露 + 会话串行锁；全套测试通过）。
-> 下一步候选：服务增强（SSE 流式 / 鉴权 / 会话列表）或 cron 审批上下文。
+> 我们上次停在这里：前端完整版 + 过程活动/思考回显 + SSE 流式全部完成
+  （提交 `0c7ff4f`，工作树干净；提交由用户手动进行）。
+> 下一步候选：请求鉴权 / 操作审计落库 / 会话删除与 fork / cron 审批 /
+  文件工具增强 / 运维日志与进程守护。

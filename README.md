@@ -574,6 +574,11 @@ prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取、patch �
 
 ## 下一步可以加什么
 
-- 服务增强：SSE 流式响应 / 请求鉴权（token）（会话列表管理已完成）
+- 服务增强：请求鉴权（token）/ 操作审计落库 / 会话删除、标题与 fork
+  （SSE 流式与会话列表已完成）
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
+- 文件工具增强：V4A patch 头/模糊匹配/语法检查、陈旧检测/文件锁、文档抽取
 - 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）
+- Skills 增强：前置条件检查、技能 hub 同步
+- 脱敏专项：URL 查询参数、手机号、DB 连接串
+- 运维：服务化下的日志、进程守护
