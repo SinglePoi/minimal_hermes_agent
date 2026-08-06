@@ -115,9 +115,26 @@
     - 对话：`POST /chat` 发消息、渲染 Markdown 子集（代码块/行内代码/加粗/
       斜体/列表，先转义再包标签防 XSS）、建议卡片一键发送、会话 ID 自动生成并
       持久化到 localStorage、可粘贴旧会话 ID 恢复、新对话按钮
+    - 过程活动展示：`POST /chat` 响应带 `events`（工具调用/技能加载/外部记忆召回，
+      参数脱敏、结果截断），会话界面在用户消息与助手回复之间渲染活动条目，
+      点击可展开参数与结果
+    - SSE 流式：`POST /chat/stream` 以 text/event-stream 实时推送
+      activity（思考/工具/技能/来源）/ token（回复增量）/ message / error / done；
+      前端优先走流式（思考与工具事件边发生边显示、回复逐 token 上屏），
+      旧服务器或流式不可用时自动回退一次性 `/chat`
     - 侧栏会话列表：`GET /sessions` 列出历史会话（最后活跃倒序 + 预览 + 消息数），
-      点击条目经 `GET /sessions/<id>/messages` 加载历史回显；侧栏与顶栏都有
-      "新对话"入口（对齐 Hermes api_server 的 list_sessions / get_messages）
+      点击条目经 `GET /sessions/<id>/messages` 加载历史回显；侧栏有"新对话"入口
+      （对齐 Hermes api_server 的 list_sessions / get_messages）
+    - 会话归档：每条会话可"归档"（软标记，对齐 Hermes set_session_archived），
+      归档后从"最近"隐藏但数据保留、`--resume` 仍可恢复；"查看归档"视图可
+      取消归档；侧栏"新对话"下方的【已归档】按钮把主工作区切换为归档列表，
+      只显示已归档会话（`GET /sessions?archived_only=1`），每条仅"取消归档"、
+      不支持打开会话，支持"← 返回对话"；`?include_archived=1` 表示未归档+归档都返回
+    - 插件/技能视图：【插件】列 memory provider（`GET /plugins`，含启用中标记），
+      【技能】列可用技能（`GET /skills`，name + description），与【已归档】一样
+      切换主工作区、支持"← 返回对话"；【工具】列全部可用工具
+      （`GET /tools`：核心 TOOLS + provider 自带工具，name + description）；
+      侧栏导航按钮（新对话/已归档/插件/技能/工具）收进紧凑分组
     - 审批弹窗：/chat 阻塞期间每 800ms 轮询 `GET /approvals/pending`，展示命令与
       原因（服务端已脱敏），按钮 允许一次/本会话允许/永久允许/拒绝（拒绝可填理由）；
       smart deny 场景按网关数据的 `allow_permanent=false` 自动隐藏"永久允许"
@@ -180,8 +197,13 @@ python server.py                 # 默认 127.0.0.1:8000
 |---|---|---|
 | `/` | GET | Web 前端页面（`web/index.html`） |
 | `/web/*` | GET | 前端静态资源（app.js / style.css） |
-| `/sessions` | GET | 会话列表（按最后活跃倒序，含预览与消息数） |
+| `/sessions` | GET | 会话列表（按最后活跃倒序；`?include_archived=1` 含归档） |
 | `/sessions/<id>/messages` | GET | 指定会话的历史消息（前端回显） |
+| `/sessions/<id>/archive` | POST | 归档/取消归档：`{"archived": true\|false}` |
+| `/skills` | GET | 技能列表（`skills.discover_skills()` 的 name + description） |
+| `/plugins` | GET | 记忆 provider 插件列表（name + description + active） |
+| `/tools` | GET | 可用工具列表（核心 TOOLS + provider 工具，name + description） |
+| `/chat/stream` | POST | SSE 流式对话（event: activity/token/message/error/done） |
 | `/chat` | POST | `{"message": "...", "session_id": "..."?}` → 返回 `{"reply": ...}` |
 | `/approvals/pending` | GET | `?session_id=xxx` → 当前待审批项 |
 | `/approvals/resolve` | POST | `{"session_id", "choice": "once\|session\|always\|deny", "reason"?}` |

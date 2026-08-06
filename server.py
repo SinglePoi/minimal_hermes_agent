@@ -7,6 +7,7 @@ HTTP 服务化 + gateway 审批通知（为前端铺路，对齐 Hermes dashboar
 
 端点：
     POST /chat              发一条消息；body: {"message": "...", "session_id": "..."?}
+    POST /chat/stream       同上，但 SSE 流式返回（event: activity/token/message/error/done）
     GET  /approvals/pending 轮询待审批；query: ?session_id=xxx
     POST /approvals/resolve 解决审批；body: {"session_id", "choice": once|session|always|deny, "reason"?}
     GET  /health            探活
@@ -14,6 +15,10 @@ HTTP 服务化 + gateway 审批通知（为前端铺路，对齐 Hermes dashboar
     GET  /web/<file>        前端静态资源（app.js / style.css 等）
     GET  /sessions          会话列表（按最后活跃倒序）
     GET  /sessions/<id>/messages  指定会话的历史消息（前端回显用）
+    POST /sessions/<id>/archive  归档/取消归档；body: {"archived": true|false}
+    GET  /skills                 技能列表（name + description）
+    GET  /plugins                记忆 provider 插件列表（name + description + active）
+    GET  /tools                  可用工具列表（核心 TOOLS + provider 自带工具）
 
 审批流程（对齐 Hermes 的网关队列）：
     - /chat 请求里的 agent 线程在危险命令处通过 approval.py 的网关队列阻塞等待
@@ -42,13 +47,14 @@ sys.path.insert(0, str(ROOT))
 load_dotenv()
 
 import minimal_agent  # noqa: E402
+import skills  # noqa: E402
 from approval import (  # noqa: E402
     list_pending_approvals,
     register_gateway_notify,
     resolve_gateway_approval,
     unregister_gateway_notify,
 )
-from memory_manager import SyncWorker  # noqa: E402
+from memory_manager import SyncWorker, list_provider_plugins  # noqa: E402
 
 # 前端静态资源目录（对齐 Hermes web/ 的命名；本骨架用原生 HTML/CSS/JS，
 # 零构建、零新依赖，由 server.py 直接托管，与 API 同源避免跨域）
@@ -131,8 +137,9 @@ class AgentServer:
             self.sessions[session_id] = state
         return state
 
-    def handle_message(self, session_id: str, state: dict, message: str) -> str:
+    def handle_message(self, session_id: str, state: dict, message: str) -> tuple[str, list]:
         """处理一条消息，返回助手最终回答文本。"""
+        events: list[dict[str, Any]] = []
         with state["lock"]:
             turn_count, turns_since_memory, persisted_count = minimal_agent.process_turn(
                 self.client,
@@ -145,12 +152,14 @@ class AgentServer:
                 state["turns_since_memory"],
                 self.review_worker,
                 state["persisted_count"],
+                events,
             )
             state["turn_count"] = turn_count
             state["turns_since_memory"] = turns_since_memory
             state["persisted_count"] = persisted_count
             last = state["messages"][-1] if state["messages"] else {}
-            return last.get("content", "") if last.get("role") == "assistant" else ""
+            reply = last.get("content", "") if last.get("role") == "assistant" else ""
+            return reply, events
 
     def shutdown(self) -> None:
         """排空后台任务、注销所有网关回调。"""
@@ -161,6 +170,40 @@ class AgentServer:
         if self.manager is not None:
             self.manager.flush_pending(timeout=10)
             self.manager.shutdown()
+
+
+    def handle_message_stream(
+        self,
+        session_id: str,
+        state: dict,
+        message: str,
+        emit_event,
+        emit_token,
+    ) -> str:
+        """处理一条消息（SSE 流式）：思考/工具/召回事件实时经 emit_event 推送，
+        回复 token 经 emit_token 推送；返回最终回答文本。"""
+        events: list[dict[str, Any]] = []
+        with state["lock"]:
+            turn_count, turns_since_memory, persisted_count = minimal_agent.process_turn(
+                self.client,
+                state["messages"],
+                self.tools,
+                self.manager,
+                session_id,
+                message,
+                state["turn_count"],
+                state["turns_since_memory"],
+                self.review_worker,
+                state["persisted_count"],
+                events,
+                sink=emit_event,
+                on_token=emit_token,
+            )
+            state["turn_count"] = turn_count
+            state["turns_since_memory"] = turns_since_memory
+            state["persisted_count"] = persisted_count
+            last = state["messages"][-1] if state["messages"] else {}
+            return last.get("content", "") if last.get("role") == "assistant" else ""
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -191,6 +234,28 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _begin_sse(self) -> None:
+        """开始 SSE 响应（text/event-stream 头）。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        # SSE 结束后由服务器关闭连接（close-delimited），客户端读到 EOF 即结束
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+    def _sse(self, event: str, data: Any) -> None:
+        """写一条 SSE 帧（客户端断开时静默，不抛错）。"""
+        try:
+            body = (
+                f"event: {event}\n"
+                f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+            ).encode("utf-8")
+            self.wfile.write(body)
+            self.wfile.flush()
+        except Exception:
+            pass
 
     def _read_body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
@@ -227,10 +292,48 @@ class _Handler(BaseHTTPRequestHandler):
                 limit = int((parse_qs(parsed.query).get("limit") or ["50"])[0])
             except ValueError:
                 limit = 50
+            include_archived = (parse_qs(parsed.query).get("include_archived") or ["0"])[
+                0
+            ].lower() in ("1", "true", "yes")
+            archived_only = (parse_qs(parsed.query).get("archived_only") or ["0"])[
+                0
+            ].lower() in ("1", "true", "yes")
             self._send_json(
                 200,
-                {"sessions": minimal_agent.list_sessions(limit)},
+                {
+                    "sessions": minimal_agent.list_sessions(
+                        limit,
+                        include_archived=include_archived,
+                        archived_only=archived_only,
+                    )
+                },
             )
+            return
+        if parsed.path == "/skills":
+            skill_rows = [
+                {
+                    "name": s.get("name", ""),
+                    "description": s.get("description", ""),
+                }
+                for s in skills.discover_skills()
+            ]
+            self._send_json(200, {"skills": skill_rows})
+            return
+        if parsed.path == "/plugins":
+            self._send_json(200, {"plugins": list_provider_plugins()})
+            return
+        if parsed.path == "/tools":
+            tool_rows = []
+            for tool in self.server.app.tools:
+                fn = tool.get("function") if isinstance(tool, dict) else None
+                if isinstance(fn, dict):
+                    tool_rows.append(
+                        {
+                            "name": fn.get("name", ""),
+                            "description": fn.get("description", ""),
+                        }
+                    )
+            self._send_json(200, {"tools": tool_rows})
             return
         if parsed.path.startswith("/sessions/") and parsed.path.endswith("/messages"):
             session_id = unquote(parsed.path[len("/sessions/"):-len("/messages")])
@@ -258,11 +361,42 @@ class _Handler(BaseHTTPRequestHandler):
             )
             try:
                 state = self.server.app.get_session(session_id)
-                reply = self.server.app.handle_message(session_id, state, message)
+                reply, events = self.server.app.handle_message(session_id, state, message)
             except Exception as exc:
                 self._send_json(500, {"error": str(exc)})
                 return
-            self._send_json(200, {"session_id": session_id, "reply": reply})
+            self._send_json(
+                200,
+                {
+                    "session_id": session_id,
+                    "reply": reply,
+                    "events": events,
+                },
+            )
+            return
+        if parsed.path == "/chat/stream":
+            message = body.get("message", "")
+            if not isinstance(message, str) or not message.strip():
+                self._send_json(400, {"error": "message required"})
+                return
+            session_id = body.get("session_id") or time.strftime(
+                "session-%Y%m%d-%H%M%S"
+            )
+            self._begin_sse()
+            try:
+                state = self.server.app.get_session(session_id)
+                reply = self.server.app.handle_message_stream(
+                    session_id,
+                    state,
+                    message,
+                    emit_event=lambda ev: self._sse("activity", ev),
+                    emit_token=lambda text: self._sse("token", {"text": text}),
+                )
+            except Exception as exc:
+                self._sse("error", {"error": str(exc)})
+                reply = ""
+            self._sse("message", {"reply": reply, "session_id": session_id})
+            self._sse("done", {})
             return
         if parsed.path == "/approvals/resolve":
             session_id = body.get("session_id", "")
@@ -277,6 +411,27 @@ class _Handler(BaseHTTPRequestHandler):
                 session_id, choice, reason=body.get("reason")
             )
             self._send_json(200, {"resolved": count})
+            return
+        if parsed.path.startswith("/sessions/") and parsed.path.endswith("/archive"):
+            session_id = unquote(parsed.path[len("/sessions/"):-len("/archive")])
+            if not session_id or "/" in session_id:
+                self._send_json(404, {"error": "not found"})
+                return
+            archived = body.get("archived")
+            if not isinstance(archived, bool):
+                self._send_json(
+                    400,
+                    {"error": "archived (boolean) required"},
+                )
+                return
+            updated = minimal_agent.set_session_archived(session_id, archived)
+            if not updated:
+                self._send_json(404, {"error": "session not found"})
+                return
+            self._send_json(
+                200,
+                {"session_id": session_id, "archived": archived},
+            )
             return
         self._send_json(404, {"error": "not found"})
 

@@ -14,8 +14,10 @@ Hermes 的 MemoryManager：builtin（MEMORY.md/USER.md）恒在 + 至多一个�
     - 后台线程是 daemon：即使同步卡死也不会阻止解释器退出
 """
 
+import ast
 import importlib.util
 import json
+import os
 import sys
 import threading
 import time
@@ -126,6 +128,38 @@ def load_provider(name: str) -> MemoryProvider:
     sys.modules[f"providers.{name}"] = module
     spec.loader.exec_module(module)
     return module.Provider()
+
+
+def list_provider_plugins() -> list[dict]:
+    """列出 providers/ 目录下的 memory provider 插件（对齐 Hermes plugins 目录约定）。
+
+    每条含 name、description（模块 docstring 首行）与 active（是否当前 MEMORY_PROVIDER）。
+    """
+    providers_dir = BASE_DIR / "providers"
+    if not providers_dir.exists():
+        return []
+    active = os.environ.get("MEMORY_PROVIDER", "").strip()
+    plugins: list[dict] = []
+    for child in sorted(providers_dir.iterdir()):
+        init_file = child / "__init__.py"
+        if not child.is_dir() or not init_file.exists():
+            continue
+        description = ""
+        try:
+            tree = ast.parse(init_file.read_text(encoding="utf-8"))
+            doc = ast.get_docstring(tree)
+            if doc:
+                description = doc.strip().splitlines()[0].strip()
+        except (OSError, SyntaxError):
+            pass
+        plugins.append(
+            {
+                "name": child.name,
+                "description": description,
+                "active": child.name == active,
+            }
+        )
+    return plugins
 
 
 class MemoryManager:

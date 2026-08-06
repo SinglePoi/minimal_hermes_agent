@@ -79,7 +79,13 @@ html, body {
   color: var(--muted);
 }
 
-.side-section { display: flex; flex-direction: column; gap: 10px; }
+.side-section {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
 
 .side-label {
   font-size: 11px;
@@ -88,24 +94,42 @@ html, body {
   text-transform: uppercase;
 }
 
-.side-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+.new-chat-btn {
+  width: 100%;
+  justify-content: center;
 }
 
-.btn.mini {
-  padding: 4px 9px;
-  font-size: 12px;
-  border-radius: 8px;
+.side-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.side-nav-btn {
+  width: 100%;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.35);
+  border-color: var(--line-soft);
+  color: var(--muted);
+}
+
+.side-nav-btn:hover {
+  color: var(--text);
+  border-color: var(--line);
+}
+
+.side-nav-btn.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: rgba(217, 119, 87, 0.08);
 }
 
 .session-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-height: 280px;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   margin-right: -4px;
   padding-right: 4px;
@@ -113,8 +137,8 @@ html, body {
 
 .session-item {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
+  align-items: center;
+  gap: 6px;
   padding: 8px 10px;
   border: 1px solid var(--line-soft);
   border-radius: 10px;
@@ -128,29 +152,50 @@ html, body {
 
 .session-item:hover { border-color: rgba(217, 119, 87, 0.45); }
 
+.session-item.archived { opacity: 0.55; }
+
 .session-item.active {
   border-color: var(--accent);
   background: rgba(217, 119, 87, 0.08);
 }
 
-.session-item-id {
-  font-size: 11px;
-  font-family: Consolas, "Courier New", monospace;
-  color: var(--muted);
-  word-break: break-all;
-}
-
-.session-item-preview {
-  font-size: 12px;
-  line-height: 1.4;
+.session-item-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.45;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.session-item-meta {
-  font-size: 10px;
+.session-item-action {
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.5);
   color: var(--muted);
+  font-size: 11px;
+  font-family: inherit;
+  padding: 2px 7px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.session-item-action:hover {
+  color: var(--accent-strong);
+  border-color: rgba(217, 119, 87, 0.5);
+}
+
+.session-item:hover .session-item-action,
+.session-item:focus-within .session-item-action {
+  opacity: 1;
+}
+
+/* 工作区视图里"取消归档"是主要操作，保持常显 */
+.workspace-view .session-item-action {
+  opacity: 1;
 }
 
 .session-empty {
@@ -159,22 +204,62 @@ html, body {
   padding: 6px 2px;
 }
 
-.cap-list {
-  margin: 0;
-  padding: 0;
-  list-style: none;
+/* 工作区视图（主工作区切换） */
+.workspace-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 24px;
+  overflow-y: auto;
+}
+
+.workspace-view-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.workspace-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 8px;
-  font-size: 13px;
 }
 
-.cap-list li {
-  padding: 7px 10px;
-  border: 1px solid var(--line-soft);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.35);
-  color: #57524a;
+.session-item.stack {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.session-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.session-item-desc {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.session-item-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--accent-strong);
+  border: 1px solid rgba(217, 119, 87, 0.4);
+  border-radius: 999px;
+  padding: 1px 8px;
 }
 
 .sidebar-footer {
@@ -215,49 +300,6 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-
-.topbar-right {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.session-label {
-  font-size: 12px;
-  color: var(--muted);
-  white-space: nowrap;
-}
-
-.topbar-right input {
-  width: 230px;
-  padding: 7px 10px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.6);
-  color: var(--text);
-  font-size: 12px;
-  font-family: Consolas, "Courier New", monospace;
-}
-.topbar-right input:focus { outline: 1px solid var(--accent); }
-
-.status {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--muted);
-  white-space: nowrap;
-}
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--muted);
-  display: inline-block;
-}
-.dot.ok { background: #4caf7d; box-shadow: 0 0 0 3px rgba(76, 175, 125, 0.18); }
-.dot.err { background: var(--danger); box-shadow: 0 0 0 3px rgba(192, 57, 43, 0.16); }
 
 /* 内容区 */
 .content {
@@ -425,6 +467,45 @@ html, body {
   75% { content: "..."; }
 }
 
+/* 过程活动（工具调用 / 技能加载 / 第三方来源） */
+.activity {
+  align-self: flex-start;
+  max-width: 90%;
+  margin: 2px 0;
+}
+
+.activity-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.35);
+  color: var(--muted);
+  font-size: 12px;
+  font-family: inherit;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.activity-head:hover {
+  color: var(--text);
+  border-color: var(--line);
+}
+
+.activity-detail {
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--line);
+  background: rgba(255, 255, 255, 0.25);
+  border-radius: 0 8px 8px 0;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: Consolas, "Courier New", monospace;
+}
+
 /* 输入区（毛玻璃） */
 .composer {
   display: flex;
@@ -588,7 +669,6 @@ html, body {
   .suggestions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .hero h2 { font-size: 24px; }
   .msg { max-width: 90%; }
-  .topbar-right input { width: 170px; }
 }
 
 @media (max-width: 560px) {

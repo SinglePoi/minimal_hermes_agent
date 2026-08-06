@@ -8,7 +8,7 @@
 </head>
 <body>
   <div class="app">
-    <!-- 左侧状态栏（毛玻璃）：品牌 / 能力清单 -->
+    <!-- 左侧状态栏（毛玻璃）：品牌 / 新对话 / 最近会话 -->
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">
@@ -24,25 +24,17 @@
         </div>
       </div>
 
-      <div class="side-section">
-        <div class="side-head">
-          <span class="side-label">会话</span>
-          <button id="btn-new-session-side" class="btn mini" type="button">＋ 新对话</button>
-        </div>
-        <div class="session-list" id="session-list"></div>
+      <div class="side-nav">
+        <button id="btn-new-session-side" class="btn primary new-chat-btn" type="button">＋ 新对话</button>
+        <button id="btn-archived" class="btn side-nav-btn" type="button">已归档</button>
+        <button id="btn-plugins" class="btn side-nav-btn" type="button">插件</button>
+        <button id="btn-skills" class="btn side-nav-btn" type="button">技能</button>
+        <button id="btn-tools" class="btn side-nav-btn" type="button">工具</button>
       </div>
 
       <div class="side-section">
-        <div class="side-label">能力</div>
-        <ul class="cap-list">
-          <li>Agent Loop · 多轮对话</li>
-          <li>工具系统 · 并行调度</li>
-          <li>三层记忆 · 历史检索</li>
-          <li>上下文压缩</li>
-          <li>危险命令审批</li>
-          <li>Skills 按需加载</li>
-          <li>HTTP 服务化 · Web 界面</li>
-        </ul>
+        <div class="side-label">最近</div>
+        <div class="session-list" id="session-list"></div>
       </div>
 
       <div class="sidebar-footer">对齐 Hermes Agent 架构</div>
@@ -52,17 +44,6 @@
     <div class="main-col">
       <header class="topbar">
         <div class="view-title" id="view-title">新对话</div>
-        <div class="topbar-right">
-          <label class="session-label" for="session-id">会话 ID</label>
-          <input id="session-id" type="text" spellcheck="false"
-                 placeholder="留空自动新建" autocomplete="off"
-                 title="粘贴已有会话 ID 可恢复历史对话">
-          <button id="btn-new-session-top" class="btn ghost" type="button">新对话</button>
-          <div class="status" id="status" title="服务连接状态">
-            <span class="dot"></span>
-            <span id="status-text">连接中…</span>
-          </div>
-        </div>
       </header>
 
       <main class="content">
@@ -94,6 +75,36 @@
 
         <!-- 会话线程（首条消息后显示） -->
         <section class="thread hidden" id="chat" aria-live="polite"></section>
+
+        <!-- 工作区视图：已归档 / 插件 / 技能（点击侧栏按钮切换主工作区） -->
+        <section class="workspace-view hidden" id="archived-view">
+          <div class="workspace-view-head">
+            <span class="view-title">已归档</span>
+            <button id="btn-archived-back" class="btn ghost" type="button">← 返回对话</button>
+          </div>
+          <div class="workspace-list" id="archived-list"></div>
+        </section>
+        <section class="workspace-view hidden" id="plugins-view">
+          <div class="workspace-view-head">
+            <span class="view-title">插件</span>
+            <button id="btn-plugins-back" class="btn ghost" type="button">← 返回对话</button>
+          </div>
+          <div class="workspace-list" id="plugins-list"></div>
+        </section>
+        <section class="workspace-view hidden" id="skills-view">
+          <div class="workspace-view-head">
+            <span class="view-title">技能</span>
+            <button id="btn-skills-back" class="btn ghost" type="button">← 返回对话</button>
+          </div>
+          <div class="workspace-list" id="skills-list"></div>
+        </section>
+        <section class="workspace-view hidden" id="tools-view">
+          <div class="workspace-view-head">
+            <span class="view-title">工具</span>
+            <button id="btn-tools-back" class="btn ghost" type="button">← 返回对话</button>
+          </div>
+          <div class="workspace-list" id="tools-list"></div>
+        </section>
       </main>
 
       <footer class="composer">

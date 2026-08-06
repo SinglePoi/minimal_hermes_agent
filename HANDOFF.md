@@ -180,9 +180,31 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     （不再叫夜莺，也不限定客服天气等业务范围）：
     - 对话：POST /chat、Markdown 子集渲染（先转义防 XSS）、建议卡片一键发送、
       会话 ID 落 localStorage、可粘贴旧 ID 恢复、新对话按钮（侧栏 + 顶栏双入口）
+    - 过程活动展示：run_agent_turn/process_turn 新增 events 参数，/chat 响应带
+      events（tool/skill/source 三类，参数经 redact 脱敏、结果截断 300 字符），
+      前端在消息间渲染活动条目、点击展开详情；外部记忆召回也作为 source 事件
+    - SSE 流式：call_llm_stream 累积流式 content/tool_calls/reasoning_content，
+      POST /chat/stream 实时推送 activity/token/message/error/done
+      （Connection: close 结束，注意别发 keep-alive 否则 http.server 不关连接）；
+      前端 readSse 解析 + 按事件 id 增量更新活动，回复逐 token 上屏，
+      流式失败自动回退一次性 /chat
     - 侧栏会话列表：GET /sessions（最后活跃倒序 + 预览 + 消息数）+ 点击经
       GET /sessions/<id>/messages 加载历史回显（对齐 Hermes api_server 的
       list_sessions / get_messages）
+    - 会话归档：POST /sessions/<id>/archive 软归档（对齐 Hermes
+      set_session_archived：sessions.archived 标记，不删数据，--resume 仍可恢复）；
+      侧栏每条会话可归档；"新对话"下方【已归档】按钮把主工作区切换为归档
+      会话列表（非抽屉），只显示已归档会话（走 archived_only=1，修复
+      include_archived 把未归档也列出的问题），每条仅"取消归档"、不支持
+      打开会话，支持返回对话；
+    - 插件/技能视图：【插件】列 memory provider（GET /plugins，
+      memory_manager.list_provider_plugins 枚举 providers/ + docstring 首行 +
+      MEMORY_PROVIDER 启用标记），【技能】列可用技能（GET /skills 走
+      skills.discover_skills）；与已归档共用通用工作区视图切换
+      （VIEWS 注册表 + showView/closeView）；【工具】列全部工具（GET /tools：
+      server 的 self.tools = 核心 TOOLS + provider 工具）；侧栏导航按钮收进
+      .side-nav 紧凑分组（gap 6px）
+      sessions 表首次访问自动 ALTER TABLE 迁移补 archived 列
     - 审批弹窗：/chat 阻塞期间每 800ms 轮询 pending，按钮 允许一次/本会话/
       永久允许/拒绝（拒绝可填理由）；allow_permanent=false（smart deny）时
       隐藏"永久允许"（对齐 Hermes api_server 的 _approval_event_choices）

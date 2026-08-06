@@ -35,6 +35,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from dotenv import load_dotenv
@@ -297,6 +298,14 @@ def _db_conn() -> sqlite3.Connection:
         "system_prompt TEXT NOT NULL,"
         "updated_at TEXT DEFAULT (datetime('now')))"
     )
+    # 归档标记（对齐 Hermes sessions.archived）：软标记，不删数据；
+    # 旧库首次访问时补列迁移
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
+    if "archived" not in cols:
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
     return conn
 
 
@@ -464,21 +473,36 @@ def load_session_history(session_id: str) -> list[dict[str, Any]]:
         conn.close()
 
 
-def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
+def list_sessions(
+    limit: int = 50,
+    include_archived: bool = False,
+    archived_only: bool = False,
+) -> list[dict[str, Any]]:
     """列出会话记录（按最后活跃倒序，对齐 Hermes api_server 的 list_sessions_rich）。
 
-    每条包含 session_id、updated_at、message_count 和最后一条用户消息的预览。
+    过滤语义与 Hermes 一致：
+    - 默认只列未归档会话（archived 会话从列表隐藏，但仍可按 id 恢复）
+    - include_archived=True：未归档 + 已归档都返回
+    - archived_only=True：只返回已归档会话（归档管理视图用）
+    每条包含 session_id、updated_at、archived、message_count 和最后一条用户消息的预览。
     """
+    if archived_only:
+        where_clause = "WHERE s.archived = 1"
+    elif not include_archived:
+        where_clause = "WHERE s.archived = 0"
+    else:
+        where_clause = ""
     conn = _db_conn()
     try:
         rows = conn.execute(
-            """SELECT s.session_id, s.updated_at,
+            f"""SELECT s.session_id, s.updated_at, s.archived,
                       COUNT(m.id) AS message_count,
                       (SELECT m2.content FROM messages m2
                        WHERE m2.session_id = s.session_id AND m2.role = 'user'
                        ORDER BY m2.id DESC LIMIT 1) AS preview
                FROM sessions s
                LEFT JOIN messages m ON m.session_id = s.session_id
+               {where_clause}
                GROUP BY s.session_id
                ORDER BY COALESCE(MAX(m.created_at), s.updated_at) DESC
                LIMIT ?""",
@@ -488,11 +512,30 @@ def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
             {
                 "session_id": r[0],
                 "updated_at": r[1] or "",
-                "message_count": r[2] or 0,
-                "preview": (r[3] or "").strip()[:80],
+                "archived": bool(r[2]),
+                "message_count": r[3] or 0,
+                "preview": (r[4] or "").strip()[:80],
             }
             for r in rows
         ]
+    finally:
+        conn.close()
+
+
+def set_session_archived(session_id: str, archived: bool) -> bool:
+    """归档/取消归档会话（对齐 Hermes set_session_archived：软标记，不删数据）。
+
+    归档会话从默认列表隐藏，但消息与系统提示词保留，--resume / 按 id 访问仍可用。
+    返回是否真的更新了一行（会话不存在返回 False）。
+    """
+    conn = _db_conn()
+    try:
+        cur = conn.execute(
+            "UPDATE sessions SET archived = ? WHERE session_id = ?",
+            (1 if archived else 0, session_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         conn.close()
 
@@ -652,6 +695,99 @@ def call_llm(client: OpenAI, messages: list[dict[str, Any]], tools: list[dict[st
     except Exception:
         pass
     return response.choices[0].message
+
+
+class _StreamMessage:
+    """从流式响应累积出的消息对象（对齐非流式 message 的接口）。"""
+
+    def __init__(self) -> None:
+        self.content = ""
+        self.reasoning_content = ""
+        self.tool_calls: list[Any] = []
+
+    def model_dump(self, exclude_none=True) -> dict[str, Any]:
+        """序列化供历史回填（与 OpenAI 消息结构一致）。"""
+        d: dict[str, Any] = {"role": "assistant", "content": self.content}
+        if self.reasoning_content:
+            d["reasoning_content"] = self.reasoning_content
+        if self.tool_calls:
+            d["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in self.tool_calls
+            ]
+        return d
+
+
+def call_llm_stream(
+    client: OpenAI,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    on_token: Any = None,
+):
+    """流式调用大模型：累积 content / 工具调用 / 推理内容，token 实时回调。
+
+    对齐 Hermes 的流式接口语义：delta 里的 content 增量逐段给 on_token，
+    tool_calls 按 index 累积出完整参数。返回 _StreamMessage
+    （接口与非流式 message 一致，run_agent_turn 无需分支）。
+    """
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        tools=tools,
+        stream=True,
+    )
+    msg = _StreamMessage()
+    calls: dict[int, dict[str, str]] = {}
+    for chunk in response:
+        try:
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                record_usage(getattr(usage, "prompt_tokens", 0) or 0)
+        except Exception:
+            pass
+        if not chunk.choices:
+            continue
+        delta = getattr(chunk.choices[0], "delta", None)
+        if delta is None:
+            continue
+        text = getattr(delta, "content", None)
+        if isinstance(text, str) and text:
+            msg.content += text
+            if on_token is not None:
+                on_token(text)
+        reasoning = getattr(delta, "reasoning_content", None)
+        if isinstance(reasoning, str) and reasoning:
+            msg.reasoning_content += reasoning
+        for tc in getattr(delta, "tool_calls", None) or []:
+            idx = getattr(tc, "index", 0) or 0
+            slot = calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+            if getattr(tc, "id", None):
+                slot["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    slot["name"] = fn.name
+                if getattr(fn, "arguments", None):
+                    slot["arguments"] += fn.arguments
+    for idx in sorted(calls):
+        slot = calls[idx]
+        msg.tool_calls.append(
+            SimpleNamespace(
+                id=slot["id"] or f"call_{idx}",
+                type="function",
+                function=SimpleNamespace(
+                    name=slot["name"], arguments=slot["arguments"]
+                ),
+            )
+        )
+    return msg
 
 
 # ---------------- 工具：定义 + 执行 ----------------
@@ -1006,12 +1142,50 @@ def show_current_memory() -> None:
         console.print(Panel("\n".join(lines), title="📖 已记住的信息", border_style="yellow"))
 
 
+# 工具事件分类：普通工具 / 技能加载 / 第三方来源（外部记忆检索）
+_SKILL_TOOLS = {"skills_list", "skill_view"}
+_SOURCE_TOOLS = {"memory_search", "vector_search"}
+
+
+def _tool_event_kind(name: str) -> str:
+    """按工具名归类事件类型（tool / skill / source）。"""
+    if name in _SKILL_TOOLS:
+        return "skill"
+    if name in _SOURCE_TOOLS:
+        return "source"
+    return "tool"
+
+
+def _tool_event_label(kind: str, name: str, args: dict) -> str:
+    """生成事件显示名：skill_view 显示被加载的技能名，其余显示工具名。"""
+    if kind == "skill" and name == "skill_view":
+        return str(args.get("name") or name)
+    return name
+
+
+def _record_event(
+    events: list[dict[str, Any]] | None,
+    sink: Any,
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    """记录一个事件：写入列表（带自增 id）并实时回调 sink（SSE 用）。"""
+    if events is not None:
+        event["id"] = len(events)
+        events.append(event)
+    if sink is not None:
+        sink(dict(event))
+    return event
+
+
 def run_agent_turn(
     client: OpenAI,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     manager: MemoryManager | None = None,
     session_key: str = "",
+    events: list[dict[str, Any]] | None = None,
+    sink: Any = None,
+    on_token: Any = None,
 ) -> None:
     """执行一轮对话：模型 + 工具循环，直到模型给出最终回答。
 
@@ -1038,7 +1212,29 @@ def run_agent_turn(
                     save_session_prompt(session_key, messages[0]["content"])
 
         console.print(f"\n[bold blue]--- 第 {turn + 1} 轮：调用大模型 ---[/bold blue]")
-        msg = call_llm(client, messages, tools)
+        # 思考过程事件：每轮模型调用前记录；若模型暴露推理内容（如
+        # DeepSeek 的 reasoning_content）则一并回显（截断 + 脱敏）
+        think_event = _record_event(
+            events,
+            sink,
+            {
+                "type": "think",
+                "name": f"第 {turn + 1} 轮思考",
+                "args": "",
+                "result": "",
+            },
+        )
+        if on_token is not None:
+            msg = call_llm_stream(client, messages, tools, on_token=on_token)
+        else:
+            msg = call_llm(client, messages, tools)
+        reasoning = getattr(msg, "reasoning_content", None) or ""
+        if reasoning:
+            think_event["result"] = redact_sensitive_text(
+                str(reasoning)[:300], force=True
+            )
+            if sink is not None:
+                sink(dict(think_event))
 
         if msg.tool_calls:
             # 模型要求调用工具：先把 assistant 消息（含 tool_calls）放回历史
@@ -1054,6 +1250,27 @@ def run_agent_turn(
                 )
                 console.print(
                     f"  [yellow]🔧 模型要调用工具：[/yellow]{name}({args_display})"
+                )
+            # 记录工具调用事件（按模型原始顺序，参数已脱敏），供 Web 前端展示
+            call_events: list[dict[str, Any]] = []
+            for tc in tool_calls:
+                name = tool_name(tc)
+                args = tool_arguments(tc) or {}
+                kind = _tool_event_kind(name)
+                call_events.append(
+                    _record_event(
+                        events,
+                        sink,
+                        {
+                            "type": kind,
+                            "name": _tool_event_label(kind, name, args),
+                            "args": redact_sensitive_text(
+                                json.dumps(args, ensure_ascii=False), force=True
+                            )
+                            or "",
+                            "result": "",
+                        },
+                    )
                 )
 
             def run_one(tc) -> str:
@@ -1079,6 +1296,13 @@ def run_agent_turn(
             # 按原始顺序回显工具返回（本段新增的 tool 消息正好一一对应）
             for tool_msg in messages[tool_start:]:
                 console.print(f"  [green]📦 工具返回：[/green]{tool_msg['content']}")
+
+            # 按原始顺序把工具结果回填进事件（结果截断 + 脱敏），并实时回调 sink
+            for ev, tool_msg in zip(call_events, messages[tool_start:]):
+                result = tool_msg.get("content", "") or ""
+                ev["result"] = redact_sensitive_text(result[:300], force=True) or ""
+                if sink is not None:
+                    sink(dict(ev))
 
             continue  # 回到循环开头，把结果再发给大模型
 
@@ -1144,6 +1368,9 @@ def process_turn(
     turns_since_memory: int,
     review_worker: SyncWorker,
     persisted_count: int,
+    events: list[dict[str, Any]] | None = None,
+    sink: Any = None,
+    on_token: Any = None,
 ) -> tuple[int, int, int]:
     """处理一条用户消息（REPL 与服务器共用）：召回 → 对话 → 落库 → 同步 → nudge。
 
@@ -1160,10 +1387,29 @@ def process_turn(
             console.print(
                 Panel(ext_context[:300], title="🔌 外部记忆召回", border_style="magenta")
             )
+            _record_event(
+                events,
+                sink,
+                {
+                    "type": "source",
+                    "name": "记忆召回",
+                    "args": "",
+                    "result": redact_sensitive_text(ext_context[:200], force=True),
+                },
+            )
 
     messages.append({"role": "user", "content": user_content})
     console.print(f"[dim]📚 会话：{session_id}[/dim]")
-    run_agent_turn(client, messages, tools, manager, session_id)
+    run_agent_turn(
+        client,
+        messages,
+        tools,
+        manager,
+        session_id,
+        events=events,
+        sink=sink,
+        on_token=on_token,
+    )
 
     # 增量落库（对齐 Hermes：消息逐轮写入 SessionDB，中途退出也不丢）
     persist_messages(session_id, messages, start=persisted_count)
