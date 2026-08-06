@@ -77,6 +77,14 @@
       CIRCUIT BREAKER 硬停警告；任何人工批准都会重置计数
     - 命令混淆检测：`base64 -d | bash`、`eval $(curl)`、`bash <<EOF`、
       openssl 解码后执行等模式加入危险清单
+    - 用户自定义 deny 规则：`APPROVAL_DENY`（; 分隔的 fnmatch glob，如
+      `rm -rf *;git push --force*`）命中即无条件拦截——先于永久允许列表与
+      mode=off 旁路，用户说"永不"就是永不（对齐 Hermes approvals.deny）
+    - 内容级扫描 `tirith.py`（Hermes tirith 的 Python 简化版）：检测正则
+      认不出的语义威胁——ANSI 转义/控制字符/单独回车（终端注入）、零宽字符/
+      双向覆盖符（隐形文字）、同形字域名（钓鱼）、管道到解释器；发现即进入
+      审批门卫（block 需审批、warn 带警告），`TIRITH_ENABLED`/`TIRITH_FAIL_OPEN`
+      可配，off 旁路仍优先
     - 智能评估防注入：命令先剥 shell 注释、包在 `<command>` 定界符里、
       系统提示词明确要求忽略命令内夹带指令（对齐 Hermes 设计）
 16. **记忆同步异步化 + 合并节流**（对齐 Hermes memory_manager 的后台串行设计）：
@@ -92,7 +100,13 @@
 18. **会话历史清理策略**（对齐 Hermes SessionDB.prune_sessions）：启动时清理
     不活跃超过保留天数的旧会话（默认 90 天，`SESSION_RETENTION_DAYS` 可调，
     0 禁用）；活跃度 = 最后一条消息时间（无消息会话回退 sessions.updated_at）；
-    连 messages + FTS 全文索引一起删，当前正在使用的会话受保护
+   连 messages + FTS 全文索引一起删，当前正在使用的会话受保护
+19. **HTTP 服务化 + gateway 审批通知**（为前端铺路，对齐 Hermes dashboard/gateway）：
+    `server.py` 零新依赖（标准库 http.server）——`POST /chat` 发消息、
+    `GET /approvals/pending` 轮询待审批、`POST /approvals/resolve` 解决审批、
+    `GET /health` 探活；审批走 approval.py 的网关队列（对齐 Hermes 的
+    register_gateway_notify / resolve_gateway_approval：agent 线程阻塞等"门铃"，
+    HTTP 端 resolve 唤醒）；主循环抽取为 process_turn 供 REPL 与服务器共用
 
 ## 你需要准备的
 
@@ -132,6 +146,26 @@ python minimal_agent.py
 $env:PYTHONIOENCODING="utf-8"
 ```
 
+### 服务化运行（HTTP + 审批）
+
+```powershell
+python server.py                 # 默认 127.0.0.1:8000
+# 或指定地址端口：python server.py 0.0.0.0 9000
+```
+
+端点一览：
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/chat` | POST | `{"message": "...", "session_id": "..."?}` → 返回 `{"reply": ...}` |
+| `/approvals/pending` | GET | `?session_id=xxx` → 当前待审批项 |
+| `/approvals/resolve` | POST | `{"session_id", "choice": "once\|session\|always\|deny", "reason"?}` |
+| `/health` | GET | 探活 |
+
+审批流程：`/chat` 请求里的 agent 线程遇到危险命令会阻塞等待；客户端在另一个
+连接轮询 `pending`、再 `POST resolve`，线程被唤醒后 `/chat` 返回最终结果。
+（流式/SSE 与 WebSocket 是二期。）
+
 可选环境变量：
 
 | 变量 | 作用 | 默认值 |
@@ -147,6 +181,9 @@ $env:PYTHONIOENCODING="utf-8"
 | `APPROVAL_DENIAL_BREAKER` | 连续智能拒绝多少次后触发熔断（0 = 禁用） | `3` |
 | `SESSION_RETENTION_DAYS` | 会话历史保留天数，启动时清理不活跃旧会话（0 = 禁用） | `90` |
 | `MEMORY_NUDGE_INTERVAL` | 记忆 nudge 间隔（用户轮次）：每 N 轮后台审查一次（0 = 禁用） | `10` |
+| `APPROVAL_DENY` | 用户自定义拒绝规则（; 分隔的 fnmatch glob，命中即无条件拦截） | 空 |
+| `TIRITH_ENABLED` | 内容级安全扫描开关（false 关闭） | `true` |
+| `TIRITH_FAIL_OPEN` | 扫描器异常时放行（true）还是拦截（false） | `true` |
 
 ## 体验一个完整循环
 
@@ -331,6 +368,10 @@ python tests/test_session_prompt.py
 python tests/test_session_cleanup.py
 python tests/test_memory_nudge.py
 python tests/test_skills_compression.py
+python tests/test_approval_deny.py
+python tests/test_tirith.py
+python tests/test_gateway_approval.py
+python tests/test_server.py
 ```
 
 覆盖危险/硬性模式检测、deny/session/always 审批分支、允许列表落盘重载、
@@ -342,6 +383,9 @@ Skills 的 frontmatter 解析、发现、索引、加载与路径安全；文件
 UPSERT 覆盖与压缩后重建；会话清理的旧会话删除/FTS 清理/保护/禁用。
 记忆 nudge 的间隔触发、恢复水合与后台 worker 排空。
 技能压缩的标记往返、幽灵技能收集与摘要后补回。
+用户 deny 规则的 glob 匹配、先于 allowlist/off 的优先级与返回结构。
+tirith 的终端注入/隐形字符/同形字/管道检测与审批集成。
+网关审批队列的阻塞/唤醒/FIFO/超时；HTTP 端点的 health/pending/resolve/chat。
 Windows 控制台无需手动设编码，脚本会自动切换 UTF-8。
 
 ## 体验 Skills（按需加载）
@@ -453,6 +497,9 @@ python minimal_agent.py
 | 会话历史清理 `prune_sessions()` | `hermes_state.py` 的 SessionDB.prune_sessions（older_than_days） |
 | 记忆 nudge `MEMORY_NUDGE_INTERVAL` | `agent/turn_context.py`（_turns_since_memory 计数 + 恢复水合）+ `agent/agent_init.py`（nudge_interval） |
 | 技能压缩 prune/reinject | `agent/context_compressor.py`（_skill_pruned_marker / _collect_ghosted_skill_names / _reinject_pruned_skill_markers） |
+| 用户 deny 规则 `APPROVAL_DENY` | `tools/approval.py`（_match_user_deny_rule / _user_deny_block_result，approvals.deny） |
+| 内容级扫描 `tirith.py` | `tools/tirith_security.py`（check_command_security，Python 简化版） |
+| 服务化 `server.py` + 网关审批 | `gateway/run.py`（register_gateway_notify / resolve_gateway_approval）+ `gateway/platforms/api_server.py` |
 | 危险命令审批 `approval.py` | `tools/approval.py`（DANGEROUS_PATTERNS、HARDLINE_PATTERNS、prompt_dangerous_approval） |
 | `terminal` 工具（先审批再执行） | `tools/terminal_tool.py`（check_all_command_guards + subprocess） |
 | 永久允许列表 `approval_allowlist.json` | `config.yaml` 的 `command_allowlist`（JSON 免去 YAML 依赖） |
@@ -478,5 +525,5 @@ prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取、patch �
 ## 下一步可以加什么
 
 - Skills 增强：上下文压缩时的技能 prune/reinject、前置条件检查（对齐 Hermes 剩余部分）
-- 审批剩余：用户自定义 deny 规则（approvals.deny）、tirith 内容级扫描、gateway 通知
+- 审批剩余：gateway 通知（跟服务化一起做）
 - 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）

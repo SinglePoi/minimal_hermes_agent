@@ -32,6 +32,8 @@ skills.py                   Skills：frontmatter 解析 + 发现 + 技能索引 
 skills/                     示例技能包：weather-answer（播报规范）、release-check（发版清单），含 references/
 file_tools.py               文件工具：read_file/write_file/search_files + 敏感路径保护（对齐 file_tools.py）
 redact.py                   敏感文本脱敏：前缀密钥/赋值/JSON/YAML/请求头/JWT/私钥/URL userinfo（对齐 redact.py）
+tirith.py                   内容级安全扫描：终端注入/隐形字符/同形字域名/管道到解释器（tirith 的 Python 简化版）
+demo_file_tools.py          文件工具可视化演示（离线，python demo_file_tools.py 直接跑）
 tests/test_approval.py      审批回归测试（零依赖，python tests/test_approval.py 直接跑）
 tests/test_tool_dispatch.py 并行执行回归测试（零依赖，python tests/test_tool_dispatch.py 直接跑）
 tests/test_skills.py        Skills 回归测试（零依赖，python tests/test_skills.py 直接跑）
@@ -43,6 +45,11 @@ tests/test_session_prompt.py 系统提示词持久化回归测试（零依赖，
 tests/test_session_cleanup.py 会话清理回归测试（零依赖，python tests/test_session_cleanup.py 直接跑）
 tests/test_memory_nudge.py   记忆 nudge 回归测试（零依赖，python tests/test_memory_nudge.py 直接跑）
 tests/test_skills_compression.py 技能压缩联动回归测试（零依赖，python tests/test_skills_compression.py 直接跑）
+tests/test_approval_deny.py   用户 deny 规则回归测试（零依赖，python tests/test_approval_deny.py 直接跑）
+tests/test_tirith.py          内容级扫描回归测试（零依赖，python tests/test_tirith.py 直接跑）
+tests/test_gateway_approval.py 网关审批队列回归测试（零依赖，python tests/test_gateway_approval.py 直接跑）
+tests/test_server.py          HTTP 服务化回归测试（零依赖，python tests/test_server.py 直接跑）
+server.py                    HTTP 服务化：/chat + /approvals/pending + /approvals/resolve + /health（零新依赖）
 context_compressor.py       上下文压缩（阈值 50%、protect_last_n、交接摘要）
 memory_provider.py          MemoryProvider 抽象基类 + LLM 事实提取助手
 memory_manager.py           外部 provider 编排（加载/召回/同步/工具路由）
@@ -63,7 +70,8 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
 3. **三层记忆**：
    - 会话历史 → `sessions.db`（原始档案，FTS5 检索）
    - 外部同步 → LLM 提取事实 → 向量库（`sync_turn`，对齐 mem0 `infer=True`）
-   - 记忆审查 → `MEMORY.md` / `USER.md`（常驻注入，每 3 轮 + 会话结束）
+   - 记忆审查 → `MEMORY.md` / `USER.md`（常驻注入，每 `MEMORY_NUDGE_INTERVAL` 轮
+     默认 10、后台异步 + 会话结束）
 4. **多轮对话**：REPL 连续问答、增量落库、`--resume <session_id>` 恢复
 5. **上下文压缩**：`context_compressor.py`，中间轮次摘要化 + 保留最近 N 条 + merge-into-tail
 6. **外部 memory provider 插件**：ABC + 动态加载 + 工具路由；`MEMORY_PROVIDER=keyword|vector`
@@ -109,7 +117,7 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     0 禁用），人工批准重置；DANGEROUS_PATTERNS 新增 base64|bash、eval $(curl)、
     openssl 解码、heredoc 等混淆检测；LLM client 已串进 run_tool → run_terminal
     → check_dangerous_command
-15. **记忆同步异步化 + 合并节流**：`memory_manager.py` 新增 _SyncWorker——
+15. **记忆同步异步化 + 合并节流**：`memory_manager.py` 新增 SyncWorker——
     sync_all 丢给单线程后台 worker 立即返回（对齐 Hermes：慢 provider 不阻塞对话结尾，
     案例：Hindsight daemon 曾阻塞 298s）；串行执行保证第 N 轮先于第 N+1 轮；
     合并节流（worker 未开始的旧任务被最新覆盖，messages 全量历史不丢数据）；
@@ -141,6 +149,23 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     摘要后把丢失标记补回 "## Pruned Skills" 区块（上限 20 个防膨胀）；
     _summarize 的输入里大技能裁成标记、小技能保留原文；SYSTEM_PROMPT 新增规则 10
     （看到标记用 skill_view 重载，每个技能一次）
+21. **用户自定义 deny 规则**：approval.py 对齐 Hermes approvals.deny——
+    APPROVAL_DENY（; 分隔的 fnmatch glob，大小写不敏感）命中即无条件拦截；
+    检查位置在硬性禁止之后、永久允许列表与 mode=off 之前（用户说"永不"就是
+    永不，连旁路都绕不过）；返回 user_deny=True + BLOCKED + "不要重试"
+22. **内容级扫描 tirith.py**：Hermes tools/tirith_security.py 的 Python 简化版——
+    检测正则认不出的语义威胁：ANSI 转义/控制字符/单独回车（终端注入）、零宽/
+    双向覆盖符（隐形文字）、同形字域名（西里尔等易混淆字符）、管道到解释器；
+    返回契约对齐 Hermes {"action": allow|warn|block, "findings", "summary"}；
+    发现合并进审批门卫（block 需审批、warn 带警告），TIRITH_ENABLED /
+    TIRITH_FAIL_OPEN 可配，mode=off 旁路仍优先（对齐 Hermes 顺序）
+23. **HTTP 服务化 + gateway 审批通知**：server.py 零新依赖（标准库
+    ThreadingHTTPServer）——POST /chat / GET /approvals/pending /
+    POST /approvals/resolve / GET /health；approval.py 新增网关队列（对齐 Hermes
+    register_gateway_notify / _await_gateway_decision / resolve_gateway_approval：
+    _ApprovalEntry 带 threading.Event 当"门铃"，agent 线程阻塞、HTTP resolve 唤醒、
+    FIFO、超时失败关闭、unregister 唤醒为拒绝）；非交互自动放行对网关会话豁免；
+    主循环抽取 process_turn 供 REPL 与服务器共用；_lock 补齐线程安全
 
 ## 运行方式
 
@@ -151,14 +176,22 @@ python minimal_agent.py "夜莺项目什么时候发版？"
 python minimal_agent.py
 # 恢复会话
 python minimal_agent.py --resume session-xxx
+# HTTP 服务化（/chat + 审批轮询/resolve）
+python server.py                    # 默认 127.0.0.1:8000；端点见 README
+# 文件工具离线可视化演示
+python demo_file_tools.py
 ```
 
 - 环境变量在 `.env`（DeepSeek 用 `DEEPSEEK_API_KEY`；向量用 `EMBEDDING_*`，已配好）
 - 常用开关：`MEMORY_PROVIDER=vector`（语义召回）、`CONTEXT_WINDOW`、`PROTECT_LAST_N`
 - Windows 中文乱码先设 `$env:PYTHONIOENCODING="utf-8"`
 - 本机测试可用内置 Python：`C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`
+- ⚠️ 当前工作树有大量未提交改动（整个骨架从零开始累积），新会话先看 `git status`
 
 ## 已验证的测试
+
+> 注：下面各测试文件记录的"条数"是当时统计，可能随用例增改漂移；
+> 以直接运行 `python tests/test_xxx.py` 的输出为准（当前共 15 套）。
 
 - 多轮对话跨轮次回答、`--resume` 恢复
 - Qwen embedding 真调成功（1024 维）、向量召回 → 模型引用召回回答
@@ -206,27 +239,43 @@ python minimal_agent.py --resume session-xxx
 - 回归测试脚本 `tests/test_skills_compression.py`：14 条断言全过（标记往返/
   调用点识别/幽灵技能收集/补标记不重复/端到端：大技能裁标记 + 小技能留原文 +
   摘要后补回）
+- 回归测试脚本 `tests/test_approval_deny.py`：11 条断言全过（glob/大小写/多条、
+  deny 先于 allowlist 与 off、返回结构）
+- 回归测试脚本 `tests/test_tirith.py`：16 条断言全过（终端注入/隐形字符/同形字/
+  管道检测、开关与 fail-open、审批集成含 off 旁路）
+- 回归测试脚本 `tests/test_gateway_approval.py`：11 条断言全过（阻塞/唤醒/FIFO/
+  超时失败关闭/理由传递/session 持久化/unregister 唤醒为拒绝）
+- 回归测试脚本 `tests/test_server.py`：9 条断言全过（health/pending 空与有挂起/
+  resolve 唤醒阻塞线程/chat 正常对话与 400 校验）
 - 回归测试脚本 `tests/test_file_tools.py` 新增 patch 组：唯一替换/多次报错/replace_all/
   已应用 no-change/.env 拒绝/CRLF 保留（修复了 Windows write_text 双换行 bug）；
   并行测试补 patch+write 同路径顺序、不同路径并行
 
 ## 已知限制 / 下一步候选
 
-- 审批增强：Smart Approval（辅助 LLM）/ 连续拒绝熔断 / 命令混淆检测（base64、$() 等）/
-  cron 与 gateway 审批上下文、用户自定义 deny 规则、tirith 内容级扫描
-  （对齐 `tools/approval.py` 剩余部分）
+- 审批增强已完成（smart/熔断/混淆/deny/tirith）；剩余仅 cron 审批上下文
+  （`approvals.cron_mode`，对齐 `tools/approval.py` 剩余部分）
 - 文件工具简化：patch 只做 replace 模式（无 V4A 补丁头/模糊匹配/语法检查），
   无陈旧检测/文件锁、无文档抽取；
   搜索仍跳过敏感文件（Hermes 也过滤敏感路径的搜索结果）
 - 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）
-- Skills 增强：上下文压缩时的技能 prune/reinject、前置条件检查、技能 hub 同步
+- Skills 增强：prune/reinject 已完成；剩余前置条件检查、技能 hub 同步
   （Hermes 有，骨架简化掉了）
 - 脱敏简化：URL 查询参数（Hermes 默认关闭）、手机号、DB 连接串专项未做
+
+## 下一阶段（前端 / 服务增强）
+
+- 前端 Web 页面：连 `POST /chat` + 审批按钮（轮询 pending → resolve），
+  参考 Hermes `web/`（Vite + React）与 `apps/desktop/`（Electron）
+- 服务增强：SSE 流式响应 / 请求鉴权（token）/ 会话列表管理
+- 审批剩余：cron 审批上下文（`approvals.cron_mode`）
+- 运维：服务化下的日志、进程守护（Hermes 用 systemd/gateway daemon）
 
 ## 给新会话的起始指令（可直接粘贴）
 
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里：Skills 与压缩联动（已完成：prune/reinject + 幽灵技能防漏）。
-> 下一步候选：审批剩余（deny 规则/tirith）或服务化（为前端铺路）。
+> 我们上次停在这里：HTTP 服务化 + gateway 审批通知（已完成：server.py 四个端点 +
+  网关队列；内核候选已清零，进入前端阶段）。
+> 下一步候选：前端 Web 页面（连 /chat + 审批按钮）或服务增强（SSE 流式 / 鉴权）。

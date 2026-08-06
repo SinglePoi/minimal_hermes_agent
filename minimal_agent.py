@@ -1080,6 +1080,60 @@ def hydrate_nudge_counter(prior_user_turns: int, interval: int) -> int:
     return prior_user_turns % interval
 
 
+def process_turn(
+    client: OpenAI,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    manager: MemoryManager | None,
+    session_id: str,
+    user_input: str,
+    turn_count: int,
+    turns_since_memory: int,
+    review_worker: SyncWorker,
+    persisted_count: int,
+) -> tuple[int, int, int]:
+    """处理一条用户消息（REPL 与服务器共用）：召回 → 对话 → 落库 → 同步 → nudge。
+
+    返回 (turn_count, turns_since_memory, persisted_count) 供调用方续接状态。
+    """
+    turn_count += 1
+
+    # 每轮 prefetch：外部 provider 按当前问题召回（对齐 Hermes 每轮 prefetch_all）
+    user_content = user_input
+    if manager:
+        ext_context = manager.prefetch_all(user_input, session_id=session_id)
+        if ext_context:
+            user_content += "\n\n" + build_memory_context_block(ext_context)
+            console.print(
+                Panel(ext_context[:300], title="🔌 外部记忆召回", border_style="magenta")
+            )
+
+    messages.append({"role": "user", "content": user_content})
+    console.print(f"[dim]📚 会话：{session_id}[/dim]")
+    run_agent_turn(client, messages, tools, manager, session_id)
+
+    # 增量落库（对齐 Hermes：消息逐轮写入 SessionDB，中途退出也不丢）
+    persist_messages(session_id, messages, start=persisted_count)
+    persisted_count = len(messages)
+
+    # 同步本轮对话给外部 provider（对齐 Hermes 的 sync_all）
+    if manager:
+        last = messages[-1] if messages else {}
+        assistant_text = last.get("content", "") if last.get("role") == "assistant" else ""
+        manager.sync_all(user_input, assistant_text, messages=messages, client=client)
+
+    # 记忆 nudge：按可配置间隔触发，后台异步审查（对齐 Hermes：不阻塞对话）
+    should_review, turns_since_memory = should_run_memory_nudge(
+        turns_since_memory, MEMORY_NUDGE_INTERVAL
+    )
+    if should_review:
+        review_worker.submit(
+            lambda msgs=list(messages), cli=client: review_memory_turn(cli, msgs)
+        )
+
+    return turn_count, turns_since_memory, persisted_count
+
+
 def main():
     if not API_KEY:
         console.print(
@@ -1176,41 +1230,18 @@ def main():
         if user_input in ("退出", "exit", "quit", "/exit"):
             break
 
-        turn_count += 1
-
-        # 每轮 prefetch：外部 provider 按当前问题召回（对齐 Hermes 每轮 prefetch_all）
-        user_content = user_input
-        if memory_manager:
-            ext_context = memory_manager.prefetch_all(user_input, session_id=session_id)
-            if ext_context:
-                user_content += "\n\n" + build_memory_context_block(ext_context)
-                console.print(Panel(ext_context[:300], title="🔌 外部记忆召回", border_style="magenta"))
-
-        messages.append({"role": "user", "content": user_content})
-
-        console.print(f"[dim]📚 会话：{session_id}[/dim]")
-        run_agent_turn(client, messages, tools, memory_manager, session_id)
-
-        # 增量落库（对齐 Hermes：消息逐轮写入 SessionDB，中途退出也不丢）
-        persist_messages(session_id, messages, start=persisted_count)
-        persisted_count = len(messages)
-
-        # 同步本轮对话给外部 provider（对齐 Hermes 的 sync_all）
-        if memory_manager:
-            last = messages[-1] if messages else {}
-            assistant_text = last.get("content", "") if last.get("role") == "assistant" else ""
-            memory_manager.sync_all(
-                user_input, assistant_text, messages=messages, client=client
-            )
-
-        # 记忆 nudge：按可配置间隔触发，后台异步审查（对齐 Hermes：不阻塞对话）
-        should_review, turns_since_memory = should_run_memory_nudge(
-            turns_since_memory, MEMORY_NUDGE_INTERVAL
+        turn_count, turns_since_memory, persisted_count = process_turn(
+            client,
+            messages,
+            tools,
+            memory_manager,
+            session_id,
+            user_input,
+            turn_count,
+            turns_since_memory,
+            review_worker,
+            persisted_count,
         )
-        if should_review:
-            review_worker.submit(
-                lambda msgs=list(messages), cli=client: review_memory_turn(cli, msgs)
-            )
 
         if one_shot_mode:
             break  # 一次性问题已答完，退出

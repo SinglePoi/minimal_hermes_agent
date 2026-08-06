@@ -32,6 +32,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from redact import redact_sensitive_text
+from tirith import check_command_security
 
 console = Console()
 BASE_DIR = Path(__file__).parent
@@ -212,6 +213,7 @@ def detect_dangerous_command(command: str) -> tuple[bool, Optional[str], Optiona
 # =========================================================================
 _session_approved: dict[str, set] = {}
 _permanent_approved: set = set()
+_lock = threading.Lock()  # 会话/网关审批状态的互斥锁（对齐 Hermes 的线程安全）
 
 
 def approve_session(session_key: str, pattern_key: str) -> None:
@@ -424,6 +426,48 @@ def _get_smart_policy() -> str:
     return os.environ.get("APPROVAL_SMART_POLICY", "").strip()
 
 
+def _get_user_deny_patterns() -> list[str]:
+    """读取用户自定义 deny 规则（APPROVAL_DENY，; 分隔的 fnmatch glob）。
+
+    对齐 Hermes 的 approvals.deny（config.yaml 里的 glob 列表），骨架用环境变量。
+    """
+    raw = os.environ.get("APPROVAL_DENY", "").strip()
+    if not raw:
+        return []
+    return [p.strip() for p in raw.split(";") if p.strip()]
+
+
+def _match_user_deny_rule(command: str) -> str | None:
+    """检查命令是否命中用户自定义 deny 规则，命中返回该规则（对齐 Hermes 同名函数）。
+
+    规则是 fnmatch glob、大小写不敏感，匹配整条命令；命中即无条件拦截——
+    先于 APPROVAL_MODE=off 旁路与永久允许列表，用户说"永不"就是永不。
+    （Hermes 会对命令做反混淆变体后再匹配；骨架简化：直接匹配原始命令。）
+    """
+    globs = _get_user_deny_patterns()
+    if not globs:
+        return None
+    candidate = command.lower().strip()
+    for pattern in globs:
+        if fnmatch.fnmatchcase(candidate, pattern.lower()):
+            return pattern
+    return None
+
+
+def _user_deny_block_result(pattern: str) -> dict[str, Any]:
+    """构造用户 deny 规则的拦截结果（对齐 Hermes _user_deny_block_result）。"""
+    return {
+        "approved": False,
+        "user_deny": True,
+        "message": (
+            f"BLOCKED: this command matches the user-defined deny rule "
+            f"'{pattern}' (APPROVAL_DENY). It cannot be executed via the "
+            "agent — not even with approvals.mode=off. Do NOT retry or "
+            "rephrase this command; the user has explicitly forbidden it."
+        ),
+    }
+
+
 def _get_denial_breaker_threshold() -> int:
     """读取连续拒绝熔断阈值（APPROVAL_DENIAL_BREAKER，默认 3；0 表示禁用）。"""
     try:
@@ -462,6 +506,189 @@ def _denial_breaker_addendum(session_key: str) -> str:
         "operation. Report the blocked operation to the user and ask them "
         "to run it manually if it is genuinely needed."
     )
+
+
+# =========================================================================
+# 网关审批队列（对齐 Hermes tools/approval.py 的 gateway 机制）
+# =========================================================================
+class _ApprovalEntry:
+    """一条挂起的网关审批：event 是"门铃"，resolve 时按响唤醒阻塞的 agent 线程。"""
+
+    def __init__(self, data: dict) -> None:
+        self.event = threading.Event()
+        self.data = data
+        self.result: Optional[str] = None  # once / session / always / deny
+        self.reason: Optional[str] = None  # 拒绝时的可选理由
+
+
+_gateway_queues: dict[str, list[_ApprovalEntry]] = {}
+_gateway_notify_cbs: dict[str, Any] = {}
+
+
+def register_gateway_notify(session_key: str, cb) -> None:
+    """注册会话的通知回调（对齐 Hermes：cb(approval_data) -> None，只负责发消息）。"""
+    with _lock:
+        _gateway_notify_cbs[session_key] = cb
+
+
+def unregister_gateway_notify(session_key: str) -> None:
+    """注销回调并唤醒该会话所有阻塞线程（按拒绝处理，防挂死）。"""
+    with _lock:
+        _gateway_notify_cbs.pop(session_key, None)
+        entries = _gateway_queues.pop(session_key, [])
+    for entry in entries:
+        entry.result = "deny"
+        entry.event.set()
+
+
+def get_gateway_notify(session_key: str):
+    """返回会话的通知回调；未注册返回 None。"""
+    with _lock:
+        return _gateway_notify_cbs.get(session_key)
+
+
+def list_pending_approvals(session_key: str) -> list[dict]:
+    """列出会话当前挂起的审批（供轮询接口读取，对齐 Hermes 的 pending 展示）。"""
+    with _lock:
+        queue = _gateway_queues.get(session_key, [])
+        return [
+            {
+                "command": entry.data.get("command", ""),
+                "description": entry.data.get("description", ""),
+                "pattern_key": entry.data.get("pattern_key", ""),
+            }
+            for entry in queue
+        ]
+
+
+def resolve_gateway_approval(
+    session_key: str,
+    choice: str,
+    reason: Optional[str] = None,
+) -> int:
+    """按响门铃：解决会话最旧的一条挂起审批（对齐 Hermes 的 FIFO + reason）。"""
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return 0
+        entry = queue.pop(0)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+    entry.result = choice
+    if reason:
+        entry.reason = reason
+    entry.event.set()
+    return 1
+
+
+def _await_gateway_decision(
+    session_key: str,
+    notify_cb,
+    approval_data: dict,
+    timeout_seconds: Optional[int] = None,
+) -> dict:
+    """入队 + 通知 + 阻塞等待用户 resolve（对齐 Hermes _await_gateway_decision）。
+
+    返回 {"resolved": bool, "choice": str|None, "reason": str|None}；
+    通知失败返回 notify_failed=True（调用方必须失败关闭）。
+    """
+    entry = _ApprovalEntry(approval_data)
+    with _lock:
+        _gateway_queues.setdefault(session_key, []).append(entry)
+
+    def _drop_entry() -> None:
+        """把条目移出队列（解决后或失败时清理）。"""
+        with _lock:
+            queue = _gateway_queues.get(session_key, [])
+            if entry in queue:
+                queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
+
+    try:
+        notify_cb(approval_data)
+    except Exception:
+        _drop_entry()
+        return {"resolved": False, "choice": None, "reason": None,
+                "notify_failed": True}
+
+    if timeout_seconds is None:
+        timeout_seconds = _get_approval_timeout()
+    resolved = entry.event.wait(timeout=max(timeout_seconds, 0))
+    _drop_entry()
+    if not resolved:
+        return {"resolved": False, "choice": None, "reason": None}
+    return {"resolved": True, "choice": entry.result, "reason": entry.reason}
+
+
+def _apply_approval_choice(
+    session_key: str,
+    pattern_key: str,
+    description: str,
+    choice: str | None,
+    smart_denied_for_owner: bool = False,
+    deny_reason: str = "",
+) -> dict[str, Any]:
+    """统一处理审批选择（CLI 与网关共用）：拒绝/超时失败关闭，通过则持久化。
+
+    smart deny 的人工覆盖只允许"仅本次"——session/always 不当持久化。
+    """
+    if choice == "timeout" or choice is None:
+        breaker = _denial_breaker_addendum(session_key) if smart_denied_for_owner else ""
+        return {
+            "approved": False,
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "timeout",
+            "user_consent": False,
+            "message": (
+                "BLOCKED: Command timed out without user response. The user "
+                "has NOT consented to this action. Do NOT retry this command, "
+                "do NOT rephrase it, and do NOT attempt the same outcome via "
+                "a different command. Silence is not consent."
+                + breaker
+            ),
+        }
+    if choice == "deny":
+        breaker = _denial_breaker_addendum(session_key) if smart_denied_for_owner else ""
+        reason_addendum = ""
+        if deny_reason:
+            reason_addendum = f' Reason given by the user: "{deny_reason}".'
+        return {
+            "approved": False,
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "denied",
+            "user_consent": False,
+            "message": (
+                "BLOCKED: User denied this command. The user has NOT consented "
+                "to this action. Do NOT retry this command, do NOT rephrase "
+                "it, and do NOT attempt the same outcome via a different "
+                "command. Stop the current workflow and wait for the user to "
+                "respond before taking any further destructive or "
+                "irreversible action."
+                + reason_addendum
+                + breaker
+            ),
+        }
+
+    # once / session / always：按选择持久化（smart deny 覆盖只允许 once）
+    if choice == "session" and not smart_denied_for_owner:
+        approve_session(session_key, pattern_key)
+    elif choice == "always" and not smart_denied_for_owner:
+        approve_session(session_key, pattern_key)
+        approve_permanent(pattern_key)
+        save_permanent_allowlist()
+
+    # 人工批准（含 smart deny 的单次覆盖）重置连续拒绝计数
+    _reset_denials(session_key)
+    return {
+        "approved": True,
+        "message": None,
+        "pattern_key": pattern_key,
+        "user_approved": True,
+        "description": description,
+    }
 
 
 def _strip_line_comment(line: str) -> str:
@@ -591,14 +818,29 @@ def check_dangerous_command(
         console.print(f"[red]🚫 {hardline_desc}[/red]")
         return _hardline_block_result(hardline_desc or "hardline block")
 
+    # 1.5 用户自定义 deny 规则（对齐 Hermes：先于 allowlist / mode=off，无条件拦截）
+    deny_pattern = _match_user_deny_rule(command)
+    if deny_pattern is not None:
+        console.print(f"[red]🚫 命中用户 deny 规则：{deny_pattern}[/red]")
+        return _user_deny_block_result(deny_pattern)
+
     # 2. 永久允许列表精确匹配
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
-    # 3. 危险模式检测
+    # 3. 危险模式检测 + 内容级扫描（tirith 简化版：正则之外的语义威胁，对齐 Hermes）
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
-    if not is_dangerous:
+    tirith_result = check_command_security(command)
+    tirith_flagged = tirith_result.get("action") in ("block", "warn")
+    if not is_dangerous and not tirith_flagged:
         return {"approved": True, "message": None}
+    if tirith_result.get("findings"):
+        extra = "；".join(f["description"] for f in tirith_result["findings"])
+        description = f"{description}；{extra}" if description else extra
+        pattern_key = pattern_key or (
+            "tirith:" + tirith_result["findings"][0].get("type", "content")
+        )
+        console.print(f"[dim]🛡️ 内容级扫描：{extra}[/dim]")
 
     # 4. 会话/永久已批准
     if is_approved(session_key, pattern_key or ""):
@@ -608,8 +850,9 @@ def check_dangerous_command(
     if _get_approval_mode() == "off":
         return {"approved": True, "message": None, "description": description}
 
-    # 6. 非交互 → 自动放行（Hermes 主门卫的 fail-open 历史行为）
-    if not _is_interactive_cli():
+    # 6. 非交互 → 自动放行（Hermes 主门卫的 fail-open 历史行为；
+    #    网关会话除外——它们有通知回调，走队列阻塞而不是放行）
+    if not _is_interactive_cli() and get_gateway_notify(session_key) is None:
         display = redact_sensitive_text(command, force=True) or command
         console.print(
             f"[dim]ℹ️ 非交互模式：危险命令已自动放行（{description}）——"
@@ -644,68 +887,59 @@ def check_dangerous_command(
             )
         # escalate → 落回人工审批
 
-    # 8. 人工审批（smart deny 时只给“仅本次/拒绝”，不给会话/永久记忆）
+    # 8. 审批：有 gateway 回调 → 走网关队列（阻塞等 resolve）；否则终端提示
+    #    （对齐 Hermes：gateway 会话用 submit_pending + resolve 而非 input()）
+    notify_cb = get_gateway_notify(session_key)
+    if notify_cb is not None:
+        decision = _await_gateway_decision(
+            session_key,
+            notify_cb,
+            {
+                "command": redact_sensitive_text(command, force=True) or command,
+                "description": description or "",
+                "pattern_key": pattern_key,
+                "pattern_keys": [pattern_key] if pattern_key else [],
+                "allow_permanent": not smart_denied_for_owner,
+            },
+        )
+        if decision.get("notify_failed"):
+            return {
+                "approved": False,
+                "pattern_key": pattern_key,
+                "description": description,
+                "outcome": "notify_failed",
+                "user_consent": False,
+                "message": (
+                    "BLOCKED: Failed to send approval request to the user. "
+                    "Do NOT retry."
+                ),
+            }
+        choice = decision.get("choice")
+        if not decision.get("resolved") or choice is None:
+            choice = "timeout"
+        return _apply_approval_choice(
+            session_key,
+            pattern_key or "",
+            description or "",
+            choice,
+            smart_denied_for_owner=smart_denied_for_owner,
+            deny_reason=decision.get("reason") or "",
+        )
+
+    # 终端提示（smart deny 时只给"仅本次/拒绝"，不给会话/永久记忆）
     choice = prompt_dangerous_approval(
         command,
         description or "",
         allow_permanent=not smart_denied_for_owner,
         smart_denied=smart_denied_for_owner,
     )
-
-    if choice == "timeout":
-        breaker = _denial_breaker_addendum(session_key) if smart_denied_for_owner else ""
-        return {
-            "approved": False,
-            "pattern_key": pattern_key,
-            "description": description,
-            "outcome": "timeout",
-            "user_consent": False,
-            "message": (
-                "BLOCKED: Command timed out without user response. The user "
-                "has NOT consented to this action. Do NOT retry this command, "
-                "do NOT rephrase it, and do NOT attempt the same outcome via "
-                "a different command. Silence is not consent."
-                + breaker
-            ),
-        }
-    if choice == "deny":
-        breaker = _denial_breaker_addendum(session_key) if smart_denied_for_owner else ""
-        return {
-            "approved": False,
-            "pattern_key": pattern_key,
-            "description": description,
-            "outcome": "denied",
-            "user_consent": False,
-            "message": (
-                "BLOCKED: User denied this command. The user has NOT consented "
-                "to this action. Do NOT retry this command, do NOT rephrase "
-                "it, and do NOT attempt the same outcome via a different "
-                "command. Stop the current workflow and wait for the user to "
-                "respond before taking any further destructive or "
-                "irreversible action."
-                + breaker
-            ),
-        }
-
-    # 9. once / session / always：按选择持久化（对齐 Hermes 的持久化分支）。
-    #    smart deny 的人工覆盖只允许 once——不记忆、不写允许列表
-    if choice == "session" and not smart_denied_for_owner:
-        approve_session(session_key, pattern_key or "")
-    elif choice == "always" and not smart_denied_for_owner:
-        approve_session(session_key, pattern_key or "")
-        approve_permanent(pattern_key or "")
-        save_permanent_allowlist()
-
-    # 人工批准（含 smart deny 的单次覆盖）重置连续拒绝计数
-    _reset_denials(session_key)
-
-    return {
-        "approved": True,
-        "message": None,
-        "pattern_key": pattern_key,
-        "user_approved": True,
-        "description": description,
-    }
+    return _apply_approval_choice(
+        session_key,
+        pattern_key or "",
+        description or "",
+        choice,
+        smart_denied_for_owner=smart_denied_for_owner,
+    )
 
 
 # 模块导入时加载永久允许列表（对齐 Hermes 末尾的 load_permanent_allowlist()）
