@@ -8,6 +8,7 @@ HTTP 服务化 + 网关审批端点的回归测试（零依赖，直接运行）
     - GET /approvals/pending 轮询（空 / 有挂起项）
     - POST /approvals/resolve 解决（无挂起返回 0；有挂起唤醒阻塞线程）
     - POST /chat 正常对话（假 client）+ 参数校验
+    - GET / 与 /web/* 静态前端（含路径穿越拒绝）
 """
 
 import json
@@ -135,6 +136,7 @@ def test_health_and_pending() -> None:
         pending = http_json("GET", f"{fx.base}/approvals/pending?session_id=s1")
         check("有挂起 -> 1 条", len(pending["pending"]) == 1)
         check("挂起项含命令", "git reset" in pending["pending"][0]["command"])
+        check("挂起项暴露 allow_permanent", pending["pending"][0]["allow_permanent"] is True)
 
         resolved = http_json(
             "POST", f"{fx.base}/approvals/resolve",
@@ -174,12 +176,53 @@ def test_chat_endpoint() -> None:
         fx.close()
 
 
+def http_get(url: str) -> tuple[int, str, bytes]:
+    """发 GET 请求，返回 (状态码, Content-Type, 响应体)。"""
+    import urllib.error
+
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            return resp.status, resp.headers.get("Content-Type", ""), resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers.get("Content-Type", ""), exc.read()
+
+
+def test_static_frontend() -> None:
+    """静态前端：首页 / app.js / style.css 可访问，缺失与路径穿越返回 404。"""
+    fx = ServerFixture()
+    try:
+        status, ctype, body = http_get(f"{fx.base}/")
+        check("GET / 返回 200", status == 200)
+        check("GET / 是 text/html", ctype.startswith("text/html"))
+        check("首页包含页面标题", "夜莺" in body.decode("utf-8", errors="replace"))
+
+        status, ctype, body = http_get(f"{fx.base}/web/app.js")
+        check("GET /web/app.js 返回 200", status == 200)
+        check("app.js 是 javascript", ctype.startswith("text/javascript"))
+        check("app.js 含审批轮询逻辑", "approvals/pending" in body.decode("utf-8"))
+
+        status, _, _ = http_get(f"{fx.base}/web/style.css")
+        check("GET /web/style.css 返回 200", status == 200)
+
+        status, _, _ = http_get(f"{fx.base}/web/not-exist.js")
+        check("缺失静态文件 -> 404", status == 404)
+
+        # 路径穿越（URL 编码的 ../，客户端不会自行归一化）
+        status, _, _ = http_get(f"{fx.base}/web/%2e%2e/approval.py")
+        check("编码路径穿越 -> 404", status == 404)
+        status, _, _ = http_get(f"{fx.base}/web/%2e%2e/%2e%2e/approval.py")
+        check("深层路径穿越 -> 404", status == 404)
+    finally:
+        fx.close()
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== HTTP 服务化回归测试 ==")
     for test_fn in (
         test_health_and_pending,
         test_chat_endpoint,
+        test_static_frontend,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

@@ -1,0 +1,384 @@
+"use strict";
+/* 夜莺 Web 前端：连 server.py 的 /chat + 审批轮询/resolve。
+   与 Hermes dashboard 的交互契约对齐：/chat 阻塞等待审批，前端轮询
+   /approvals/pending 发现待审批项，POST /approvals/resolve 后线程被唤醒。 */
+
+const API = {
+  chat: "/chat",
+  pending: "/approvals/pending",
+  resolve: "/approvals/resolve",
+  health: "/health",
+};
+
+const STORAGE_KEY = "nightingale.session";
+const POLL_INTERVAL_MS = 800;
+
+const state = {
+  sessionId: "",
+  inFlight: false,
+  pollTimer: null,
+  abort: null,
+  queueCount: 0,
+  pendingItem: null,
+};
+
+const $ = (id) => document.getElementById(id);
+const chatEl = $("chat");
+const emptyEl = $("empty-state");
+const inputEl = $("input");
+const sendBtn = $("btn-send");
+const statusEl = $("status");
+const statusText = $("status-text");
+
+/* ---------- 工具函数 ---------- */
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+/* 极简 Markdown 渲染（先整体转义再包标签，杜绝 XSS）。
+   支持：```代码块```、`行内代码`、**加粗**、*斜体*、列表、段落。 */
+function renderMarkdown(text) {
+  const safe = escapeHtml(text);
+  const lines = safe.split("\n");
+  const out = [];
+  let inFence = false;
+  let fenceBuf = [];
+  let listBuf = [];
+
+  const inline = (s) =>
+    s
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+      .replace(/`([^`]+)`/g, "<code>$1</code>");
+
+  const flushList = () => {
+    if (listBuf.length) {
+      out.push("<ul>" + listBuf.join("") + "</ul>");
+      listBuf = [];
+    }
+  };
+
+  const closeFence = () => {
+    out.push("<pre><code>" + fenceBuf.join("\n") + "</code></pre>");
+    fenceBuf = [];
+  };
+
+  for (const line of lines) {
+    if (/^```/.test(line)) {
+      flushList();
+      if (inFence) {
+        closeFence();
+        inFence = false;
+      } else {
+        inFence = true;
+      }
+      continue;
+    }
+    if (inFence) {
+      fenceBuf.push(line);
+      continue;
+    }
+    if (/^[-*]\s+/.test(line)) {
+      listBuf.push("<li>" + inline(line.replace(/^[-*]\s+/, "")) + "</li>");
+      continue;
+    }
+    if (/^\d+\.\s+/.test(line)) {
+      listBuf.push("<li>" + inline(line.replace(/^\d+\.\s+/, "")) + "</li>");
+      continue;
+    }
+    flushList();
+    if (line.trim() === "") {
+      continue;
+    }
+    if (/^#{1,3}\s/.test(line)) {
+      out.push("<p><strong>" + inline(line.replace(/^#{1,3}\s/, "")) + "</strong></p>");
+    } else {
+      out.push("<p>" + inline(line) + "</p>");
+    }
+  }
+  flushList();
+  if (inFence) closeFence();
+  return out.join("");
+}
+
+function appendMessage(role, text) {
+  emptyEl.classList.add("hidden");
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  if (role === "assistant") {
+    div.innerHTML = renderMarkdown(text);
+  } else {
+    div.textContent = text;
+  }
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return div;
+}
+
+function setThinking(on) {
+  if (on) {
+    if (!chatEl.querySelector(".msg.thinking")) {
+      const div = document.createElement("div");
+      div.className = "msg thinking";
+      div.textContent = "夜莺思考中";
+      emptyEl.classList.add("hidden");
+      chatEl.appendChild(div);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+  } else {
+    const el = chatEl.querySelector(".msg.thinking");
+    if (el) el.remove();
+  }
+}
+
+function setOnline(ok, text) {
+  const dot = statusEl.querySelector(".dot");
+  dot.classList.toggle("ok", ok);
+  dot.classList.toggle("err", !ok);
+  statusText.textContent = text;
+}
+
+async function httpJson(method, url, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  if (state.abort && method === "POST") {
+    opts.signal = state.abort.signal;
+  }
+  const resp = await fetch(url, opts);
+  let data = {};
+  try {
+    data = await resp.json();
+  } catch (e) {
+    /* 非 JSON 响应 */
+  }
+  if (!resp.ok) {
+    const err = new Error((data && data.error) || ("HTTP " + resp.status));
+    err.status = resp.status;
+    throw err;
+  }
+  return data;
+}
+
+function loadSession() {
+  try {
+    return localStorage.getItem(STORAGE_KEY) || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+function saveSession(id) {
+  try {
+    if (id) localStorage.setItem(STORAGE_KEY, id);
+    else localStorage.removeItem(STORAGE_KEY);
+  } catch (e) {
+    /* 隐私模式忽略 */
+  }
+}
+
+/* ---------- 审批 ---------- */
+
+function renderPending(items) {
+  state.queueCount = items.length;
+  state.pendingItem = items.length ? items[0] : null;
+
+  if (!state.pendingItem) {
+    $("approval-overlay").classList.add("hidden");
+    return;
+  }
+
+  const item = state.pendingItem;
+  $("approval-desc").textContent = item.description || "未知";
+  $("approval-cmd").textContent = item.command || "";
+  const allowPermanent = item.allow_permanent !== false;
+  $("btn-always").classList.toggle("hidden", !allowPermanent);
+
+  const note = [];
+  if (item.allow_permanent === false) {
+    note.push("智能审查已判定危险，仅允许单次覆盖，不支持永久/会话记忆。");
+  }
+  if (state.queueCount > 1) {
+    note.push("还有 " + (state.queueCount - 1) + " 条命令排队等待处理（按先进先出）。");
+  }
+  $("approval-note").textContent = note.join(" ");
+  $("approval-note").classList.toggle("hidden", note.length === 0);
+  $("approval-queue").classList.toggle("hidden", state.queueCount <= 1);
+  $("approval-queue").textContent = "队列 " + state.queueCount;
+
+  $("deny-box").classList.add("hidden");
+  $("deny-reason").value = "";
+  $("approval-overlay").classList.remove("hidden");
+}
+
+async function pollApprovals() {
+  if (!state.sessionId) return;
+  try {
+    const data = await httpJson("GET", API.pending + "?session_id=" + encodeURIComponent(state.sessionId));
+    renderPending(data.pending || []);
+  } catch (e) {
+    /* 轮询失败静默重试，主请求的错误由 /chat 抛给用户 */
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  pollApprovals();
+  state.pollTimer = setInterval(pollApprovals, POLL_INTERVAL_MS);
+}
+
+function stopPolling() {
+  if (state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+}
+
+async function resolveApproval(choice) {
+  if (!state.sessionId || !state.pendingItem) return;
+  let reason;
+  if (choice === "deny") {
+    reason = $("deny-reason").value.trim() || undefined;
+  }
+  try {
+    await httpJson("POST", API.resolve, {
+      session_id: state.sessionId,
+      choice,
+      ...(reason ? { reason } : {}),
+    });
+    // 立即刷新一次，让弹窗反映最新队列
+    await pollApprovals();
+  } catch (e) {
+    appendMessage("error", "审批提交失败：" + e.message);
+  }
+}
+
+/* ---------- 对话 ---------- */
+
+async function sendMessage() {
+  const text = inputEl.value.trim();
+  if (!text || state.inFlight) return;
+
+  inputEl.value = "";
+  autoResize();
+  appendMessage("user", text);
+  setThinking(true);
+  state.inFlight = true;
+  sendBtn.disabled = true;
+  inputEl.disabled = true;
+  state.abort = new AbortController();
+  startPolling();
+
+  const body = { message: text };
+  if (state.sessionId) body.session_id = state.sessionId;
+
+  try {
+    const data = await httpJson("POST", API.chat, body);
+    if (data.session_id) {
+      state.sessionId = data.session_id;
+      $("session-id").value = data.session_id;
+      saveSession(data.session_id);
+    }
+    setThinking(false);
+    appendMessage("assistant", data.reply || "(空回复)");
+    setOnline(true, "服务在线");
+  } catch (e) {
+    setThinking(false);
+    appendMessage("error", "请求失败：" + e.message);
+    setOnline(false, "服务异常");
+  } finally {
+    state.inFlight = false;
+    sendBtn.disabled = false;
+    inputEl.disabled = false;
+    stopPolling();
+    inputEl.focus();
+    // 请求结束后若还有未解决审批（如刷新后残留），保留弹窗让用户处理
+    if (state.pendingItem) {
+      pollApprovals();
+    }
+  }
+}
+
+function newSession() {
+  if (state.inFlight) {
+    if (state.abort) state.abort.abort();
+  }
+  state.sessionId = "";
+  state.queueCount = 0;
+  state.pendingItem = null;
+  $("session-id").value = "";
+  saveSession("");
+  chatEl.querySelectorAll(".msg").forEach((el) => el.remove());
+  emptyEl.classList.remove("hidden");
+  stopPolling();
+  $("approval-overlay").classList.add("hidden");
+}
+
+function autoResize() {
+  inputEl.style.height = "auto";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + "px";
+}
+
+/* ---------- 初始化 ---------- */
+
+function bindEvents() {
+  sendBtn.addEventListener("click", sendMessage);
+  inputEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+  inputEl.addEventListener("input", autoResize);
+
+  $("btn-new-session").addEventListener("click", () => {
+    if (state.inFlight || confirm("开始新会话？当前对话消息会被清空（历史仍在服务端）。")) {
+      newSession();
+    }
+  });
+
+  $("session-id").addEventListener("change", () => {
+    const id = $("session-id").value.trim();
+    state.sessionId = id;
+    saveSession(id);
+  });
+
+  // 审批按钮
+  $("btn-once").addEventListener("click", () => resolveApproval("once"));
+  $("btn-session").addEventListener("click", () => resolveApproval("session"));
+  $("btn-always").addEventListener("click", () => resolveApproval("always"));
+  $("btn-deny").addEventListener("click", () => {
+    $("deny-box").classList.remove("hidden");
+    $("deny-reason").focus();
+  });
+  $("btn-deny-cancel").addEventListener("click", () => {
+    $("deny-box").classList.add("hidden");
+  });
+  $("btn-deny-confirm").addEventListener("click", () => resolveApproval("deny"));
+}
+
+async function checkHealth() {
+  try {
+    const data = await httpJson("GET", API.health);
+    setOnline(data.ok === true, "服务在线");
+  } catch (e) {
+    setOnline(false, "服务离线");
+  }
+}
+
+function init() {
+  state.sessionId = loadSession();
+  $("session-id").value = state.sessionId;
+  bindEvents();
+  checkHealth();
+  setInterval(checkHealth, 15000);
+  inputEl.disabled = false;
+  inputEl.focus();
+}
+
+init();

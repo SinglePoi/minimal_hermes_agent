@@ -166,6 +166,20 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     _ApprovalEntry 带 threading.Event 当"门铃"，agent 线程阻塞、HTTP resolve 唤醒、
     FIFO、超时失败关闭、unregister 唤醒为拒绝）；非交互自动放行对网关会话豁免；
     主循环抽取 process_turn 供 REPL 与服务器共用；_lock 补齐线程安全
+24. **前端 Web 页面（web/ 静态站点）**：对齐 Hermes dashboard 交互契约（参考
+    Hermes `web/` 的 Vite + React 设计，按骨架惯例简化为原生 HTML/CSS/JS，
+    零构建、零新依赖）——server.py 托管 `web/`（GET / 与 /web/*，含路径穿越
+    防护），同一 origin 免跨域：
+    - 对话面板：POST /chat、Markdown 子集渲染（先转义防 XSS）、会话 ID 落
+      localStorage、可粘贴旧 ID 恢复、新会话按钮
+    - 审批弹窗：/chat 阻塞期间每 800ms 轮询 pending，按钮 允许一次/本会话/
+      永久允许/拒绝（拒绝可填理由）；allow_permanent=false（smart deny）时
+      隐藏"永久允许"（对齐 Hermes api_server 的 _approval_event_choices）
+    - /health 探活指示器；请求失败/离线有提示
+    - 服务端配套：list_pending_approvals 暴露 allow_permanent；同一会话 /chat
+      加串行锁（对齐 Hermes turn lease）
+    - 回归测试：tests/test_server.py 新增静态端点、路径穿越拒绝、allow_permanent
+      断言；另用 Node DOM 桩冒烟验证 发送→回复→审批弹窗→once/always/deny 全流程
 
 ## 运行方式
 
@@ -177,7 +191,8 @@ python minimal_agent.py
 # 恢复会话
 python minimal_agent.py --resume session-xxx
 # HTTP 服务化（/chat + 审批轮询/resolve）
-python server.py                    # 默认 127.0.0.1:8000；端点见 README
+python server.py                    # 默认 127.0.0.1:8000；浏览器打开 http://127.0.0.1:8000/
+                                    # 即进入 Web 页面（对话 + 审批按钮）；端点见 README
 # 文件工具离线可视化演示
 python demo_file_tools.py
 ```
@@ -255,6 +270,8 @@ python demo_file_tools.py
 
 - 审批增强已完成（smart/熔断/混淆/deny/tirith）；剩余仅 cron 审批上下文
   （`approvals.cron_mode`，对齐 `tools/approval.py` 剩余部分）
+- 前端页面已完成（对话 + 审批轮询/按钮）；剩余服务增强：SSE 流式响应 / 请求鉴权
+  （token）/ 会话列表管理（Hermes web/ 有完整 dashboard，骨架只做最小聊天页）
 - 文件工具简化：patch 只做 replace 模式（无 V4A 补丁头/模糊匹配/语法检查），
   无陈旧检测/文件锁、无文档抽取；
   搜索仍跳过敏感文件（Hermes 也过滤敏感路径的搜索结果）
@@ -265,9 +282,8 @@ python demo_file_tools.py
 
 ## 下一阶段（前端 / 服务增强）
 
-- 前端 Web 页面：连 `POST /chat` + 审批按钮（轮询 pending → resolve），
-  参考 Hermes `web/`（Vite + React）与 `apps/desktop/`（Electron）
 - 服务增强：SSE 流式响应 / 请求鉴权（token）/ 会话列表管理
+  （前端页面已完成，可直接在此基础上扩展）
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
 - 运维：服务化下的日志、进程守护（Hermes 用 systemd/gateway daemon）
 
@@ -276,6 +292,6 @@ python demo_file_tools.py
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里：HTTP 服务化 + gateway 审批通知（已完成：server.py 四个端点 +
-  网关队列；内核候选已清零，进入前端阶段）。
-> 下一步候选：前端 Web 页面（连 /chat + 审批按钮）或服务增强（SSE 流式 / 鉴权）。
+> 我们上次停在这里：前端 Web 页面（已完成：server.py 托管 web/ 静态站点 +
+  对话面板 + 审批轮询/按钮 + allow_permanent 暴露 + 会话串行锁；全套测试通过）。
+> 下一步候选：服务增强（SSE 流式 / 鉴权 / 会话列表）或 cron 审批上下文。

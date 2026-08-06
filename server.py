@@ -10,6 +10,8 @@ HTTP 服务化 + gateway 审批通知（为前端铺路，对齐 Hermes dashboar
     GET  /approvals/pending 轮询待审批；query: ?session_id=xxx
     POST /approvals/resolve 解决审批；body: {"session_id", "choice": once|session|always|deny, "reason"?}
     GET  /health            探活
+    GET  /                  前端页面（web/index.html）
+    GET  /web/<file>        前端静态资源（app.js / style.css 等）
 
 审批流程（对齐 Hermes 的网关队列）：
     - /chat 请求里的 agent 线程在危险命令处通过 approval.py 的网关队列阻塞等待
@@ -22,13 +24,14 @@ resolve 与 /chat 可以同时进行）。
 """
 
 import json
+import os
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from dotenv import load_dotenv
 
@@ -44,6 +47,34 @@ from approval import (  # noqa: E402
     unregister_gateway_notify,
 )
 from memory_manager import SyncWorker  # noqa: E402
+
+# 前端静态资源目录（对齐 Hermes web/ 的命名；本骨架用原生 HTML/CSS/JS，
+# 零构建、零新依赖，由 server.py 直接托管，与 API 同源避免跨域）
+WEB_DIR = ROOT / "web"
+
+_MIME_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+    ".txt": "text/plain; charset=utf-8",
+}
+
+
+def _is_within(path: Path, base: Path) -> bool:
+    """判断 path 是否位于 base 目录内（静态文件路径穿越防护）。"""
+    try:
+        base_resolved = str(base.resolve())
+        return os.path.commonpath([str(path.resolve()), base_resolved]) == base_resolved
+    except (OSError, ValueError):
+        return False
 
 
 class AgentServer:
@@ -88,6 +119,9 @@ class AgentServer:
                 if history
                 else 0
             ),
+            # 同一会话的 /chat 串行执行锁（对齐 Hermes 的 turn lease 语义：
+            # 前端单飞 + 服务端锁双重保险，避免并发请求竞争 messages 列表）
+            "lock": threading.Lock(),
         }
         # 网关会话：注册审批通知（危险命令将走队列阻塞，而非终端输入）
         register_gateway_notify(session_id, self._notify)
@@ -97,23 +131,24 @@ class AgentServer:
 
     def handle_message(self, session_id: str, state: dict, message: str) -> str:
         """处理一条消息，返回助手最终回答文本。"""
-        turn_count, turns_since_memory, persisted_count = minimal_agent.process_turn(
-            self.client,
-            state["messages"],
-            self.tools,
-            self.manager,
-            session_id,
-            message,
-            state["turn_count"],
-            state["turns_since_memory"],
-            self.review_worker,
-            state["persisted_count"],
-        )
-        state["turn_count"] = turn_count
-        state["turns_since_memory"] = turns_since_memory
-        state["persisted_count"] = persisted_count
-        last = state["messages"][-1] if state["messages"] else {}
-        return last.get("content", "") if last.get("role") == "assistant" else ""
+        with state["lock"]:
+            turn_count, turns_since_memory, persisted_count = minimal_agent.process_turn(
+                self.client,
+                state["messages"],
+                self.tools,
+                self.manager,
+                session_id,
+                message,
+                state["turn_count"],
+                state["turns_since_memory"],
+                self.review_worker,
+                state["persisted_count"],
+            )
+            state["turn_count"] = turn_count
+            state["turns_since_memory"] = turns_since_memory
+            state["persisted_count"] = persisted_count
+            last = state["messages"][-1] if state["messages"] else {}
+            return last.get("content", "") if last.get("role") == "assistant" else ""
 
     def shutdown(self) -> None:
         """排空后台任务、注销所有网关回调。"""
@@ -141,6 +176,20 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_static(self, rel_path: str) -> None:
+        """从 web/ 目录提供静态文件；拒绝路径穿越与不存在的文件。"""
+        target = (WEB_DIR / rel_path).resolve()
+        if not _is_within(target, WEB_DIR) or not target.is_file():
+            self._send_json(404, {"error": "not found"})
+            return
+        mime = _MIME_TYPES.get(target.suffix.lower(), "application/octet-stream")
+        body = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _read_body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
@@ -156,6 +205,12 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self._send_json(200, {"ok": True})
+            return
+        if parsed.path in ("/", "/index.html"):
+            self._serve_static("index.html")
+            return
+        if parsed.path.startswith("/web/"):
+            self._serve_static(unquote(parsed.path[len("/web/"):]))
             return
         if parsed.path == "/approvals/pending":
             session_id = (parse_qs(parsed.query).get("session_id") or [""])[0]

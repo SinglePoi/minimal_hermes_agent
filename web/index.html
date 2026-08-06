@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>夜莺 · 客服助手</title>
+  <link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">🌙</span>
+        <div class="brand-text">
+          <h1>夜莺</h1>
+          <p class="subtitle">内部客服天气助手</p>
+        </div>
+      </div>
+      <div class="session-box">
+        <label for="session-id">会话 ID</label>
+        <input id="session-id" type="text" spellcheck="false"
+               placeholder="留空自动新建" autocomplete="off"
+               title="粘贴已有会话 ID 可恢复历史对话">
+        <button id="btn-new-session" class="btn ghost" type="button">新会话</button>
+      </div>
+      <div class="status" id="status" title="服务连接状态">
+        <span class="dot"></span>
+        <span id="status-text">连接中…</span>
+      </div>
+    </header>
+
+    <main id="chat" class="chat" aria-live="polite">
+      <div class="empty" id="empty-state">
+        <div class="empty-icon" aria-hidden="true">🌙</div>
+        <p>夜莺在等你。试试：<em>“北京今天天气怎么样？”</em></p>
+      </div>
+    </main>
+
+    <footer class="composer">
+      <textarea id="input" rows="1" placeholder="输入问题，Enter 发送，Shift+Enter 换行" disabled></textarea>
+      <button id="btn-send" class="btn primary" type="button">发送</button>
+    </footer>
+  </div>
+
+  <!-- 危险命令审批弹窗（轮询 /approvals/pending → POST /approvals/resolve） -->
+  <div id="approval-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="approval-title">
+    <div class="approval-card">
+      <div class="approval-head">
+        <h2 id="approval-title">⚠️ 危险命令需要批准</h2>
+        <span id="approval-queue" class="badge hidden"></span>
+      </div>
+      <p class="field-label">原因</p>
+      <p id="approval-desc" class="approval-desc"></p>
+      <p class="field-label">命令</p>
+      <pre id="approval-cmd" class="approval-cmd"></pre>
+      <p id="approval-note" class="approval-note hidden"></p>
+      <div class="approval-actions">
+        <button class="btn danger" id="btn-deny" type="button">拒绝</button>
+        <span class="spacer" aria-hidden="true"></span>
+        <button class="btn" id="btn-always" type="button">永久允许</button>
+        <button class="btn" id="btn-session" type="button">本会话允许</button>
+        <button class="btn primary" id="btn-once" type="button">允许一次</button>
+      </div>
+      <div id="deny-box" class="deny-box hidden">
+        <textarea id="deny-reason" rows="2" placeholder="拒绝理由（可选），将传给审批系统"></textarea>
+        <div class="deny-actions">
+          <button id="btn-deny-cancel" class="btn ghost" type="button">取消</button>
+          <button id="btn-deny-confirm" class="btn danger" type="button">确认拒绝</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/web/app.js"></script>
+</body>
+</html>

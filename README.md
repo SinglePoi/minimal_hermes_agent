@@ -107,6 +107,20 @@
     `GET /health` 探活；审批走 approval.py 的网关队列（对齐 Hermes 的
     register_gateway_notify / resolve_gateway_approval：agent 线程阻塞等"门铃"，
     HTTP 端 resolve 唤醒）；主循环抽取为 process_turn 供 REPL 与服务器共用
+20. **前端 Web 页面（web/ 静态站点）**：对齐 Hermes dashboard 的交互契约（参考
+    Hermes `web/` 的 Vite + React 设计，按骨架惯例简化为原生 HTML/CSS/JS，
+    零构建、零新依赖）——`server.py` 直接托管 `web/`（`GET /` 与 `/web/*`），
+    同一 origin 免跨域：
+    - 对话面板：`POST /chat` 发消息、渲染 Markdown 子集（代码块/行内代码/加粗/
+      斜体/列表，先转义再包标签防 XSS）、会话 ID 自动生成并持久化到
+      localStorage、可粘贴旧会话 ID 恢复、新会话按钮
+    - 审批弹窗：/chat 阻塞期间每 800ms 轮询 `GET /approvals/pending`，展示命令与
+      原因（服务端已脱敏），按钮 允许一次/本会话允许/永久允许/拒绝（拒绝可填理由）；
+      smart deny 场景按网关数据的 `allow_permanent=false` 自动隐藏"永久允许"
+      （对齐 Hermes api_server 的 `_approval_event_choices`）
+    - 连接状态：`/health` 探活指示器；请求失败/服务离线有明确提示
+    - 服务端配套：`list_pending_approvals` 暴露 `allow_permanent`；同一会话的
+      /chat 加串行锁（对齐 Hermes turn lease，防并发请求竞争 messages 状态）
 
 ## 你需要准备的
 
@@ -153,10 +167,14 @@ python server.py                 # 默认 127.0.0.1:8000
 # 或指定地址端口：python server.py 0.0.0.0 9000
 ```
 
+启动后浏览器打开 <http://127.0.0.1:8000/> 即进入夜莺 Web 页面（对话 + 审批按钮）。
+
 端点一览：
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
+| `/` | GET | Web 前端页面（`web/index.html`） |
+| `/web/*` | GET | 前端静态资源（app.js / style.css） |
 | `/chat` | POST | `{"message": "...", "session_id": "..."?}` → 返回 `{"reply": ...}` |
 | `/approvals/pending` | GET | `?session_id=xxx` → 当前待审批项 |
 | `/approvals/resolve` | POST | `{"session_id", "choice": "once\|session\|always\|deny", "reason"?}` |
@@ -164,6 +182,7 @@ python server.py                 # 默认 127.0.0.1:8000
 
 审批流程：`/chat` 请求里的 agent 线程遇到危险命令会阻塞等待；客户端在另一个
 连接轮询 `pending`、再 `POST resolve`，线程被唤醒后 `/chat` 返回最终结果。
+Web 页面已内置该流程：请求期间每 800ms 轮询，弹出审批框点按钮即可。
 （流式/SSE 与 WebSocket 是二期。）
 
 可选环境变量：
@@ -524,6 +543,6 @@ prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取、patch �
 
 ## 下一步可以加什么
 
-- Skills 增强：上下文压缩时的技能 prune/reinject、前置条件检查（对齐 Hermes 剩余部分）
-- 审批剩余：gateway 通知（跟服务化一起做）
+- 服务增强：SSE 流式响应 / 请求鉴权（token）/ 会话列表管理
+- 审批剩余：cron 审批上下文（`approvals.cron_mode`）
 - 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）

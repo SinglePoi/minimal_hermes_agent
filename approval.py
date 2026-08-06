@@ -556,6 +556,9 @@ def list_pending_approvals(session_key: str) -> list[dict]:
                 "command": entry.data.get("command", ""),
                 "description": entry.data.get("description", ""),
                 "pattern_key": entry.data.get("pattern_key", ""),
+                # smart deny 的人工覆盖只允许"仅本次"（对齐 Hermes 网关数据的
+                # allow_permanent：前端据此决定是否展示"永久允许"按钮）
+                "allow_permanent": bool(entry.data.get("allow_permanent", True)),
             }
             for entry in queue
         ]
