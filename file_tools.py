@@ -190,7 +190,9 @@ def write_file_tool(path: str, content: str) -> str:
     resolved = _normalize_path(path)
     try:
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
+        # 用字节模式写入：Windows 文本模式会把 \n 再翻译成 \r\n（CRLF 变 \r\r\n），
+        # write_bytes 保证内容原样落盘
+        resolved.write_bytes(content.encode("utf-8"))
     except OSError as exc:
         return _error(f"写入失败：{exc}")
     return json.dumps(
@@ -199,6 +201,96 @@ def write_file_tool(path: str, content: str) -> str:
             "path": str(resolved),
             "resolved_path": str(resolved),
             "files_modified": [str(resolved)],
+        },
+        ensure_ascii=False,
+    )
+
+
+def patch_file_tool(
+    path: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+) -> str:
+    """patch 工具（replace 模式）：在文件里找到 old_string 换成 new_string（对齐 Hermes patch_tool）。
+
+    语义与 Hermes 一致：
+    - old_string 必须唯一；出现多次且未传 replace_all=true 时报错，要求确认
+    - 找不到 old_string：若 new_string 已存在于文件中，判定"补丁已应用"，
+      返回 no_change 成功（防止模型反复重发同一补丁）；否则报错
+    - 写前先过 _check_sensitive_path（改 .env 等敏感文件照样拒绝）
+
+    简化掉的部分（Hermes 有，骨架不做）：模糊匹配（fuzzy match）、V4A 补丁头格式、
+    diff/语法检查结果、CRLF 与 BOM 的完整往返处理（这里只做基础保留）。
+    """
+    # 1. 写操作先查"证件"：敏感路径一律拒绝
+    sensitive = _check_sensitive_path(path)
+    if sensitive:
+        return _error(sensitive)
+
+    # 2. 参数校验
+    if not old_string:
+        return _error("old_string 不能为空")
+    if new_string is None:
+        return _error("new_string 不能为空")
+
+    # 3. 读文件
+    resolved = _normalize_path(path)
+    if not resolved.is_file():
+        return _error(f"文件不存在：{path}")
+    content, err = _read_text(resolved)
+    if err:
+        return _error(err)
+
+    # 4. BOM / 换行符基础处理：匹配前剥 BOM，写回时按文件原有行尾归一化
+    had_bom = content.startswith("\ufeff")
+    if had_bom:
+        content = content[1:]
+    file_ending = "\r\n" if "\r\n" in content else "\n"
+    old_norm = old_string.replace("\r\n", "\n")
+    new_norm = new_string.replace("\r\n", "\n")
+    # 匹配统一在 LF 归一化后的内容上进行，避免 CRLF 文件里多行匹配不到
+    content_lf = content.replace("\r\n", "\n")
+
+    # 5. 统计出现次数，按 Hermes 语义处理
+    count = content_lf.count(old_norm)
+    if count == 0:
+        if new_norm and new_norm in content_lf:
+            return json.dumps(
+                {
+                    "success": True,
+                    "no_change": True,
+                    "message": (
+                        f"文件已包含目标文本，补丁看起来已应用（{path}）。"
+                        "未做任何修改，不要重发这个补丁。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        return _error(f"在 {path} 中找不到 old_string")
+    if count > 1 and not replace_all:
+        return _error(
+            f"old_string 在 {path} 里出现 {count} 次，不唯一；"
+            "如确认要全部替换，请传 replace_all=true"
+        )
+
+    # 6. 替换并写回（count==1 或 replace_all=true 时都是全量替换）
+    new_lf = content_lf.replace(old_norm, new_norm)
+    new_content = new_lf.replace("\n", file_ending) if file_ending == "\r\n" else new_lf
+    if had_bom:
+        new_content = "\ufeff" + new_content
+    try:
+        resolved.write_bytes(new_content.encode("utf-8"))
+    except OSError as exc:
+        return _error(f"写入失败：{exc}")
+
+    return json.dumps(
+        {
+            "success": True,
+            "path": str(resolved),
+            "resolved_path": str(resolved),
+            "files_modified": [str(resolved)],
+            "replaced": count,
         },
         ensure_ascii=False,
     )

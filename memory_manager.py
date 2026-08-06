@@ -3,16 +3,97 @@
 
 Hermes 的 MemoryManager：builtin（MEMORY.md/USER.md）恒在 + 至多一个外部 provider。
 我们项目的内置记忆仍由 minimal_agent.py 直接管理，本管理器只负责外部 provider。
+
+同步采用后台异步 + 合并节流（对齐 Hermes sync_all 的"单 worker 串行、不阻塞
+主流程"设计）：
+    - sync_all() 只把任务交给后台 worker，立即返回——慢的 provider 永远不会
+      卡住对话结尾（Hermes 记录过一个 Hindsight daemon 阻塞 298s 的案例）
+    - 单 worker 串行执行：第 N 轮的写入先于第 N+1 轮，provider 无需自己保证顺序
+    - 合并节流：快速连发多轮时，worker 还没开始跑的旧任务会被最新任务覆盖
+      （messages 是累计的全量对话，最新一次同步覆盖所有历史，不丢数据）
+    - 后台线程是 daemon：即使同步卡死也不会阻止解释器退出
 """
 
 import importlib.util
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 
 from memory_provider import MemoryProvider
 
 BASE_DIR = Path(__file__).parent
+
+
+class _SyncWorker:
+    """单线程后台同步 worker：串行 + 合并节流 + 可排空。
+
+    - submit(fn)：把任务交给 worker；若上一个任务还没开始执行，直接覆盖它
+      （合并节流——最新的任务携带全量 messages，覆盖不丢数据）
+    - flush(timeout)：等当前任务和待执行任务排空；超时放弃，不阻塞退出
+    - shutdown()：投递哨兵让线程退出（幂等）
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending = None
+        self._active = False
+        self._event = threading.Event()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="mem-sync"
+        )
+        self._thread.start()
+
+    def submit(self, fn) -> bool:
+        """投递任务；worker 关闭时返回 False（调用方自行决定兜底）。"""
+        with self._lock:
+            if self._closed:
+                return False
+            self._pending = fn
+            self._event.set()
+            return True
+
+    def _loop(self) -> None:
+        """消费循环：取最新任务执行；哨兵（None）退出。"""
+        while True:
+            self._event.wait()
+            with self._lock:
+                fn = self._pending
+                self._pending = None
+                self._event.clear()
+                self._active = fn is not None
+            if fn is None:
+                return
+            try:
+                fn()
+            except Exception:
+                pass
+            finally:
+                with self._lock:
+                    self._active = False
+
+    def flush(self, timeout: float | None = None) -> None:
+        """等待后台任务排空（无 pending 且无正在执行的任务）。"""
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            with self._lock:
+                idle = self._pending is None and not self._active
+            if idle:
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            time.sleep(0.02)
+
+    def shutdown(self) -> None:
+        """关闭 worker：拒绝新任务并投递哨兵（幂等）。"""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._pending = None
+            self._event.set()
 
 
 def build_memory_context_block(raw_context: str) -> str:
@@ -53,6 +134,7 @@ class MemoryManager:
     def __init__(self) -> None:
         self._providers: list[MemoryProvider] = []
         self._tool_to_provider: dict[str, MemoryProvider] = {}
+        self._sync_worker = _SyncWorker()
 
     def add_provider(self, provider: MemoryProvider) -> None:
         self._providers.append(provider)
@@ -98,18 +180,43 @@ class MemoryManager:
         messages: list[dict] | None = None,
         client=None,
     ) -> None:
-        """对话结束后同步给所有 provider（对齐 Hermes 的 sync_all）。"""
-        for provider in self._providers:
+        """对话结束后异步同步给所有 provider（对齐 Hermes：后台串行，不阻塞主流程）。
+
+        任务交给单线程后台 worker 立即返回；worker 关闭时回退为内联执行
+        （保证行为不丢，对齐 Hermes 的 fail-safe 回退）。
+        """
+        providers = list(self._providers)
+        if not providers:
+            return
+
+        def _run() -> None:
+            """后台执行：逐个 provider 同步，单个失败不影响其它。"""
+            for provider in providers:
+                try:
+                    provider.sync_turn(
+                        user_content,
+                        assistant_content,
+                        session_id=session_id,
+                        messages=messages,
+                        client=client,
+                    )
+                except Exception:
+                    continue
+
+        if not self._sync_worker.submit(_run):
+            # worker 已关闭（进程退出阶段）：回退内联，尽量不丢这次同步
             try:
-                provider.sync_turn(
-                    user_content,
-                    assistant_content,
-                    session_id=session_id,
-                    messages=messages,
-                    client=client,
-                )
+                _run()
             except Exception:
-                continue
+                pass
+
+    def flush_pending(self, timeout: float | None = None) -> None:
+        """等待后台同步排空（会话结束/退出前调用；超时放弃，不阻塞退出）。"""
+        self._sync_worker.flush(timeout)
+
+    def shutdown(self) -> None:
+        """停止接收新同步任务并退出后台线程（幂等，进程退出前调用）。"""
+        self._sync_worker.shutdown()
 
     def get_all_tool_schemas(self) -> list[dict]:
         """收集所有 provider 的自带工具定义，按名字去重（对齐 Hermes 的 get_all_tool_schemas）。"""

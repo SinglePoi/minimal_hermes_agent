@@ -26,6 +26,7 @@ for stream in (sys.stdout, sys.stderr):
 
 from file_tools import (  # noqa: E402
     _check_sensitive_path,
+    patch_file_tool,
     read_file_tool,
     search_files_tool,
     write_file_tool,
@@ -132,6 +133,55 @@ def test_search_files() -> None:
               any("other.txt" in m["path"].replace("\\", "/") for m in data["matches"]))
 
 
+def test_patch_file() -> None:
+    """patch：唯一替换、多次出现报错、replace_all、已应用 no-op、敏感拒绝、CRLF。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        target = root / "app.py"
+        target.write_text("def old():\n    return 1\n", encoding="utf-8")
+
+        data = json.loads(patch_file_tool(str(target), "def old():", "def new():"))
+        check("patch 唯一替换成功", data["success"] is True and data["replaced"] == 1)
+        check("patch 内容已变",
+              target.read_text(encoding="utf-8") == "def new():\n    return 1\n")
+        check("patch 返回 files_modified", "app.py" in data["files_modified"][0])
+
+        # 找不到 → 报错
+        data = json.loads(patch_file_tool(str(target), "def missing():", "x"))
+        check("patch 找不到 old_string -> error", data["success"] is False)
+
+        # 已应用检测：old 已不在、new 已在 → no_change 成功
+        data = json.loads(patch_file_tool(str(target), "def old():", "def new():"))
+        check("patch 已应用 -> no_change",
+              data["success"] is True and data.get("no_change") is True)
+
+        # 多次出现：不唯一报错，replace_all 后全部替换
+        multi = root / "multi.txt"
+        multi.write_text("a\nb\na\n", encoding="utf-8")
+        data = json.loads(patch_file_tool(str(multi), "a", "X"))
+        check("patch 多次出现不唯一 -> error", data["success"] is False)
+        data = json.loads(patch_file_tool(str(multi), "a", "X", replace_all=True))
+        check("patch replace_all 全部替换",
+              data["success"] is True and data["replaced"] == 2
+              and multi.read_text(encoding="utf-8") == "X\nb\nX\n")
+
+        # 敏感路径拒绝
+        env = root / ".env"
+        env.write_text("KEY=1\n", encoding="utf-8")
+        data = json.loads(patch_file_tool(str(env), "KEY=1", "KEY=2"))
+        check("patch 拒绝 .env", data["success"] is False)
+
+        # CRLF 文件里多行匹配（归一化后能找到）
+        crlf = root / "win.txt"
+        crlf.write_bytes(b"line1\r\nline2\r\nline3\r\n")
+        data = json.loads(patch_file_tool(
+            str(crlf), "line1\nline2", "line1\nline2-X"
+        ))
+        check("patch CRLF 多行匹配", data["success"] is True)
+        check("patch 保留 CRLF 行尾",
+              crlf.read_bytes() == b"line1\r\nline2-X\r\nline3\r\n")
+
+
 def test_sensitive_path_checks() -> None:
     """_check_sensitive_path 的边界用例。"""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -152,6 +202,7 @@ def main() -> None:
         test_read_file,
         test_write_file,
         test_search_files,
+        test_patch_file,
         test_sensitive_path_checks,
     ):
         print(f"[{test_fn.__name__}]")

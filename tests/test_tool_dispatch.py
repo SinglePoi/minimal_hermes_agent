@@ -234,6 +234,11 @@ def test_real_file_tools_path_scope() -> None:
     def write(path):
         return make_call(f"w-{path}", "write_file", {"path": path})
 
+    def patch(path):
+        return make_call(f"p-{path}", "patch", {
+            "path": path, "old_string": "a", "new_string": "b",
+        })
+
     segs = _plan_tool_batch_segments([write("src/a.py"), write("src/a.py")])
     check("真实工具：同路径双写 -> 顺序", kinds(segs) == [("sequential", 2)])
 
@@ -242,6 +247,12 @@ def test_real_file_tools_path_scope() -> None:
 
     segs = _plan_tool_batch_segments([read("src/a.py"), write("src/a.py")])
     check("真实工具：读+写同路径 -> 顺序", kinds(segs) == [("sequential", 2)])
+
+    segs = _plan_tool_batch_segments([patch("src/a.py"), write("src/a.py")])
+    check("真实工具：patch+写同路径 -> 顺序", kinds(segs) == [("sequential", 2)])
+
+    segs = _plan_tool_batch_segments([patch("src/a.py"), write("src/b.py")])
+    check("真实工具：patch+写不同路径 -> 并行", kinds(segs) == [("parallel", 2)])
 
 
 def main() -> None:

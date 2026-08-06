@@ -51,7 +51,12 @@ from tool_dispatch import (
     tool_name,
 )
 from skills import build_skills_index, skills_list, skill_view
-from file_tools import read_file_tool, search_files_tool, write_file_tool
+from file_tools import (
+    patch_file_tool,
+    read_file_tool,
+    search_files_tool,
+    write_file_tool,
+)
 from redact import redact_sensitive_text
 
 load_dotenv()
@@ -90,7 +95,10 @@ SYSTEM_PROMPT = """你是「小助手」，一个乐于助人的 AI 助手。
 7. session_search 只搜"历史对话记录"（过去聊过什么），不包含记忆库和项目知识。
    只有问题确实需要回忆某次具体对话的细节时，才调用它。
 8. 需要专业技能（如发版检查、话术规范）时：先用 skills_list 查看可用技能，
-   再用 skill_view 加载技能内容；技能内容加载进上下文后直接据此回答。"""
+   再用 skill_view 加载技能内容；技能内容加载进上下文后直接据此回答。
+9. 执行删除、覆盖等危险操作时，不要先问用户"是否确认"——直接调用 terminal 工具
+   执行；系统会自动做危险命令审批（交互模式弹审批，或按 APPROVAL_MODE 配置处理），
+   审批通过后命令才会执行。审批被拒绝时再如实告诉用户。"""
 
 
 def load_system_prompt() -> str:
@@ -638,6 +646,27 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "patch",
+            "description": (
+                "在文件中做局部替换：找到 old_string 换成 new_string（比整文件重写省 token）。"
+                "old_string 必须唯一，除非 replace_all=true；找不到时若 new_string 已存在"
+                "会判定补丁已应用。敏感文件（.env 等）拒绝修改。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "要修改的文件路径"},
+                    "old_string": {"type": "string", "description": "要被替换的原文（必须能唯一定位）"},
+                    "new_string": {"type": "string", "description": "替换后的新文本"},
+                    "replace_all": {"type": "boolean", "description": "出现多次时是否全部替换（默认 false）"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_files",
             "description": (
                 "在目录下递归搜索文件名或文件内容（大小写不敏感），返回匹配文件与命中行。"
@@ -656,15 +685,21 @@ TOOLS = [
 ]
 
 
-def run_terminal(command: str, session_key: str, timeout: int = 120) -> str:
+def run_terminal(
+    command: str,
+    session_key: str,
+    timeout: int = 120,
+    client=None,
+) -> str:
     """执行本地 shell 命令：先过审批门卫，再运行（对齐 Hermes terminal_tool）。
 
     审批逻辑在 approval.check_dangerous_command()：危险命令需用户批准
     （once/session/always/deny），拒绝或超时返回 BLOCKED 消息且不执行。
+    client 供 APPROVAL_MODE=smart 时辅助 LLM 评估用（没有也能跑，落回人工审批）。
     返回结构与 Hermes terminal_tool 一致：JSON 的 output / exit_code / error 字段，
     用户批准过则附带 approval 说明。
     """
-    approval = check_dangerous_command(command, session_key)
+    approval = check_dangerous_command(command, session_key, client=client)
     if not approval.get("approved"):
         console.print(
             Panel(
@@ -731,6 +766,7 @@ def run_tool(
     args: dict[str, Any],
     manager: MemoryManager | None = None,
     session_key: str = "",
+    client=None,
 ) -> str:
     """根据工具名找到对应函数并执行。以后加新工具就在这里加一行。"""
     if name == "get_weather":
@@ -752,6 +788,7 @@ def run_tool(
             command=args.get("command", ""),
             session_key=session_key,
             timeout=int(args.get("timeout", 120) or 120),
+            client=client,
         )
     if name == "skills_list":
         return skills_list()
@@ -770,6 +807,13 @@ def run_tool(
         return write_file_tool(
             path=args.get("path", ""),
             content=args.get("content", ""),
+        )
+    if name == "patch":
+        return patch_file_tool(
+            path=args.get("path", ""),
+            old_string=args.get("old_string", ""),
+            new_string=args.get("new_string", ""),
+            replace_all=bool(args.get("replace_all", False)),
         )
     if name == "search_files":
         return search_files_tool(
@@ -848,7 +892,7 @@ def run_agent_turn(
                 """执行单个工具调用（parallel 段的工作线程也会调用它）。"""
                 name = tool_name(tc)
                 args = tool_arguments(tc) or {}
-                return run_tool(name, args, manager, session_key)
+                return run_tool(name, args, manager, session_key, client)
 
             def on_segment(kind: str, calls: list) -> None:
                 """每段执行前提示（对齐 Hermes 并发的"running N tools concurrently"）。"""
@@ -1007,6 +1051,10 @@ def main():
     # 会话结束：最后一次记忆审查 + 提示如何恢复
     if turn_count % 3 != 0:
         review_memory_turn(client, messages)
+    # 排空后台记忆同步（有界等待，不阻塞退出；同步卡住则放弃）
+    if memory_manager:
+        memory_manager.flush_pending(timeout=10)
+        memory_manager.shutdown()
     console.print(f"\n[dim]会话已保存。下次用 --resume {session_id} 继续对话。[/dim]")
 
 

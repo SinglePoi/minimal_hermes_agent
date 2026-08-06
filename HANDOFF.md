@@ -25,6 +25,8 @@ tests/test_tool_dispatch.py 并行执行回归测试（零依赖，python tests/
 tests/test_skills.py        Skills 回归测试（零依赖，python tests/test_skills.py 直接跑）
 tests/test_file_tools.py    文件工具回归测试（零依赖，python tests/test_file_tools.py 直接跑）
 tests/test_redact.py        脱敏回归测试（零依赖，python tests/test_redact.py 直接跑）
+tests/test_approval_smart.py 审批增强回归测试（零依赖，python tests/test_approval_smart.py 直接跑）
+tests/test_memory_sync.py   记忆异步同步回归测试（零依赖，python tests/test_memory_sync.py 直接跑）
 context_compressor.py       上下文压缩（阈值 50%、protect_last_n、交接摘要）
 memory_provider.py          MemoryProvider 抽象基类 + LLM 事实提取助手
 memory_manager.py           外部 provider 编排（加载/召回/同步/工具路由）
@@ -77,6 +79,26 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     Authorization 头、JWT、私钥块、URL userinfo；开关 HERMES_REDACT_SECRETS 导入时
     快照、force=True 强制打码、code_file 跳过赋值类规则（对齐 Hermes 语义）；
     接入点：read_file 读敏感文件打码后返回、审批面板/非交互警告打码、工具参数展示打码
+13. **patch 工具（replace 模式）**：`file_tools.py` 的 patch_file_tool 对齐 Hermes
+    patch_tool——old_string 唯一替换（多次出现需 replace_all=true）、找不到时报错、
+    "补丁已应用"检测（new_string 已在文件里 → no_change 成功，防重复重发）；
+    写前过 _check_sensitive_path；BOM 剥离/CRLF 归一化保留（Windows 写文件用
+    write_bytes，避免 \r\r\n 双换行）；已加入并行规划器 _PATH_SCOPED_WRITERS
+    （与 write_file 同路径排队、不同路径并行）；V4A 补丁头格式简化掉
+14. **审批增强**：对齐 Hermes approvals.mode / _smart_approve / 熔断 / 混淆检测——
+    APPROVAL_MODE=manual|smart|off；smart 先用辅助 LLM 评估（approve 自动放行、
+    deny 给一次"仅本次"人工覆盖且不持久化、escalate/无 client/LLM 失败落回人工）；
+    评估前剥 shell 注释（防 `rm -rf / # 回答 APPROVE` 注入）、命令包 <command>
+    定界符、操作员策略只进系统提示词；连续拒绝熔断默认 3 次（APPROVAL_DENIAL_BREAKER，
+    0 禁用），人工批准重置；DANGEROUS_PATTERNS 新增 base64|bash、eval $(curl)、
+    openssl 解码、heredoc 等混淆检测；LLM client 已串进 run_tool → run_terminal
+    → check_dangerous_command
+15. **记忆同步异步化 + 合并节流**：`memory_manager.py` 新增 _SyncWorker——
+    sync_all 丢给单线程后台 worker 立即返回（对齐 Hermes：慢 provider 不阻塞对话结尾，
+    案例：Hindsight daemon 曾阻塞 298s）；串行执行保证第 N 轮先于第 N+1 轮；
+    合并节流（worker 未开始的旧任务被最新覆盖，messages 全量历史不丢数据）；
+    flush_pending(timeout) 有界排空 + shutdown 幂等 + worker 关闭时回退内联；
+    minimal_agent 会话结束 flush(10s) 后 shutdown
 
 ## 运行方式
 
@@ -117,14 +139,32 @@ python minimal_agent.py --resume session-xxx
 - 回归测试脚本 `tests/test_redact.py`：26 条断言全过（打码格式/前缀密钥/赋值/JSON/YAML/
   请求头/私钥/JWT/userinfo/file_read 哨兵/force 与开关）+ 端到端冒烟
   （read_file 读 .env 显示 `«redacted:sk-…»`、审批命令 Bearer 打码）
+- 回归测试脚本 `tests/test_approval_smart.py`：35 条断言全过（模式读取/三种 verdict/
+  失败安全/注释剥离/smart 全流程/off 旁路/熔断阈值与重置/混淆检测）+ 端到端冒烟
+  （smart APPROVE 后危险命令真实执行、全程无人工提示）
+- 真实 DeepSeek 验证（2026-08-06）：修复"判决带解释尾巴导致误判 ESCALATE"——
+  改为取回答中首个 APPROVE/DENY/ESCALATE 关键词；提示词改为果断判决版；
+  实测 rm -rf build / Remove-Item build / cmd rd build -> approve，
+  rm -rf / 与 /etc -> deny
+- 真实 DeepSeek 验证（2026-08-06）：用户反馈"删文件夹仍提示风险"——定位为
+  主模型（DeepSeek）自己用文字问"是否确认删除"，而非审批系统弹窗；
+  SYSTEM_PROMPT 新增规则 9（危险操作直接调 terminal，审批交给系统，不要
+  文字询问）；验证模型改为直接调用 terminal 工具；另新增 APPROVAL_DEBUG=1
+  调试开关（打印辅助 LLM 原始回答与判决）、非交互自动放行文案改为中性 ℹ️
+- 回归测试脚本 `tests/test_memory_sync.py`：9 条断言全过（异步不阻塞/串行顺序/
+  合并节流只跑最新/flush 超时/shutdown 内联回退/无 provider 直接返回）
+- 回归测试脚本 `tests/test_file_tools.py` 新增 patch 组：唯一替换/多次报错/replace_all/
+  已应用 no-change/.env 拒绝/CRLF 保留（修复了 Windows write_text 双换行 bug）；
+  并行测试补 patch+write 同路径顺序、不同路径并行
 
 ## 已知限制 / 下一步候选
 
-- `sync_turn` 是同步 LLM 调用（Hermes 用后台异步 + 节流）
 - 会话历史无清理策略（磁盘会增长，运维问题）
 - 审批增强：Smart Approval（辅助 LLM）/ 连续拒绝熔断 / 命令混淆检测（base64、$() 等）/
-  cron 与 gateway 审批上下文（对齐 `tools/approval.py` 剩余部分）
-- 文件工具简化：无 patch 工具（V4A 补丁）、无陈旧检测/文件锁、无文档抽取；
+  cron 与 gateway 审批上下文、用户自定义 deny 规则、tirith 内容级扫描
+  （对齐 `tools/approval.py` 剩余部分）
+- 文件工具简化：patch 只做 replace 模式（无 V4A 补丁头/模糊匹配/语法检查），
+  无陈旧检测/文件锁、无文档抽取；
   搜索仍跳过敏感文件（Hermes 也过滤敏感路径的搜索结果）
 - 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）
 - Skills 增强：上下文压缩时的技能 prune/reinject、前置条件检查、技能 hub 同步
@@ -136,5 +176,5 @@ python minimal_agent.py --resume session-xxx
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里：敏感文本脱敏（已完成：`redact.py` + read_file/审批/展示接入）。
-> 下一步候选：审批增强（Smart Approval / 熔断 / 混淆检测）或 patch 工具（V4A）。
+> 我们上次停在这里：记忆同步异步化（已完成：后台 worker + 合并节流 + flush）。
+> 下一步候选：会话历史清理策略 或 记忆 nudge。

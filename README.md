@@ -59,6 +59,25 @@
     前缀密钥、`KEY=value`、JSON/YAML 配置、Authorization 头、JWT、私钥块、URL
     userinfo 全部打码；`read_file` 读敏感文件改为"打码后读取"（不可复用哨兵
     `«redacted:sk-…»`，防模型把打码值写回文件），审批面板与工具参数展示同样打码
+14. **patch 工具**：`file_tools.py` 的 replace 模式（对齐 Hermes patch_tool）——
+    在文件里找 `old_string` 换 `new_string`，比整文件重写省 token；old_string
+    必须唯一（除非 replace_all=true），找不到时若 new_string 已存在则判定
+    "补丁已应用"返回 no_change（防模型反复重发）；写前照常过敏感路径检查；
+    已接入并行规划器写者集合（与 write_file 同路径排队）
+15. **审批增强**（对齐 Hermes approvals.mode / _smart_approve / 熔断）：
+    - 审批模式 `APPROVAL_MODE=manual|smart|off`：off 直接旁路；
+      smart 先用辅助 LLM 评估（approve 自动放行、deny 给一次"仅本次"人工覆盖、
+      escalate 落回人工），manual 维持逐条询问
+    - 连续拒绝熔断：辅助 LLM 连续 deny 达到阈值（默认 3）后拒绝消息附加
+      CIRCUIT BREAKER 硬停警告；任何人工批准都会重置计数
+    - 命令混淆检测：`base64 -d | bash`、`eval $(curl)`、`bash <<EOF`、
+      openssl 解码后执行等模式加入危险清单
+    - 智能评估防注入：命令先剥 shell 注释、包在 `<command>` 定界符里、
+      系统提示词明确要求忽略命令内夹带指令（对齐 Hermes 设计）
+16. **记忆同步异步化 + 合并节流**（对齐 Hermes memory_manager 的后台串行设计）：
+    对话结束的 `sync_all` 不再阻塞主流程——任务交给单线程后台 worker 立即返回；
+    快速连发多轮时未开始的旧任务被最新任务覆盖（messages 是全量历史，不丢数据）；
+    会话结束有界等待排空（flush 超时 10s），同步卡死也不阻塞退出
 
 ## 你需要准备的
 
@@ -108,6 +127,9 @@ $env:PYTHONIOENCODING="utf-8"
 | `CONTEXT_WINDOW` | 上下文窗口（token），压缩阈值 = 50% | `128000` |
 | `PROTECT_LAST_N` | 压缩时保留最近多少条消息完整 | `20` |
 | `APPROVAL_TIMEOUT` | 危险命令审批超时秒数（超时按拒绝处理） | `300` |
+| `APPROVAL_MODE` | 审批模式：`manual` / `smart`（辅助 LLM 评估）/ `off`（旁路） | `manual` |
+| `APPROVAL_SMART_POLICY` | 追加给辅助 LLM 的自定义策略（如"涉及 /etc 一律转人工"） | 空 |
+| `APPROVAL_DENIAL_BREAKER` | 连续智能拒绝多少次后触发熔断（0 = 禁用） | `3` |
 
 ## 体验一个完整循环
 
@@ -287,13 +309,15 @@ python tests/test_tool_dispatch.py
 python tests/test_skills.py
 python tests/test_file_tools.py
 python tests/test_redact.py
+python tests/test_memory_sync.py
 ```
 
 覆盖危险/硬性模式检测、deny/session/always 审批分支、允许列表落盘重载、
 terminal 工具的执行与拦截；并行批分段、路径重叠、并发真实发生与结果顺序回填；
 Skills 的 frontmatter 解析、发现、索引、加载与路径安全；文件工具的分页读取、
 敏感路径拒绝、搜索与真实工具名的路径重叠；脱敏的前缀密钥/赋值/JSON/YAML/
-请求头/私钥/JWT 与 file_read 哨兵。
+请求头/私钥/JWT 与 file_read 哨兵；patch 的唯一性/已应用检测/CRLF 保留。
+记忆后台同步的异步/串行/合并节流/flush 超时。
 Windows 控制台无需手动设编码，脚本会自动切换 UTF-8。
 
 ## 体验 Skills（按需加载）
@@ -352,6 +376,20 @@ python demo_file_tools.py
 会依次演示写文件、带行号读取、分页、搜索、以及写 `.env` 被拒绝，
 临时目录自动清理。
 
+## 体验智能审批（Smart Approval）
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+$env:APPROVAL_MODE="smart"
+python minimal_agent.py
+
+# 问：帮我清理一下 build 目录（模型会调 rm -rf build）
+# 辅助 LLM 判定低风险 → 显示"智能审批：自动放行"，不再逐条问你
+```
+
+说明：smart 模式需要 API Key（辅助 LLM 和主模型共用 DeepSeek）；辅助 LLM 失败
+或拿不准时自动"转人工"，不会静默放行；连续被判定危险会触发熔断警告。
+
 ## 体验工具并行执行
 
 ```powershell
@@ -392,13 +430,16 @@ python minimal_agent.py
 | Skills `skills.py` + `skills/` 目录 | `agent/skill_utils.py`（发现/frontmatter）+ `tools/skills_tool.py`（skills_list/skill_view）+ `agent/prompt_builder.py`（技能索引） |
 | 文件工具 `file_tools.py` | `tools/file_tools.py`（read_file_tool / write_file_tool / _check_sensitive_path） |
 | 敏感脱敏 `redact.py` | `agent/redact.py`（redact_sensitive_text / mask_secret / file_read 哨兵） |
+| patch 工具（replace 模式） | `tools/file_tools.py` 的 patch_tool + `tools/file_operations.py` 的 patch_replace |
+| 审批增强（smart/熔断/混淆检测） | `tools/approval.py`（_smart_approve / _record_denial / DANGEROUS_PATTERNS） |
+| 记忆异步同步 `memory_manager.py` | `agent/memory_manager.py`（sync_all 后台 worker + flush_pending） |
 
 骨架简化掉了的工业级细节：文件锁、注入威胁扫描、外部漂移检测、可插拔 MemoryProvider、
 会话压缩后的 lineage 去重（压缩黑洞处理）、记忆主动 nudge、审批的 cron/gateway 上下文、
 Smart Approval（辅助 LLM 审批）与连续拒绝熔断、命令混淆检测、工具并行里的中断语义与
 turn 级 budget 收尾、Skills 的 hub/组织同步/插件命名空间/前置条件检查、压缩时的技能
-prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取/patch 工具、脱敏的 URL 查询
-参数/手机号/DB 连接串专项——这些是后续深入源码时值得关注的点。
+prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取、patch 的 V4A 补丁头/
+模糊匹配/语法检查、脱敏的 URL 查询参数/手机号/DB 连接串专项——这些是后续深入源码时值得关注的点。
 
 ## 加新工具
 
@@ -406,7 +447,8 @@ prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取/patch 工�
 
 ## 下一步可以加什么
 
-- 审批增强：Smart Approval / 连续拒绝熔断 / 命令混淆检测（对齐 `tools/approval.py` 剩余部分）
-- `sync_turn` 异步化与节流（Hermes 用后台异步 + 节流）
 - Skills 增强：上下文压缩时的技能 prune/reinject、前置条件检查（对齐 Hermes 剩余部分）
-- patch 工具（V4A 补丁格式，对齐 Hermes file_tools 的 patch_tool）
+- 记忆 nudge：Hermes 的 memory_manager 有智能提醒时机，骨架是固定每 3 轮
+- 会话历史清理策略（sessions.db 无限增长，运维问题）
+- 审批剩余：用户自定义 deny 规则（approvals.deny）、tirith 内容级扫描、gateway 通知
+- 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）
