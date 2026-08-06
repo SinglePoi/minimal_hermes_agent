@@ -120,6 +120,9 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     另：Windows 裸命令删除加固——rmdir/rd/del/erase/Remove-Item/ri/rm 裸写
     （锚定命令起始）进危险清单；Hermes 只拦 cmd /c 与 powershell 前缀，此为
     有意超出 Hermes 的安全加固（修复"模型用 rmdir 绕过审批删目录"的实际问题）
+    再另：SYSTEM_PROMPT 新增规则 11——声称"已创建/已删除/已修改"文件或目录前，
+    必须真的通过工具执行并看到工具返回；没有工具返回不许声称操作完成
+    （修复 DeepSeek 不经工具直接"复述"删除成功的幻觉问题）
 15. **记忆同步异步化 + 合并节流**：`memory_manager.py` 新增 SyncWorker——
     sync_all 丢给单线程后台 worker 立即返回（对齐 Hermes：慢 provider 不阻塞对话结尾，
     案例：Hindsight daemon 曾阻塞 298s）；串行执行保证第 N 轮先于第 N+1 轮；
