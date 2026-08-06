@@ -39,7 +39,9 @@
 8. **上下文压缩**：消息占用超过阈值（默认 50% 上下文窗口）时，
    把中间轮次交给 LLM 生成"交接摘要"，保留最近 N 条完整消息
    （对齐 Hermes 的 `agent/context_compressor.py`：protect_last_n、merge-into-tail、
-   优先用 API 真实 token 数；压缩后重建系统提示词刷新记忆快照）
+   优先用 API 真实 token 数；压缩后重建系统提示词刷新记忆快照；
+   已加载的大段技能内容在压缩时裁成 `[SKILL_PRUNED: ...]` 标记（小技能保留原文），
+   摘要后把丢失的标记补回 "## Pruned Skills" 区块，模型可按需 skill_view 重载）
 9. **危险命令审批**：新增 `terminal` 工具（本地执行 shell 命令），执行前先过审批门卫：
    - 硬性禁止地板（`rm -rf /`、关机、格式化等无条件阻止，连批准选项都没有）
    - 危险模式检测（删除、提权、SQL DROP、git 破坏性操作、覆盖 `.env` 等）
@@ -328,6 +330,7 @@ python tests/test_memory_sync.py
 python tests/test_session_prompt.py
 python tests/test_session_cleanup.py
 python tests/test_memory_nudge.py
+python tests/test_skills_compression.py
 ```
 
 覆盖危险/硬性模式检测、deny/session/always 审批分支、允许列表落盘重载、
@@ -338,6 +341,7 @@ Skills 的 frontmatter 解析、发现、索引、加载与路径安全；文件
 记忆后台同步的异步/串行/合并节流/flush 超时；系统提示词的落库往返、
 UPSERT 覆盖与压缩后重建；会话清理的旧会话删除/FTS 清理/保护/禁用。
 记忆 nudge 的间隔触发、恢复水合与后台 worker 排空。
+技能压缩的标记往返、幽灵技能收集与摘要后补回。
 Windows 控制台无需手动设编码，脚本会自动切换 UTF-8。
 
 ## 体验 Skills（按需加载）
@@ -448,6 +452,7 @@ python minimal_agent.py
 | 压缩边界记忆提交 `commit_memory_session` | `run_agent.py` 的 commit_memory_session（压缩前同步提取） |
 | 会话历史清理 `prune_sessions()` | `hermes_state.py` 的 SessionDB.prune_sessions（older_than_days） |
 | 记忆 nudge `MEMORY_NUDGE_INTERVAL` | `agent/turn_context.py`（_turns_since_memory 计数 + 恢复水合）+ `agent/agent_init.py`（nudge_interval） |
+| 技能压缩 prune/reinject | `agent/context_compressor.py`（_skill_pruned_marker / _collect_ghosted_skill_names / _reinject_pruned_skill_markers） |
 | 危险命令审批 `approval.py` | `tools/approval.py`（DANGEROUS_PATTERNS、HARDLINE_PATTERNS、prompt_dangerous_approval） |
 | `terminal` 工具（先审批再执行） | `tools/terminal_tool.py`（check_all_command_guards + subprocess） |
 | 永久允许列表 `approval_allowlist.json` | `config.yaml` 的 `command_allowlist`（JSON 免去 YAML 依赖） |

@@ -42,6 +42,7 @@ tests/test_memory_sync.py   记忆异步同步回归测试（零依赖，python 
 tests/test_session_prompt.py 系统提示词持久化回归测试（零依赖，python tests/test_session_prompt.py 直接跑）
 tests/test_session_cleanup.py 会话清理回归测试（零依赖，python tests/test_session_cleanup.py 直接跑）
 tests/test_memory_nudge.py   记忆 nudge 回归测试（零依赖，python tests/test_memory_nudge.py 直接跑）
+tests/test_skills_compression.py 技能压缩联动回归测试（零依赖，python tests/test_skills_compression.py 直接跑）
 context_compressor.py       上下文压缩（阈值 50%、protect_last_n、交接摘要）
 memory_provider.py          MemoryProvider 抽象基类 + LLM 事实提取助手
 memory_manager.py           外部 provider 编排（加载/召回/同步/工具路由）
@@ -133,6 +134,13 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     SyncWorker，不阻塞对话）；恢复会话时用"历史用户轮次 % 间隔"水合计数，
     跨会话连续；会话结束仍有一次收尾审查；helper 纯函数
     should_run_memory_nudge / hydrate_nudge_counter 可单测
+20. **Skills 与压缩联动（prune/reinject）**：context_compressor.py 对齐 Hermes
+    的 skill prune——`_skill_pruned_marker` 生成 `[SKILL_PRUNED: ...]` 标记、
+    `_skill_view_call_sites` 识别加载过的技能、`_collect_ghosted_skill_names`
+    收集"幽灵技能"（大结果 >5000 字符 + 已有标记）、`_reinject_pruned_skill_markers`
+    摘要后把丢失标记补回 "## Pruned Skills" 区块（上限 20 个防膨胀）；
+    _summarize 的输入里大技能裁成标记、小技能保留原文；SYSTEM_PROMPT 新增规则 10
+    （看到标记用 skill_view 重载，每个技能一次）
 
 ## 运行方式
 
@@ -195,6 +203,9 @@ python minimal_agent.py --resume session-xxx
   FTS 清理、新会话保留、当前会话保护、孤儿/空会话清理、禁用与默认 90 天）
 - 回归测试脚本 `tests/test_memory_nudge.py`：11 条断言全过（间隔触发/清零/禁用、
   恢复水合、后台 worker 立即返回与排空）
+- 回归测试脚本 `tests/test_skills_compression.py`：14 条断言全过（标记往返/
+  调用点识别/幽灵技能收集/补标记不重复/端到端：大技能裁标记 + 小技能留原文 +
+  摘要后补回）
 - 回归测试脚本 `tests/test_file_tools.py` 新增 patch 组：唯一替换/多次报错/replace_all/
   已应用 no-change/.env 拒绝/CRLF 保留（修复了 Windows write_text 双换行 bug）；
   并行测试补 patch+write 同路径顺序、不同路径并行
@@ -217,5 +228,5 @@ python minimal_agent.py --resume session-xxx
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里：记忆 nudge（已完成：MEMORY_NUDGE_INTERVAL + 后台审查 + 恢复水合）。
-> 下一步候选：Skills 与压缩联动（prune/reinject）或服务化（为前端铺路）。
+> 我们上次停在这里：Skills 与压缩联动（已完成：prune/reinject + 幽灵技能防漏）。
+> 下一步候选：审批剩余（deny 规则/tirith）或服务化（为前端铺路）。
