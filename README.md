@@ -32,11 +32,12 @@
    模型需要回忆过去对话时主动调用 `session_search` 工具，返回命中会话的上下文窗口
    （对齐 Hermes 的 `tools/session_search_tool.py`）
 7. **多轮对话**：同一会话内连续问答，历史消息逐轮累积、每轮增量落库；
-   `--resume <session_id>` 恢复历史会话（对齐 Hermes CLI 会话循环 + `/resume`）
+   `--resume <session_id>` 恢复历史会话（对齐 Hermes CLI 会话循环 + `/resume`；
+   系统提示词随会话持久化到 sessions 表，恢复时一并取回）
 8. **上下文压缩**：消息占用超过阈值（默认 50% 上下文窗口）时，
    把中间轮次交给 LLM 生成"交接摘要"，保留最近 N 条完整消息
    （对齐 Hermes 的 `agent/context_compressor.py`：protect_last_n、merge-into-tail、
-   优先用 API 真实 token 数）
+   优先用 API 真实 token 数；压缩后重建系统提示词刷新记忆快照）
 9. **危险命令审批**：新增 `terminal` 工具（本地执行 shell 命令），执行前先过审批门卫：
    - 硬性禁止地板（`rm -rf /`、关机、格式化等无条件阻止，连批准选项都没有）
    - 危险模式检测（删除、提权、SQL DROP、git 破坏性操作、覆盖 `.env` 等）
@@ -78,6 +79,12 @@
     对话结束的 `sync_all` 不再阻塞主流程——任务交给单线程后台 worker 立即返回；
     快速连发多轮时未开始的旧任务被最新任务覆盖（messages 是全量历史，不丢数据）；
     会话结束有界等待排空（flush 超时 10s），同步卡死也不阻塞退出
+17. **系统提示词持久化 + 压缩重建**（对齐 Hermes SessionDB 的 update_system_prompt）：
+    - 系统提示词（人设/项目上下文/记忆快照/技能索引）构建后写入会话库 sessions 表，
+      `--resume` 恢复时直接取回——修复"恢复会话没有系统提示词"的问题
+    - 上下文压缩触发时重建系统提示词（拿到最新记忆快照）并同步持久化
+    - 压缩边界先调用 commit_memory_session（对齐 Hermes）：把当前原文对话的
+      记忆提取落库，再压成摘要——原文被摘要掉之前先抢救信息
 
 ## 你需要准备的
 
@@ -310,6 +317,7 @@ python tests/test_skills.py
 python tests/test_file_tools.py
 python tests/test_redact.py
 python tests/test_memory_sync.py
+python tests/test_session_prompt.py
 ```
 
 覆盖危险/硬性模式检测、deny/session/always 审批分支、允许列表落盘重载、
@@ -317,7 +325,8 @@ terminal 工具的执行与拦截；并行批分段、路径重叠、并发真�
 Skills 的 frontmatter 解析、发现、索引、加载与路径安全；文件工具的分页读取、
 敏感路径拒绝、搜索与真实工具名的路径重叠；脱敏的前缀密钥/赋值/JSON/YAML/
 请求头/私钥/JWT 与 file_read 哨兵；patch 的唯一性/已应用检测/CRLF 保留。
-记忆后台同步的异步/串行/合并节流/flush 超时。
+记忆后台同步的异步/串行/合并节流/flush 超时；系统提示词的落库往返、
+UPSERT 覆盖与压缩后重建。
 Windows 控制台无需手动设编码，脚本会自动切换 UTF-8。
 
 ## 体验 Skills（按需加载）
@@ -423,6 +432,9 @@ python minimal_agent.py
 | `MemoryManager` 编排 | `agent/memory_manager.py`（prefetch_all / sync_all / build_system_prompt） |
 | 插件加载 `load_provider()` | `plugins/memory/__init__.py`（`load_memory_provider`） |
 | provider 自带工具 | `memory_manager.py` 的 `get_all_tool_schemas()` / `handle_tool_call()`（mem0 的 `mem0_search` 同款） |
+| 记忆异步同步 `memory_manager.py` | `agent/memory_manager.py`（sync_all 后台 worker + flush_pending） |
+| 系统提示词持久化 + 压缩重建 | `agent/conversation_loop.py`（update_system_prompt / _restore_or_build_system_prompt） |
+| 压缩边界记忆提交 `commit_memory_session` | `run_agent.py` 的 commit_memory_session（压缩前同步提取） |
 | 危险命令审批 `approval.py` | `tools/approval.py`（DANGEROUS_PATTERNS、HARDLINE_PATTERNS、prompt_dangerous_approval） |
 | `terminal` 工具（先审批再执行） | `tools/terminal_tool.py`（check_all_command_guards + subprocess） |
 | 永久允许列表 `approval_allowlist.json` | `config.yaml` 的 `command_allowlist`（JSON 免去 YAML 依赖） |

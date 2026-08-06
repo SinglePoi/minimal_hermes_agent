@@ -269,7 +269,7 @@ def load_context_files() -> str:
 
 
 def _db_conn() -> sqlite3.Connection:
-    """打开会话数据库并建表（messages + FTS5 全文索引）。"""
+    """打开会话数据库并建表（messages + FTS5 全文索引 + sessions 系统提示词）。"""
     conn = sqlite3.connect(SESSION_DB)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS messages ("
@@ -282,7 +282,44 @@ def _db_conn() -> sqlite3.Connection:
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(search_text)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sessions ("
+        "session_id TEXT PRIMARY KEY,"
+        "system_prompt TEXT NOT NULL,"
+        "updated_at TEXT DEFAULT (datetime('now')))"
+    )
     return conn
+
+
+def save_session_prompt(session_id: str, prompt: str) -> None:
+    """把系统提示词持久化到会话库（对齐 Hermes SessionDB.update_system_prompt）。
+
+    同一会话重复保存走 UPSERT 覆盖（压缩重建后刷新持久化版本）。
+    """
+    conn = _db_conn()
+    try:
+        conn.execute(
+            "INSERT INTO sessions (session_id, system_prompt) VALUES (?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "system_prompt=excluded.system_prompt, updated_at=datetime('now')",
+            (session_id, prompt),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_session_prompt(session_id: str) -> str | None:
+    """读取持久化的系统提示词（对齐 Hermes _restore_or_build_system_prompt）。"""
+    conn = _db_conn()
+    try:
+        row = conn.execute(
+            "SELECT system_prompt FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
 
 
 def _search_tokens(text: str) -> list[str]:
@@ -864,10 +901,19 @@ def run_agent_turn(
     for turn in range(max_turns):
         # 预检压缩：上下文超过阈值 → 中间轮次摘要化（对齐 Hermes 的 preflight compression）
         if should_compress(messages):
+            # 对齐 Hermes commit_memory_session：压缩边界先把当前对话的记忆
+            # 同步提取落库——原文马上要被摘要掉，先抢救信息
+            if manager:
+                manager.commit_memory_session(messages, client=client)
             compressed = compress_context(client, messages)
             if compressed is not messages:
                 messages[:] = compressed
                 console.print("[dim]🗜️ 上下文已压缩：中间轮次 → 摘要[/dim]")
+                # 对齐 Hermes：压缩后重建系统提示词（刷新记忆快照/项目上下文/技能索引），
+                # 并同步持久化，供 --resume 恢复最新版本
+                if messages and messages[0].get("role") == "system":
+                    messages[0]["content"] = build_system_prompt(manager)
+                    save_session_prompt(session_key, messages[0]["content"])
 
         console.print(f"\n[bold blue]--- 第 {turn + 1} 轮：调用大模型 ---[/bold blue]")
         msg = call_llm(client, messages, tools)
@@ -994,6 +1040,15 @@ def main():
             messages = history
         else:
             console.print(f"[yellow]⚠️ 未找到会话 {session_id}，将创建新会话[/yellow]")
+
+    # 系统提示词：新会话构建一次并持久化；--resume 恢复持久化版本
+    # （对齐 Hermes 的 _restore_or_build_system_prompt：先查库，没有再构建）
+    system_prompt = load_session_prompt(session_id) if resume_id else None
+    if system_prompt is None:
+        system_prompt = build_system_prompt(memory_manager)
+        save_session_prompt(session_id, system_prompt)
+    messages.insert(0, {"role": "system", "content": system_prompt})
+
     persisted_count = len(messages)  # 已落库的消息数，增量写入从这里开始
     tools = get_tools(memory_manager)  # 核心工具 + provider 自带工具
 
@@ -1022,8 +1077,6 @@ def main():
                 user_content += "\n\n" + build_memory_context_block(ext_context)
                 console.print(Panel(ext_context[:300], title="🔌 外部记忆召回", border_style="magenta"))
 
-        if not messages:
-            messages.append({"role": "system", "content": build_system_prompt(memory_manager)})
         messages.append({"role": "user", "content": user_content})
 
         console.print(f"[dim]📚 会话：{session_id}[/dim]")

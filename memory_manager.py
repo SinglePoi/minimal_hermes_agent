@@ -214,6 +214,40 @@ class MemoryManager:
         """等待后台同步排空（会话结束/退出前调用；超时放弃，不阻塞退出）。"""
         self._sync_worker.flush(timeout)
 
+    def commit_memory_session(
+        self,
+        messages: list[dict],
+        client=None,
+    ) -> None:
+        """压缩/轮换边界：同步提取当前对话的记忆并落库（对齐 Hermes commit_memory_session）。
+
+        与 sync_all 的关键区别：
+        - sync_all 是后台异步（不阻塞主流程），适合"每轮结束"的常规同步
+        - commit_memory_session 是**同步执行**——必须在原文被压缩摘要掉之前
+          完成提取，否则中间轮次的信息以后就只剩摘要了（Hermes 在
+          conversation_compression.py 里于重写 transcript 之前调用它）
+
+        Hermes 走 provider.on_session_end()，骨架复用 provider.sync_turn()
+        （我们的提取逻辑就在 sync_turn 里，传空 user_content + 全量 messages，
+        有 client 时走 LLM 提取，无 client 时启发式过滤自然跳过）。
+        传入的是 messages 快照副本，避免后续压缩就地改写影响提取。
+        """
+        providers = list(self._providers)
+        if not providers:
+            return
+        snapshot = list(messages)
+        for provider in providers:
+            try:
+                provider.sync_turn(
+                    "",
+                    "",
+                    session_id="",
+                    messages=snapshot,
+                    client=client,
+                )
+            except Exception:
+                continue
+
     def shutdown(self) -> None:
         """停止接收新同步任务并退出后台线程（幂等，进程退出前调用）。"""
         self._sync_worker.shutdown()

@@ -181,6 +181,42 @@ def test_shutdown_fallback_and_empty() -> None:
     empty.shutdown()
 
 
+def test_commit_memory_session_sync() -> None:
+    """commit_memory_session 同步执行：返回前已完成，且拿到全量消息快照。"""
+    seen: dict = {}
+
+    def hook(user_content: str) -> None:
+        pass
+
+    class Recorder(StubProvider):
+        def sync_turn(self, user_content, assistant_content, **kwargs):
+            seen["user"] = user_content
+            seen["messages"] = list(kwargs.get("messages") or [])
+            self.executed.append(user_content)
+
+    provider = Recorder("recorder", hook=hook)
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    try:
+        msgs = [{"role": "system", "content": "s"},
+                {"role": "user", "content": "压缩前的内容"}]
+        start = time.monotonic()
+        manager.commit_memory_session(msgs)
+        check("commit 同步完成（返回前已执行）",
+              time.monotonic() - start < 0.2 and provider.executed == [""])
+        check("commit 拿到全量消息快照",
+              seen.get("messages") == msgs)
+        check("commit 传空 user_content（提取走 messages）",
+              seen.get("user") == "")
+
+        # 无 provider 时直接返回不崩
+        empty = MemoryManager()
+        empty.commit_memory_session(msgs)
+        empty.shutdown()
+    finally:
+        manager.shutdown()
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== 记忆后台同步回归测试 ==")
@@ -190,6 +226,7 @@ def main() -> None:
         test_coalescing_throttle,
         test_flush_timeout,
         test_shutdown_fallback_and_empty,
+        test_commit_memory_session_sync,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

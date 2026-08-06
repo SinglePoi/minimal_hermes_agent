@@ -27,6 +27,7 @@ tests/test_file_tools.py    文件工具回归测试（零依赖，python tests/
 tests/test_redact.py        脱敏回归测试（零依赖，python tests/test_redact.py 直接跑）
 tests/test_approval_smart.py 审批增强回归测试（零依赖，python tests/test_approval_smart.py 直接跑）
 tests/test_memory_sync.py   记忆异步同步回归测试（零依赖，python tests/test_memory_sync.py 直接跑）
+tests/test_session_prompt.py 系统提示词持久化回归测试（零依赖，python tests/test_session_prompt.py 直接跑）
 context_compressor.py       上下文压缩（阈值 50%、protect_last_n、交接摘要）
 memory_provider.py          MemoryProvider 抽象基类 + LLM 事实提取助手
 memory_manager.py           外部 provider 编排（加载/召回/同步/工具路由）
@@ -99,6 +100,15 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     合并节流（worker 未开始的旧任务被最新覆盖，messages 全量历史不丢数据）；
     flush_pending(timeout) 有界排空 + shutdown 幂等 + worker 关闭时回退内联；
     minimal_agent 会话结束 flush(10s) 后 shutdown
+16. **系统提示词持久化 + 压缩重建**：对齐 Hermes conversation_loop 的
+    update_system_prompt / _restore_or_build_system_prompt——
+    新增 sessions 表（session_id + system_prompt），新会话构建提示词后落库，
+    --resume 优先恢复持久化版本（修复"恢复会话完全没有系统提示词"的真 bug）；
+    上下文压缩触发后重建 messages[0]（刷新记忆快照/项目上下文/技能索引）并 UPSERT
+17. **压缩边界记忆提交**：对齐 Hermes run_agent.commit_memory_session——
+    MemoryManager 新增同步 commit_memory_session（压缩前先把当前原文对话的记忆
+    提取落库，原文即将被摘要掉）；与后台异步的 sync_all 分工明确：
+    常规每轮同步走后台，压缩边界必须同步先抢救；传入 messages 快照副本防就地改写
 
 ## 运行方式
 
@@ -153,6 +163,10 @@ python minimal_agent.py --resume session-xxx
   调试开关（打印辅助 LLM 原始回答与判决）、非交互自动放行文案改为中性 ℹ️
 - 回归测试脚本 `tests/test_memory_sync.py`：9 条断言全过（异步不阻塞/串行顺序/
   合并节流只跑最新/flush 超时/shutdown 内联回退/无 provider 直接返回）
+- 回归测试脚本 `tests/test_session_prompt.py`：6 条断言全过（落库往返/UPSERT 覆盖/
+  压缩后 messages[0] 重建并持久化）
+- 压缩边界 commit 测试：同步执行、拿到压缩前全量消息快照（49 条）、
+  压缩路径先 commit 后重建（tests/test_memory_sync.py + tests/test_session_prompt.py）
 - 回归测试脚本 `tests/test_file_tools.py` 新增 patch 组：唯一替换/多次报错/replace_all/
   已应用 no-change/.env 拒绝/CRLF 保留（修复了 Windows write_text 双换行 bug）；
   并行测试补 patch+write 同路径顺序、不同路径并行
@@ -176,5 +190,5 @@ python minimal_agent.py --resume session-xxx
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里：记忆同步异步化（已完成：后台 worker + 合并节流 + flush）。
+> 我们上次停在这里：系统提示词持久化 + 压缩重建（已完成，修复 --resume 无提示词 bug）。
 > 下一步候选：会话历史清理策略 或 记忆 nudge。
