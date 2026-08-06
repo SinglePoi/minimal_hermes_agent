@@ -9,6 +9,18 @@
 一个用 Python + DeepSeek 实现的迷你 Agent 骨架，逐步对齐 Hermes Agent 的核心架构
 （Agent Loop、工具系统、三层记忆/召回、多轮对话、上下文压缩、可插拔 memory provider）。
 
+## 约定：新增环境变量必须"三同步"
+
+以后每次给代码新增可配置的环境变量（如 `APPROVAL_MODE`、`SESSION_RETENTION_DAYS`），
+必须同步完成三件事，缺一不可：
+
+1. **`.env`**：写入本机生效的配置（真实值，含默认值；密钥类变量由用户自行填写）
+2. **`.env.example`**：写入模板（同样的键；非密钥用默认值，密钥用占位符如 `你的key`，
+   可选变量用注释掉的示例）
+3. **`README.md` 的环境变量表**：补充一行（变量、作用、默认值）
+
+例外：仅用于测试的临时变量（monkeypatch 注入）不需要写入环境文件。
+
 ## 目录与文件角色
 
 ```text
@@ -28,6 +40,7 @@ tests/test_redact.py        脱敏回归测试（零依赖，python tests/test_r
 tests/test_approval_smart.py 审批增强回归测试（零依赖，python tests/test_approval_smart.py 直接跑）
 tests/test_memory_sync.py   记忆异步同步回归测试（零依赖，python tests/test_memory_sync.py 直接跑）
 tests/test_session_prompt.py 系统提示词持久化回归测试（零依赖，python tests/test_session_prompt.py 直接跑）
+tests/test_session_cleanup.py 会话清理回归测试（零依赖，python tests/test_session_cleanup.py 直接跑）
 context_compressor.py       上下文压缩（阈值 50%、protect_last_n、交接摘要）
 memory_provider.py          MemoryProvider 抽象基类 + LLM 事实提取助手
 memory_manager.py           外部 provider 编排（加载/召回/同步/工具路由）
@@ -109,6 +122,11 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     MemoryManager 新增同步 commit_memory_session（压缩前先把当前原文对话的记忆
     提取落库，原文即将被摘要掉）；与后台异步的 sync_all 分工明确：
     常规每轮同步走后台，压缩边界必须同步先抢救；传入 messages 快照副本防就地改写
+18. **会话历史清理策略**：minimal_agent.py 新增 prune_sessions()（对齐 Hermes
+    SessionDB.prune_sessions）——启动时清理不活跃超过 SESSION_RETENTION_DAYS
+    （默认 90，0 禁用）的旧会话；活跃度 = MAX(messages.created_at)，无消息会话
+    回退 sessions.updated_at；连 messages + messages_fts 一起删；当前会话
+    （protect_session_id）受保护；孤儿消息（无 sessions 行）与空会话也覆盖
 
 ## 运行方式
 
@@ -167,13 +185,14 @@ python minimal_agent.py --resume session-xxx
   压缩后 messages[0] 重建并持久化）
 - 压缩边界 commit 测试：同步执行、拿到压缩前全量消息快照（49 条）、
   压缩路径先 commit 后重建（tests/test_memory_sync.py + tests/test_session_prompt.py）
+- 回归测试脚本 `tests/test_session_cleanup.py`：11 条断言全过（旧会话删除 +
+  FTS 清理、新会话保留、当前会话保护、孤儿/空会话清理、禁用与默认 90 天）
 - 回归测试脚本 `tests/test_file_tools.py` 新增 patch 组：唯一替换/多次报错/replace_all/
   已应用 no-change/.env 拒绝/CRLF 保留（修复了 Windows write_text 双换行 bug）；
   并行测试补 patch+write 同路径顺序、不同路径并行
 
 ## 已知限制 / 下一步候选
 
-- 会话历史无清理策略（磁盘会增长，运维问题）
 - 审批增强：Smart Approval（辅助 LLM）/ 连续拒绝熔断 / 命令混淆检测（base64、$() 等）/
   cron 与 gateway 审批上下文、用户自定义 deny 规则、tirith 内容级扫描
   （对齐 `tools/approval.py` 剩余部分）
@@ -190,5 +209,5 @@ python minimal_agent.py --resume session-xxx
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里：系统提示词持久化 + 压缩重建（已完成，修复 --resume 无提示词 bug）。
-> 下一步候选：会话历史清理策略 或 记忆 nudge。
+> 我们上次停在这里：会话历史清理策略（已完成：prune_sessions + FTS 清理 + 当前会话保护）。
+> 下一步候选：记忆 nudge 或 Skills 与压缩联动（prune/reinject）。

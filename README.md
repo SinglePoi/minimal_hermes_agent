@@ -85,6 +85,10 @@
     - 上下文压缩触发时重建系统提示词（拿到最新记忆快照）并同步持久化
     - 压缩边界先调用 commit_memory_session（对齐 Hermes）：把当前原文对话的
       记忆提取落库，再压成摘要——原文被摘要掉之前先抢救信息
+18. **会话历史清理策略**（对齐 Hermes SessionDB.prune_sessions）：启动时清理
+    不活跃超过保留天数的旧会话（默认 90 天，`SESSION_RETENTION_DAYS` 可调，
+    0 禁用）；活跃度 = 最后一条消息时间（无消息会话回退 sessions.updated_at）；
+    连 messages + FTS 全文索引一起删，当前正在使用的会话受保护
 
 ## 你需要准备的
 
@@ -137,6 +141,7 @@ $env:PYTHONIOENCODING="utf-8"
 | `APPROVAL_MODE` | 审批模式：`manual` / `smart`（辅助 LLM 评估）/ `off`（旁路） | `manual` |
 | `APPROVAL_SMART_POLICY` | 追加给辅助 LLM 的自定义策略（如"涉及 /etc 一律转人工"） | 空 |
 | `APPROVAL_DENIAL_BREAKER` | 连续智能拒绝多少次后触发熔断（0 = 禁用） | `3` |
+| `SESSION_RETENTION_DAYS` | 会话历史保留天数，启动时清理不活跃旧会话（0 = 禁用） | `90` |
 
 ## 体验一个完整循环
 
@@ -318,6 +323,7 @@ python tests/test_file_tools.py
 python tests/test_redact.py
 python tests/test_memory_sync.py
 python tests/test_session_prompt.py
+python tests/test_session_cleanup.py
 ```
 
 覆盖危险/硬性模式检测、deny/session/always 审批分支、允许列表落盘重载、
@@ -326,7 +332,7 @@ Skills 的 frontmatter 解析、发现、索引、加载与路径安全；文件
 敏感路径拒绝、搜索与真实工具名的路径重叠；脱敏的前缀密钥/赋值/JSON/YAML/
 请求头/私钥/JWT 与 file_read 哨兵；patch 的唯一性/已应用检测/CRLF 保留。
 记忆后台同步的异步/串行/合并节流/flush 超时；系统提示词的落库往返、
-UPSERT 覆盖与压缩后重建。
+UPSERT 覆盖与压缩后重建；会话清理的旧会话删除/FTS 清理/保护/禁用。
 Windows 控制台无需手动设编码，脚本会自动切换 UTF-8。
 
 ## 体验 Skills（按需加载）
@@ -435,6 +441,7 @@ python minimal_agent.py
 | 记忆异步同步 `memory_manager.py` | `agent/memory_manager.py`（sync_all 后台 worker + flush_pending） |
 | 系统提示词持久化 + 压缩重建 | `agent/conversation_loop.py`（update_system_prompt / _restore_or_build_system_prompt） |
 | 压缩边界记忆提交 `commit_memory_session` | `run_agent.py` 的 commit_memory_session（压缩前同步提取） |
+| 会话历史清理 `prune_sessions()` | `hermes_state.py` 的 SessionDB.prune_sessions（older_than_days） |
 | 危险命令审批 `approval.py` | `tools/approval.py`（DANGEROUS_PATTERNS、HARDLINE_PATTERNS、prompt_dangerous_approval） |
 | `terminal` 工具（先审批再执行） | `tools/terminal_tool.py`（check_all_command_guards + subprocess） |
 | 永久允许列表 `approval_allowlist.json` | `config.yaml` 的 `command_allowlist`（JSON 免去 YAML 依赖） |
@@ -461,6 +468,5 @@ prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取、patch �
 
 - Skills 增强：上下文压缩时的技能 prune/reinject、前置条件检查（对齐 Hermes 剩余部分）
 - 记忆 nudge：Hermes 的 memory_manager 有智能提醒时机，骨架是固定每 3 轮
-- 会话历史清理策略（sessions.db 无限增长，运维问题）
 - 审批剩余：用户自定义 deny 规则（approvals.deny）、tirith 内容级扫描、gateway 通知
 - 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）

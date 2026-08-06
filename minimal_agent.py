@@ -74,6 +74,8 @@ USER_FILE = BASE_DIR / "USER.md"          # 用户画像
 SESSION_DB = BASE_DIR / "sessions.db"     # 会话历史库（SQLite + FTS5 全文索引）
 ENTRY_DELIMITER = "\n§\n"
 CHAR_LIMIT = {"memory": 2200, "user": 1375}  # 字符上限，对齐 Hermes 默认值
+# 会话历史保留天数（对齐 Hermes prune_sessions 的默认 older_than_days=90；0 或负数 = 禁用清理）
+SESSION_RETENTION_DAYS = float(os.environ.get("SESSION_RETENTION_DAYS", "90") or 90)
 
 console = Console()
 
@@ -318,6 +320,69 @@ def load_session_prompt(session_id: str) -> str | None:
             (session_id,),
         ).fetchone()
         return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def prune_sessions(
+    older_than_days: float | None = None,
+    protect_session_id: str = "",
+) -> int:
+    """清理不活跃超过保留天数的旧会话（对齐 Hermes SessionDB.prune_sessions）。
+
+    规则：
+    - 活跃度 = 会话最后一条消息的 created_at；无消息的会话回退到 sessions.updated_at
+    - 同时删除 messages、messages_fts（全文索引）与 sessions 行，返回删除的会话数
+    - protect_session_id 保护当前正在使用的会话（Hermes 只清理已结束会话）
+    - older_than_days 默认取 SESSION_RETENTION_DAYS（90 天）；<=0 表示禁用
+    """
+    if older_than_days is None:
+        older_than_days = SESSION_RETENTION_DAYS
+    if older_than_days <= 0:
+        return 0
+    cutoff = time.strftime(
+        "%Y-%m-%d %H:%M:%S",
+        time.gmtime(time.time() - older_than_days * 86400),
+    )
+    conn = _db_conn()
+    try:
+        # 所有已知会话：sessions 表 ∪ messages 表里的 session_id
+        ids: set[str] = {
+            str(r[0]) for r in conn.execute("SELECT session_id FROM sessions")
+        }
+        ids |= {
+            str(r[0])
+            for r in conn.execute("SELECT DISTINCT session_id FROM messages")
+        }
+        to_delete: list[str] = []
+        for sid in ids:
+            if sid == protect_session_id:
+                continue
+            row = conn.execute(
+                "SELECT MAX(created_at) FROM messages WHERE session_id = ?", (sid,)
+            ).fetchone()
+            last_active = row[0] if row else None
+            if last_active is None:
+                row = conn.execute(
+                    "SELECT updated_at FROM sessions WHERE session_id = ?", (sid,)
+                ).fetchone()
+                last_active = row[0] if row else None
+            if last_active is None:
+                continue
+            if str(last_active) < cutoff:
+                to_delete.append(sid)
+
+        for sid in to_delete:
+            # 先清全文索引，再删消息与会话行（对齐 Hermes：messages + sessions 一起删）
+            conn.execute(
+                "DELETE FROM messages_fts WHERE rowid IN "
+                "(SELECT id FROM messages WHERE session_id = ?)",
+                (sid,),
+            )
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+        conn.commit()
+        return len(to_delete)
     finally:
         conn.close()
 
@@ -1013,6 +1078,12 @@ def main():
 
     session_id = resume_id or time.strftime("session-%Y%m%d-%H%M%S")
     show_current_memory()
+
+    # 会话历史清理：启动时清掉不活跃超过保留天数的旧会话（对齐 Hermes prune_sessions），
+    # 当前正在使用的会话受保护
+    pruned_count = prune_sessions(protect_session_id=session_id)
+    if pruned_count:
+        console.print(f"[dim]🧹 已清理 {pruned_count} 个不活跃旧会话[/dim]")
 
     # 外部记忆 provider（可选）：环境变量 MEMORY_PROVIDER=keyword
     # 对齐 Hermes 的 memory.provider 配置——同时只激活一个外部 provider
