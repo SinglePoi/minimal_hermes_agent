@@ -12,6 +12,8 @@ HTTP 服务化 + gateway 审批通知（为前端铺路，对齐 Hermes dashboar
     GET  /health            探活
     GET  /                  前端页面（web/index.html）
     GET  /web/<file>        前端静态资源（app.js / style.css 等）
+    GET  /sessions          会话列表（按最后活跃倒序）
+    GET  /sessions/<id>/messages  指定会话的历史消息（前端回显用）
 
 审批流程（对齐 Hermes 的网关队列）：
     - /chat 请求里的 agent 线程在危险命令处通过 approval.py 的网关队列阻塞等待
@@ -219,6 +221,27 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             pending = list_pending_approvals(session_id)
             self._send_json(200, {"session_id": session_id, "pending": pending})
+            return
+        if parsed.path == "/sessions":
+            try:
+                limit = int((parse_qs(parsed.query).get("limit") or ["50"])[0])
+            except ValueError:
+                limit = 50
+            self._send_json(
+                200,
+                {"sessions": minimal_agent.list_sessions(limit)},
+            )
+            return
+        if parsed.path.startswith("/sessions/") and parsed.path.endswith("/messages"):
+            session_id = unquote(parsed.path[len("/sessions/"):-len("/messages")])
+            if not session_id or "/" in session_id:
+                self._send_json(404, {"error": "not found"})
+                return
+            messages = minimal_agent.load_session_messages(session_id)
+            self._send_json(
+                200,
+                {"session_id": session_id, "messages": messages},
+            )
             return
         self._send_json(404, {"error": "not found"})
 

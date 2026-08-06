@@ -464,6 +464,56 @@ def load_session_history(session_id: str) -> list[dict[str, Any]]:
         conn.close()
 
 
+def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
+    """列出会话记录（按最后活跃倒序，对齐 Hermes api_server 的 list_sessions_rich）。
+
+    每条包含 session_id、updated_at、message_count 和最后一条用户消息的预览。
+    """
+    conn = _db_conn()
+    try:
+        rows = conn.execute(
+            """SELECT s.session_id, s.updated_at,
+                      COUNT(m.id) AS message_count,
+                      (SELECT m2.content FROM messages m2
+                       WHERE m2.session_id = s.session_id AND m2.role = 'user'
+                       ORDER BY m2.id DESC LIMIT 1) AS preview
+               FROM sessions s
+               LEFT JOIN messages m ON m.session_id = s.session_id
+               GROUP BY s.session_id
+               ORDER BY COALESCE(MAX(m.created_at), s.updated_at) DESC
+               LIMIT ?""",
+            (max(1, min(int(limit), 200)),),
+        ).fetchall()
+        return [
+            {
+                "session_id": r[0],
+                "updated_at": r[1] or "",
+                "message_count": r[2] or 0,
+                "preview": (r[3] or "").strip()[:80],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def load_session_messages(session_id: str) -> list[dict[str, Any]]:
+    """加载会话的持久化消息（含时间戳），供 Web 前端回显历史（对齐 api_server get_messages）。"""
+    conn = _db_conn()
+    try:
+        rows = conn.execute(
+            "SELECT role, content, created_at FROM messages "
+            "WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        return [
+            {"role": r[0], "content": r[1], "created_at": r[2] or ""}
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
 def search_messages_db(query: str, limit: int = 10) -> list[dict[str, Any]]:
     """FTS5 全文检索，BM25 相关性排序（对齐 Hermes 的 db.search_messages）。"""
     tokens = _search_tokens(query)

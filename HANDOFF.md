@@ -179,7 +179,10 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     hero/建议卡片 + 底部输入框，首条消息后切会话线程）；品牌为通用 Agent
     （不再叫夜莺，也不限定客服天气等业务范围）：
     - 对话：POST /chat、Markdown 子集渲染（先转义防 XSS）、建议卡片一键发送、
-      会话 ID 落 localStorage、可粘贴旧 ID 恢复、新对话按钮
+      会话 ID 落 localStorage、可粘贴旧 ID 恢复、新对话按钮（侧栏 + 顶栏双入口）
+    - 侧栏会话列表：GET /sessions（最后活跃倒序 + 预览 + 消息数）+ 点击经
+      GET /sessions/<id>/messages 加载历史回显（对齐 Hermes api_server 的
+      list_sessions / get_messages）
     - 审批弹窗：/chat 阻塞期间每 800ms 轮询 pending，按钮 允许一次/本会话/
       永久允许/拒绝（拒绝可填理由）；allow_permanent=false（smart deny）时
       隐藏"永久允许"（对齐 Hermes api_server 的 _approval_event_choices）
@@ -278,8 +281,8 @@ python demo_file_tools.py
 
 - 审批增强已完成（smart/熔断/混淆/deny/tirith）；剩余仅 cron 审批上下文
   （`approvals.cron_mode`，对齐 `tools/approval.py` 剩余部分）
-- 前端页面已完成（对话 + 审批轮询/按钮）；剩余服务增强：SSE 流式响应 / 请求鉴权
-  （token）/ 会话列表管理（Hermes web/ 有完整 dashboard，骨架只做最小聊天页）
+- 前端页面已完成（对话 + 审批轮询/按钮 + 侧栏会话列表/新对话入口）；剩余服务增强：
+  SSE 流式响应 / 请求鉴权（token）（Hermes web/ 有完整 dashboard，骨架只做最小聊天页）
 - 文件工具简化：patch 只做 replace 模式（无 V4A 补丁头/模糊匹配/语法检查），
   无陈旧检测/文件锁、无文档抽取；
   搜索仍跳过敏感文件（Hermes 也过滤敏感路径的搜索结果）
@@ -290,8 +293,7 @@ python demo_file_tools.py
 
 ## 下一阶段（前端 / 服务增强）
 
-- 服务增强：SSE 流式响应 / 请求鉴权（token）/ 会话列表管理
-  （前端页面已完成，可直接在此基础上扩展）
+- 服务增强：SSE 流式响应 / 请求鉴权（token）（会话列表管理已完成）
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
 - 运维：服务化下的日志、进程守护（Hermes 用 systemd/gateway daemon）
 

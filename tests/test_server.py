@@ -9,6 +9,7 @@ HTTP 服务化 + 网关审批端点的回归测试（零依赖，直接运行）
     - POST /approvals/resolve 解决（无挂起返回 0；有挂起唤醒阻塞线程）
     - POST /chat 正常对话（假 client）+ 参数校验
     - GET / 与 /web/* 静态前端（含路径穿越拒绝）
+    - GET /sessions 会话列表与 GET /sessions/<id>/messages 历史回显
 """
 
 import json
@@ -216,6 +217,50 @@ def test_static_frontend() -> None:
         fx.close()
 
 
+def test_sessions_endpoint() -> None:
+    """会话列表与历史消息接口（对齐 Hermes api_server 的 list/get_messages）。"""
+    fx = ServerFixture()
+    try:
+        empty = http_json("GET", f"{fx.base}/sessions")
+        check("空库会话列表 -> []", empty["sessions"] == [])
+
+        # 通过 /chat 产生一个真实会话（含落库消息）
+        http_json(
+            "POST", f"{fx.base}/chat",
+            {"message": "你好", "session_id": "sess-list"},
+        )
+
+        sessions = http_json("GET", f"{fx.base}/sessions")
+        ids = [s["session_id"] for s in sessions["sessions"]]
+        check("列表包含新建会话", "sess-list" in ids)
+        sess = next(s for s in sessions["sessions"] if s["session_id"] == "sess-list")
+        check("列表含消息数", sess["message_count"] >= 2)
+        check("列表含最后用户消息预览", "你好" in sess["preview"])
+
+        history = http_json("GET", f"{fx.base}/sessions/sess-list/messages")
+        check(
+            "历史含用户消息",
+            any(m["role"] == "user" and m["content"] == "你好" for m in history["messages"]),
+        )
+        check(
+            "历史含助手消息",
+            any(m["role"] == "assistant" for m in history["messages"]),
+        )
+        check("历史消息带时间戳", all("created_at" in m for m in history["messages"]))
+
+        missing = http_json("GET", f"{fx.base}/sessions/nope/messages")
+        check("不存在会话 -> 空消息列表", missing["messages"] == [])
+
+        import urllib.error
+        try:
+            http_json("GET", f"{fx.base}/sessions/a%2Fb/messages")
+            check("非法会话 id（含斜杠）-> 404", False)
+        except urllib.error.HTTPError as exc:
+            check("非法会话 id（含斜杠）-> 404", exc.code == 404)
+    finally:
+        fx.close()
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== HTTP 服务化回归测试 ==")
@@ -223,6 +268,7 @@ def main() -> None:
         test_health_and_pending,
         test_chat_endpoint,
         test_static_frontend,
+        test_sessions_endpoint,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

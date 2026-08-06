@@ -9,6 +9,8 @@ const API = {
   pending: "/approvals/pending",
   resolve: "/approvals/resolve",
   health: "/health",
+  sessions: "/sessions",
+  sessionsMessages: (id) => "/sessions/" + encodeURIComponent(id) + "/messages",
 };
 
 const STORAGE_KEY = "agent.session";
@@ -202,6 +204,102 @@ function saveSession(id) {
   }
 }
 
+/* ---------- 会话列表（侧栏） ---------- */
+
+function shortSessionId(id) {
+  return id.length > 18 ? "…" + id.slice(-14) : id;
+}
+
+function formatTime(utc) {
+  if (!utc) return "";
+  const t = new Date(utc.replace(" ", "T") + "Z");
+  if (isNaN(t.getTime())) return utc;
+  const now = new Date();
+  if (t.toDateString() === now.toDateString()) {
+    return t.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+  }
+  return t.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
+}
+
+function renderSessionList(list) {
+  const box = $("session-list");
+  box.textContent = "";
+  if (!list.length) {
+    const empty = document.createElement("div");
+    empty.className = "session-empty";
+    empty.textContent = "暂无会话，开始第一段对话吧";
+    box.appendChild(empty);
+    return;
+  }
+  list.forEach((s) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "session-item";
+    if (s.session_id === state.sessionId) item.classList.add("active");
+
+    const idLine = document.createElement("div");
+    idLine.className = "session-item-id";
+    idLine.textContent = shortSessionId(s.session_id);
+
+    const preview = document.createElement("div");
+    preview.className = "session-item-preview";
+    preview.textContent = s.preview || "(空会话)";
+
+    const meta = document.createElement("div");
+    meta.className = "session-item-meta";
+    meta.textContent =
+      formatTime(s.updated_at) +
+      (s.message_count ? " · " + s.message_count + " 条" : "");
+
+    item.append(idLine, preview, meta);
+    item.addEventListener("click", () => switchSession(s.session_id));
+    box.appendChild(item);
+  });
+}
+
+async function loadSessionList() {
+  try {
+    const data = await httpJson("GET", API.sessions);
+    renderSessionList(data.sessions || []);
+  } catch (e) {
+    /* 列表刷新失败不影响对话 */
+  }
+}
+
+async function switchSession(id) {
+  if (state.inFlight && state.abort) {
+    state.abort.abort();
+  }
+  stopPolling();
+  state.pendingItem = null;
+  $("approval-overlay").classList.add("hidden");
+  state.sessionId = id;
+  $("session-id").value = id;
+  saveSession(id);
+  chatEl.querySelectorAll(".msg").forEach((el) => el.remove());
+  viewTitle.textContent = "会话 · " + id;
+
+  try {
+    const data = await httpJson("GET", API.sessionsMessages(id));
+    const messages = data.messages || [];
+    if (!messages.length) {
+      showHome();
+    } else {
+      showThread();
+      messages.forEach((m) => {
+        if (m.role === "assistant" || m.role === "user") {
+          appendMessage(m.role, m.content);
+        }
+      });
+    }
+  } catch (e) {
+    appendMessage("error", "加载会话历史失败：" + e.message);
+    showThread();
+  }
+  loadSessionList();
+  inputEl.focus();
+}
+
 /* ---------- 审批 ---------- */
 
 function renderPending(items) {
@@ -329,6 +427,7 @@ async function sendMessage() {
     if (state.pendingItem) {
       pollApprovals();
     }
+    loadSessionList();
   }
 }
 
@@ -345,6 +444,7 @@ function newSession() {
   stopPolling();
   $("approval-overlay").classList.add("hidden");
   showHome();
+  loadSessionList();
 }
 
 function autoResize() {
@@ -372,11 +472,13 @@ function bindEvents() {
     });
   });
 
-  $("btn-new-session-top").addEventListener("click", () => {
+  const handleNewSession = () => {
     if (state.inFlight || confirm("开始新对话？当前对话消息会被清空（历史仍在服务端）。")) {
       newSession();
     }
-  });
+  };
+  $("btn-new-session-top").addEventListener("click", handleNewSession);
+  $("btn-new-session-side").addEventListener("click", handleNewSession);
 
   $("session-id").addEventListener("change", () => {
     const id = $("session-id").value.trim();
@@ -415,6 +517,7 @@ function init() {
   $("session-id").value = state.sessionId;
   bindEvents();
   checkHealth();
+  loadSessionList();
   setInterval(checkHealth, 15000);
   inputEl.disabled = false;
   inputEl.focus();

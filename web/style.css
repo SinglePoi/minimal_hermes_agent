@@ -88,6 +88,77 @@ html, body {
   text-transform: uppercase;
 }
 
+.side-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.btn.mini {
+  padding: 4px 9px;
+  font-size: 12px;
+  border-radius: 8px;
+}
+
+.session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 280px;
+  overflow-y: auto;
+  margin-right: -4px;
+  padding-right: 4px;
+}
+
+.session-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.35);
+  color: var(--text);
+  text-align: left;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background-color 0.12s ease;
+}
+
+.session-item:hover { border-color: rgba(217, 119, 87, 0.45); }
+
+.session-item.active {
+  border-color: var(--accent);
+  background: rgba(217, 119, 87, 0.08);
+}
+
+.session-item-id {
+  font-size: 11px;
+  font-family: Consolas, "Courier New", monospace;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.session-item-preview {
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-item-meta {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.session-empty {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 6px 2px;
+}
+
 .cap-list {
   margin: 0;
   padding: 0;

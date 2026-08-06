@@ -115,6 +115,9 @@
     - 对话：`POST /chat` 发消息、渲染 Markdown 子集（代码块/行内代码/加粗/
       斜体/列表，先转义再包标签防 XSS）、建议卡片一键发送、会话 ID 自动生成并
       持久化到 localStorage、可粘贴旧会话 ID 恢复、新对话按钮
+    - 侧栏会话列表：`GET /sessions` 列出历史会话（最后活跃倒序 + 预览 + 消息数），
+      点击条目经 `GET /sessions/<id>/messages` 加载历史回显；侧栏与顶栏都有
+      "新对话"入口（对齐 Hermes api_server 的 list_sessions / get_messages）
     - 审批弹窗：/chat 阻塞期间每 800ms 轮询 `GET /approvals/pending`，展示命令与
       原因（服务端已脱敏），按钮 允许一次/本会话允许/永久允许/拒绝（拒绝可填理由）；
       smart deny 场景按网关数据的 `allow_permanent=false` 自动隐藏"永久允许"
@@ -177,6 +180,8 @@ python server.py                 # 默认 127.0.0.1:8000
 |---|---|---|
 | `/` | GET | Web 前端页面（`web/index.html`） |
 | `/web/*` | GET | 前端静态资源（app.js / style.css） |
+| `/sessions` | GET | 会话列表（按最后活跃倒序，含预览与消息数） |
+| `/sessions/<id>/messages` | GET | 指定会话的历史消息（前端回显） |
 | `/chat` | POST | `{"message": "...", "session_id": "..."?}` → 返回 `{"reply": ...}` |
 | `/approvals/pending` | GET | `?session_id=xxx` → 当前待审批项 |
 | `/approvals/resolve` | POST | `{"session_id", "choice": "once\|session\|always\|deny", "reason"?}` |
@@ -547,6 +552,6 @@ prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取、patch �
 
 ## 下一步可以加什么
 
-- 服务增强：SSE 流式响应 / 请求鉴权（token）/ 会话列表管理
+- 服务增强：SSE 流式响应 / 请求鉴权（token）（会话列表管理已完成）
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
 - 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）
