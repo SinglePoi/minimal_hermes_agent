@@ -50,6 +50,15 @@
     name/description/platforms）；系统提示词只注入「技能索引」（名称 + 描述），
     模型需要时用 `skills_list` 查看、`skill_view` 加载全文或 references/ 子文件
     （对齐 Hermes 的 `agent/skill_utils.py` + `tools/skills_tool.py` 渐进披露设计）
+12. **文件工具 + 敏感路径保护**：`read_file`（分页+行号+截断）、`write_file`（先过
+    敏感检查再写）、`search_files`（文件名/内容递归搜索）；写 `.env`、
+    `approval_allowlist.json`、`~/.ssh`、密钥文件、系统目录一律拒绝——与终端审批
+    组成"配对门"，堵住绕过路径（对齐 Hermes `tools/file_tools.py` 的 `_check_sensitive_path`）；
+    三个工具已接入并行规划器的路径重叠检测（写同一文件排队、读写同路径顺序）
+13. **敏感文本脱敏**：`redact.py` 对齐 Hermes `agent/redact.py`——sk-/ghp_/glpat- 等
+    前缀密钥、`KEY=value`、JSON/YAML 配置、Authorization 头、JWT、私钥块、URL
+    userinfo 全部打码；`read_file` 读敏感文件改为"打码后读取"（不可复用哨兵
+    `«redacted:sk-…»`，防模型把打码值写回文件），审批面板与工具参数展示同样打码
 
 ## 你需要准备的
 
@@ -276,11 +285,15 @@ python minimal_agent.py
 python tests/test_approval.py
 python tests/test_tool_dispatch.py
 python tests/test_skills.py
+python tests/test_file_tools.py
+python tests/test_redact.py
 ```
 
 覆盖危险/硬性模式检测、deny/session/always 审批分支、允许列表落盘重载、
 terminal 工具的执行与拦截；并行批分段、路径重叠、并发真实发生与结果顺序回填；
-Skills 的 frontmatter 解析、发现、索引、加载与路径安全。
+Skills 的 frontmatter 解析、发现、索引、加载与路径安全；文件工具的分页读取、
+敏感路径拒绝、搜索与真实工具名的路径重叠；脱敏的前缀密钥/赋值/JSON/YAML/
+请求头/私钥/JWT 与 file_read 哨兵。
 Windows 控制台无需手动设编码，脚本会自动切换 UTF-8。
 
 ## 体验 Skills（按需加载）
@@ -306,6 +319,38 @@ platforms: [windows, linux, macos]
 说明：索引只注入名称 + 描述，不占上下文；`skill_view` 可加载 SKILL.md 全文，
 也可加载技能包内的 references/templates/scripts 等子文件；声明的 platforms
 与当前系统不匹配的技能不会出现在索引里。
+
+## 体验文件工具
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+python minimal_agent.py
+
+# 问：帮我把 build 目录下的文件整理成清单文件 build-list.txt
+# 模型会用 search_files 找文件、write_file 写清单、read_file 回读确认
+```
+
+敏感保护示例（模型尝试写 `.env` 会被拒绝并返回提示）：
+
+```text
+Refusing to access sensitive path (项目安全文件): ...
+Agent cannot read or modify security-sensitive files.
+```
+
+说明：相对路径按启动目录解析；`read_file` 带行号与分页（offset/limit），
+二进制文件拒绝读取；`write_file` 自动建父目录并返回实际写入的绝对路径。
+
+> 脱敏：读 `.env` 不再拒绝，而是把密钥打码——例如
+> `DEEPSEEK_API_KEY=«redacted:sk-…»`；审批面板里的命令同样打码。
+
+不想用 API Key？离线可视化演示（不需要 DeepSeek，直接看工具返回）：
+
+```powershell
+python demo_file_tools.py
+```
+
+会依次演示写文件、带行号读取、分页、搜索、以及写 `.env` 被拒绝，
+临时目录自动清理。
 
 ## 体验工具并行执行
 
@@ -345,12 +390,15 @@ python minimal_agent.py
 | 永久允许列表 `approval_allowlist.json` | `config.yaml` 的 `command_allowlist`（JSON 免去 YAML 依赖） |
 | 工具并行执行 `tool_dispatch.py` | `agent/tool_dispatch_helpers.py`（_plan_tool_batch_segments）+ `agent/tool_executor.py`（execute_tool_calls_segmented） |
 | Skills `skills.py` + `skills/` 目录 | `agent/skill_utils.py`（发现/frontmatter）+ `tools/skills_tool.py`（skills_list/skill_view）+ `agent/prompt_builder.py`（技能索引） |
+| 文件工具 `file_tools.py` | `tools/file_tools.py`（read_file_tool / write_file_tool / _check_sensitive_path） |
+| 敏感脱敏 `redact.py` | `agent/redact.py`（redact_sensitive_text / mask_secret / file_read 哨兵） |
 
 骨架简化掉了的工业级细节：文件锁、注入威胁扫描、外部漂移检测、可插拔 MemoryProvider、
 会话压缩后的 lineage 去重（压缩黑洞处理）、记忆主动 nudge、审批的 cron/gateway 上下文、
 Smart Approval（辅助 LLM 审批）与连续拒绝熔断、命令混淆检测、工具并行里的中断语义与
 turn 级 budget 收尾、Skills 的 hub/组织同步/插件命名空间/前置条件检查、压缩时的技能
-prune/reinject——这些是后续深入源码时值得关注的点。
+prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取/patch 工具、脱敏的 URL 查询
+参数/手机号/DB 连接串专项——这些是后续深入源码时值得关注的点。
 
 ## 加新工具
 
@@ -360,6 +408,5 @@ prune/reinject——这些是后续深入源码时值得关注的点。
 
 - 审批增强：Smart Approval / 连续拒绝熔断 / 命令混淆检测（对齐 `tools/approval.py` 剩余部分）
 - `sync_turn` 异步化与节流（Hermes 用后台异步 + 节流）
-- 文件工具 + 敏感路径保护（对齐 `tools/file_tools.py` 的 `_check_sensitive_path`，
-  并行规划器里的路径重叠逻辑已预留好接口）
 - Skills 增强：上下文压缩时的技能 prune/reinject、前置条件检查（对齐 Hermes 剩余部分）
+- patch 工具（V4A 补丁格式，对齐 Hermes file_tools 的 patch_tool）

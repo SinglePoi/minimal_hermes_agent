@@ -47,9 +47,9 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "skill_view",
 })
 
-# 路径作用域工具（预留：加入文件工具时填进这两个集合即可生效）
-_PATH_SCOPED_READERS = frozenset()
-_PATH_SCOPED_WRITERS = frozenset()
+# 路径作用域工具：按目标路径重叠决定能否并行（对齐 Hermes 的集合）
+_PATH_SCOPED_READERS = frozenset({"read_file", "search_files"})
+_PATH_SCOPED_WRITERS = frozenset({"write_file"})
 _PATH_SCOPED_TOOLS = _PATH_SCOPED_READERS | _PATH_SCOPED_WRITERS
 
 

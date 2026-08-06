@@ -226,6 +226,24 @@ def test_executor_mixed_batch() -> None:
           [m["tool_call_id"] for m in messages] == ["c1", "c2", "c3", "c4"])
 
 
+def test_real_file_tools_path_scope() -> None:
+    """真实文件工具名已接入路径重叠：写同一文件顺序、读写不同文件并行。"""
+    def read(path):
+        return make_call(f"r-{path}", "read_file", {"path": path})
+
+    def write(path):
+        return make_call(f"w-{path}", "write_file", {"path": path})
+
+    segs = _plan_tool_batch_segments([write("src/a.py"), write("src/a.py")])
+    check("真实工具：同路径双写 -> 顺序", kinds(segs) == [("sequential", 2)])
+
+    segs = _plan_tool_batch_segments([read("src/a.py"), write("src/b.py")])
+    check("真实工具：读+写不同路径 -> 并行", kinds(segs) == [("parallel", 2)])
+
+    segs = _plan_tool_batch_segments([read("src/a.py"), write("src/a.py")])
+    check("真实工具：读+写同路径 -> 顺序", kinds(segs) == [("sequential", 2)])
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== 工具并行执行回归测试 ==")
@@ -234,6 +252,7 @@ def main() -> None:
         test_planner_path_scope,
         test_executor_parallel_and_order,
         test_executor_mixed_batch,
+        test_real_file_tools_path_scope,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

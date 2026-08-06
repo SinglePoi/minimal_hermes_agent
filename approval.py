@@ -32,6 +32,8 @@ from typing import Any, Optional
 from rich.console import Console
 from rich.panel import Panel
 
+from redact import redact_sensitive_text
+
 console = Console()
 BASE_DIR = Path(__file__).parent
 
@@ -300,12 +302,17 @@ def prompt_dangerous_approval(
     if timeout_seconds is None:
         timeout_seconds = _get_approval_timeout()
 
+    # 对齐 Hermes：展示给用户的副本先打码（密钥/令牌不落到屏幕与日志），
+    # 原始 command 仍用于后续执行判定
+    display_command = redact_sensitive_text(command, force=True) or command
+    display_description = redact_sensitive_text(description) or description
+
     console.print()
     console.print(
         Panel(
             f"[bold red]⚠️ 危险命令需要批准[/bold red]\n\n"
-            f"[yellow]原因[/yellow]：{description}\n"
-            f"[yellow]命令[/yellow]：{command}",
+            f"[yellow]原因[/yellow]：{display_description}\n"
+            f"[yellow]命令[/yellow]：{display_command}",
             title="审批",
             border_style="red",
         )
@@ -405,8 +412,9 @@ def check_dangerous_command(command: str, session_key: str) -> dict[str, Any]:
 
     # 5. 交互提示（或非交互自动放行）
     if not _is_interactive_cli():
+        display = redact_sensitive_text(command, force=True) or command
         console.print(
-            f"[yellow]⚠️ 非交互环境，危险命令自动放行（{description}）：{command}[/yellow]"
+            f"[yellow]⚠️ 非交互环境，危险命令自动放行（{description}）：{display}[/yellow]"
         )
         return {"approved": True, "message": None, "auto_approved": True,
                 "description": description}

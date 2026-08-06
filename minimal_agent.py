@@ -51,6 +51,8 @@ from tool_dispatch import (
     tool_name,
 )
 from skills import build_skills_index, skills_list, skill_view
+from file_tools import read_file_tool, search_files_tool, write_file_tool
+from redact import redact_sensitive_text
 
 load_dotenv()
 
@@ -596,6 +598,61 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "分页读取文本文件（带行号）。敏感文件（.env、密钥、系统配置等）会拒绝读取。"
+                "参数 path 是文件路径，offset 起始行（默认 1），limit 每页行数（默认 200）。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "要读取的文件路径"},
+                    "offset": {"type": "integer", "description": "起始行号，默认 1"},
+                    "limit": {"type": "integer", "description": "每页最多行数，默认 200"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "写入文本文件（覆盖同名文件，自动创建父目录）。"
+                "敏感文件（.env、approval_allowlist.json、密钥、系统目录等）会拒绝写入。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "要写入的文件路径"},
+                    "content": {"type": "string", "description": "文件完整内容"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": (
+                "在目录下递归搜索文件名或文件内容（大小写不敏感），返回匹配文件与命中行。"
+                "敏感文件（.env 等）与排除目录（.git、__pycache__ 等）会被跳过。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "搜索起始目录"},
+                    "pattern": {"type": "string", "description": "搜索关键词"},
+                },
+                "required": ["path", "pattern"],
+            },
+        },
+    },
 ]
 
 
@@ -703,6 +760,22 @@ def run_tool(
             name=args.get("name", ""),
             file_path=args.get("file_path", ""),
         )
+    if name == "read_file":
+        return read_file_tool(
+            path=args.get("path", ""),
+            offset=int(args.get("offset", 1) or 1),
+            limit=int(args.get("limit", 200) or 200),
+        )
+    if name == "write_file":
+        return write_file_tool(
+            path=args.get("path", ""),
+            content=args.get("content", ""),
+        )
+    if name == "search_files":
+        return search_files_tool(
+            path=args.get("path", ""),
+            pattern=args.get("pattern", ""),
+        )
     if manager is not None and manager.has_tool(name):
         # 外部 provider 自带工具（如 keyword 的 memory_search）
         return manager.handle_tool_call(name, args)
@@ -764,7 +837,12 @@ def run_agent_turn(
             for tc in tool_calls:
                 name = tool_name(tc)
                 args = tool_arguments(tc) or {}
-                console.print(f"  [yellow]🔧 模型要调用工具：[/yellow]{name}({args})")
+                args_display = redact_sensitive_text(
+                    json.dumps(args, ensure_ascii=False), force=True
+                )
+                console.print(
+                    f"  [yellow]🔧 模型要调用工具：[/yellow]{name}({args_display})"
+                )
 
             def run_one(tc) -> str:
                 """执行单个工具调用（parallel 段的工作线程也会调用它）。"""
