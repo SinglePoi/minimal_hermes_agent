@@ -41,6 +41,7 @@ tests/test_approval_smart.py 审批增强回归测试（零依赖，python tests
 tests/test_memory_sync.py   记忆异步同步回归测试（零依赖，python tests/test_memory_sync.py 直接跑）
 tests/test_session_prompt.py 系统提示词持久化回归测试（零依赖，python tests/test_session_prompt.py 直接跑）
 tests/test_session_cleanup.py 会话清理回归测试（零依赖，python tests/test_session_cleanup.py 直接跑）
+tests/test_memory_nudge.py   记忆 nudge 回归测试（零依赖，python tests/test_memory_nudge.py 直接跑）
 context_compressor.py       上下文压缩（阈值 50%、protect_last_n、交接摘要）
 memory_provider.py          MemoryProvider 抽象基类 + LLM 事实提取助手
 memory_manager.py           外部 provider 编排（加载/召回/同步/工具路由）
@@ -127,6 +128,11 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     （默认 90，0 禁用）的旧会话；活跃度 = MAX(messages.created_at)，无消息会话
     回退 sessions.updated_at；连 messages + messages_fts 一起删；当前会话
     （protect_session_id）受保护；孤儿消息（无 sessions 行）与空会话也覆盖
+19. **记忆 nudge**：对齐 Hermes memory.nudge_interval（默认 10）——
+    MEMORY_NUDGE_INTERVAL 按用户轮次计数，达到间隔后台触发记忆审查（复用
+    SyncWorker，不阻塞对话）；恢复会话时用"历史用户轮次 % 间隔"水合计数，
+    跨会话连续；会话结束仍有一次收尾审查；helper 纯函数
+    should_run_memory_nudge / hydrate_nudge_counter 可单测
 
 ## 运行方式
 
@@ -187,6 +193,8 @@ python minimal_agent.py --resume session-xxx
   压缩路径先 commit 后重建（tests/test_memory_sync.py + tests/test_session_prompt.py）
 - 回归测试脚本 `tests/test_session_cleanup.py`：11 条断言全过（旧会话删除 +
   FTS 清理、新会话保留、当前会话保护、孤儿/空会话清理、禁用与默认 90 天）
+- 回归测试脚本 `tests/test_memory_nudge.py`：11 条断言全过（间隔触发/清零/禁用、
+  恢复水合、后台 worker 立即返回与排空）
 - 回归测试脚本 `tests/test_file_tools.py` 新增 patch 组：唯一替换/多次报错/replace_all/
   已应用 no-change/.env 拒绝/CRLF 保留（修复了 Windows write_text 双换行 bug）；
   并行测试补 patch+write 同路径顺序、不同路径并行
@@ -209,5 +217,5 @@ python minimal_agent.py --resume session-xxx
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里：会话历史清理策略（已完成：prune_sessions + FTS 清理 + 当前会话保护）。
-> 下一步候选：记忆 nudge 或 Skills 与压缩联动（prune/reinject）。
+> 我们上次停在这里：记忆 nudge（已完成：MEMORY_NUDGE_INTERVAL + 后台审查 + 恢复水合）。
+> 下一步候选：Skills 与压缩联动（prune/reinject）或服务化（为前端铺路）。

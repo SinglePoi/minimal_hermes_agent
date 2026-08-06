@@ -26,7 +26,7 @@ from memory_provider import MemoryProvider
 BASE_DIR = Path(__file__).parent
 
 
-class _SyncWorker:
+class SyncWorker:
     """单线程后台同步 worker：串行 + 合并节流 + 可排空。
 
     - submit(fn)：把任务交给 worker；若上一个任务还没开始执行，直接覆盖它
@@ -134,7 +134,7 @@ class MemoryManager:
     def __init__(self) -> None:
         self._providers: list[MemoryProvider] = []
         self._tool_to_provider: dict[str, MemoryProvider] = {}
-        self._sync_worker = _SyncWorker()
+        self._sync_worker = SyncWorker()
 
     def add_provider(self, provider: MemoryProvider) -> None:
         self._providers.append(provider)

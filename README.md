@@ -12,7 +12,9 @@
    - `MEMORY.md`（自己学到的知识）+ `USER.md`（用户画像），条目用 `\n§\n` 分隔
    - **模型主动写入**：对话中模型发现用户信息时调用 `memory` 工具
      （`action=add/replace/remove`，`target=memory/user`）立即落盘
-   - **对话结束审查**：再让模型补提遗漏信息，子串重叠自动去重
+   - **记忆 nudge**：每 `MEMORY_NUDGE_INTERVAL` 轮（默认 10，0 禁用）后台触发一次
+     记忆审查，让模型补提遗漏信息，子串重叠自动去重；恢复会话时按历史轮次对齐
+     计数（对齐 Hermes 的 nudge_interval 语义），审查不阻塞对话
    - **占用率提示**：注入带 `[45% — 1000/2200 chars]` 头部，工具响应回 `usage`，
      让模型知道记忆快满、主动合并（对齐 Hermes 的 char_limit）
 4. **项目上下文（Context Files）**：自动发现并注入 `AGENTS.md`（当前目录和脚本目录），
@@ -142,6 +144,7 @@ $env:PYTHONIOENCODING="utf-8"
 | `APPROVAL_SMART_POLICY` | 追加给辅助 LLM 的自定义策略（如"涉及 /etc 一律转人工"） | 空 |
 | `APPROVAL_DENIAL_BREAKER` | 连续智能拒绝多少次后触发熔断（0 = 禁用） | `3` |
 | `SESSION_RETENTION_DAYS` | 会话历史保留天数，启动时清理不活跃旧会话（0 = 禁用） | `90` |
+| `MEMORY_NUDGE_INTERVAL` | 记忆 nudge 间隔（用户轮次）：每 N 轮后台审查一次（0 = 禁用） | `10` |
 
 ## 体验一个完整循环
 
@@ -324,6 +327,7 @@ python tests/test_redact.py
 python tests/test_memory_sync.py
 python tests/test_session_prompt.py
 python tests/test_session_cleanup.py
+python tests/test_memory_nudge.py
 ```
 
 覆盖危险/硬性模式检测、deny/session/always 审批分支、允许列表落盘重载、
@@ -333,6 +337,7 @@ Skills 的 frontmatter 解析、发现、索引、加载与路径安全；文件
 请求头/私钥/JWT 与 file_read 哨兵；patch 的唯一性/已应用检测/CRLF 保留。
 记忆后台同步的异步/串行/合并节流/flush 超时；系统提示词的落库往返、
 UPSERT 覆盖与压缩后重建；会话清理的旧会话删除/FTS 清理/保护/禁用。
+记忆 nudge 的间隔触发、恢复水合与后台 worker 排空。
 Windows 控制台无需手动设编码，脚本会自动切换 UTF-8。
 
 ## 体验 Skills（按需加载）
@@ -442,6 +447,7 @@ python minimal_agent.py
 | 系统提示词持久化 + 压缩重建 | `agent/conversation_loop.py`（update_system_prompt / _restore_or_build_system_prompt） |
 | 压缩边界记忆提交 `commit_memory_session` | `run_agent.py` 的 commit_memory_session（压缩前同步提取） |
 | 会话历史清理 `prune_sessions()` | `hermes_state.py` 的 SessionDB.prune_sessions（older_than_days） |
+| 记忆 nudge `MEMORY_NUDGE_INTERVAL` | `agent/turn_context.py`（_turns_since_memory 计数 + 恢复水合）+ `agent/agent_init.py`（nudge_interval） |
 | 危险命令审批 `approval.py` | `tools/approval.py`（DANGEROUS_PATTERNS、HARDLINE_PATTERNS、prompt_dangerous_approval） |
 | `terminal` 工具（先审批再执行） | `tools/terminal_tool.py`（check_all_command_guards + subprocess） |
 | 永久允许列表 `approval_allowlist.json` | `config.yaml` 的 `command_allowlist`（JSON 免去 YAML 依赖） |
@@ -467,6 +473,5 @@ prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取、patch �
 ## 下一步可以加什么
 
 - Skills 增强：上下文压缩时的技能 prune/reinject、前置条件检查（对齐 Hermes 剩余部分）
-- 记忆 nudge：Hermes 的 memory_manager 有智能提醒时机，骨架是固定每 3 轮
 - 审批剩余：用户自定义 deny 规则（approvals.deny）、tirith 内容级扫描、gateway 通知
 - 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）

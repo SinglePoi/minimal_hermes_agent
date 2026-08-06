@@ -42,7 +42,7 @@ from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
 
-from memory_manager import MemoryManager, build_memory_context_block, load_provider
+from memory_manager import MemoryManager, SyncWorker, build_memory_context_block, load_provider
 from context_compressor import compress_context, record_usage, should_compress
 from approval import check_dangerous_command
 from tool_dispatch import (
@@ -76,6 +76,8 @@ ENTRY_DELIMITER = "\n§\n"
 CHAR_LIMIT = {"memory": 2200, "user": 1375}  # 字符上限，对齐 Hermes 默认值
 # 会话历史保留天数（对齐 Hermes prune_sessions 的默认 older_than_days=90；0 或负数 = 禁用清理）
 SESSION_RETENTION_DAYS = float(os.environ.get("SESSION_RETENTION_DAYS", "90") or 90)
+# 记忆 nudge 间隔（用户轮次；对齐 Hermes memory.nudge_interval 默认 10；0 = 禁用周期性审查）
+MEMORY_NUDGE_INTERVAL = int(os.environ.get("MEMORY_NUDGE_INTERVAL", "10") or 10)
 
 console = Console()
 
@@ -1053,6 +1055,29 @@ def review_memory_turn(client: OpenAI, messages: list[dict[str, Any]]) -> None:
             console.print(Panel("\n".join(f"+ {f}" for f in added), title=title, border_style="cyan"))
 
 
+def should_run_memory_nudge(turns_since_memory: int, interval: int) -> tuple[bool, int]:
+    """判断当前用户轮次是否触发记忆 nudge（对齐 Hermes：计数达间隔触发并清零）。
+
+    返回 (是否触发, 更新后的计数)。interval <= 0 表示禁用周期性审查。
+    """
+    if interval <= 0:
+        return False, turns_since_memory
+    turns_since_memory += 1
+    if turns_since_memory >= interval:
+        return True, 0
+    return False, turns_since_memory
+
+
+def hydrate_nudge_counter(prior_user_turns: int, interval: int) -> int:
+    """恢复会话时对齐 nudge 计数（对齐 Hermes：prior_user_turns % interval）。
+
+    让跨会话的轮次计数连续，恢复后不会立刻多触发一次。
+    """
+    if interval <= 0 or prior_user_turns <= 0:
+        return 0
+    return prior_user_turns % interval
+
+
 def main():
     if not API_KEY:
         console.print(
@@ -1123,6 +1148,17 @@ def main():
     persisted_count = len(messages)  # 已落库的消息数，增量写入从这里开始
     tools = get_tools(memory_manager)  # 核心工具 + provider 自带工具
 
+    # 记忆 nudge：后台审查 worker + 恢复会话时对齐计数（对齐 Hermes 的 nudge_interval）
+    review_worker = SyncWorker()
+    turns_since_memory = (
+        hydrate_nudge_counter(
+            sum(1 for m in messages if m.get("role") == "user"),
+            MEMORY_NUDGE_INTERVAL,
+        )
+        if resume_id
+        else 0
+    )
+
     turn_count = 0
     while True:
         if one_shot is not None:
@@ -1165,16 +1201,25 @@ def main():
                 user_input, assistant_text, messages=messages, client=client
             )
 
-        # 记忆审查：每 3 轮一次（对齐 Hermes 的 nudge_interval 概念）
-        if turn_count % 3 == 0:
-            review_memory_turn(client, messages)
+        # 记忆 nudge：按可配置间隔触发，后台异步审查（对齐 Hermes：不阻塞对话）
+        should_review, turns_since_memory = should_run_memory_nudge(
+            turns_since_memory, MEMORY_NUDGE_INTERVAL
+        )
+        if should_review:
+            review_worker.submit(
+                lambda msgs=list(messages), cli=client: review_memory_turn(cli, msgs)
+            )
 
         if one_shot_mode:
             break  # 一次性问题已答完，退出
 
-    # 会话结束：最后一次记忆审查 + 提示如何恢复
-    if turn_count % 3 != 0:
-        review_memory_turn(client, messages)
+    # 会话结束：最后一次记忆审查（后台执行），排空后干净退出
+    if turn_count > 0:
+        review_worker.submit(
+            lambda msgs=list(messages), cli=client: review_memory_turn(cli, msgs)
+        )
+    review_worker.flush(timeout=10)
+    review_worker.shutdown()
     # 排空后台记忆同步（有界等待，不阻塞退出；同步卡住则放弃）
     if memory_manager:
         memory_manager.flush_pending(timeout=10)
