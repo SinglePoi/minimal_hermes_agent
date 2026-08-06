@@ -55,7 +55,7 @@ memory_provider.py          MemoryProvider 抽象基类 + LLM 事实提取助手
 memory_manager.py           外部 provider 编排（加载/召回/同步/工具路由）
 providers/keyword/          示例 provider：本地 JSON + 关键词召回
 providers/vector/           向量检索 provider：Qwen embedding + 余弦相似度
-AGENTS.md                   项目上下文（常驻注入，示例：夜莺项目）
+AGENTS.md                   项目上下文（常驻注入，示例：Agent 骨架）
 .env                        DeepSeek key + Qwen embedding 配置（勿提交）
 .env.example                配置模板
 requirements.txt            openai / python-dotenv / rich（sentence-transformers 注释备用）
@@ -169,9 +169,11 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
 24. **前端 Web 页面（web/ 静态站点）**：对齐 Hermes dashboard 交互契约（参考
     Hermes `web/` 的 Vite + React 设计，按骨架惯例简化为原生 HTML/CSS/JS，
     零构建、零新依赖）——server.py 托管 `web/`（GET / 与 /web/*，含路径穿越
-    防护），同一 origin 免跨域：
-    - 对话面板：POST /chat、Markdown 子集渲染（先转义防 XSS）、会话 ID 落
-      localStorage、可粘贴旧 ID 恢复、新会话按钮
+    防护），同一 origin 免跨域；布局参考 Codex 首页（毛玻璃侧栏 + 标题栏 +
+    hero/建议卡片 + 底部输入框，首条消息后切会话线程）；品牌为通用 Agent
+    （不再叫夜莺，也不限定客服天气等业务范围）：
+    - 对话：POST /chat、Markdown 子集渲染（先转义防 XSS）、建议卡片一键发送、
+      会话 ID 落 localStorage、可粘贴旧 ID 恢复、新对话按钮
     - 审批弹窗：/chat 阻塞期间每 800ms 轮询 pending，按钮 允许一次/本会话/
       永久允许/拒绝（拒绝可填理由）；allow_permanent=false（smart deny）时
       隐藏"永久允许"（对齐 Hermes api_server 的 _approval_event_choices）
@@ -185,7 +187,7 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
 
 ```powershell
 # 一次性问答
-python minimal_agent.py "夜莺项目什么时候发版？"
+python minimal_agent.py "这个项目是做什么的？"
 # 多轮 REPL
 python minimal_agent.py
 # 恢复会话

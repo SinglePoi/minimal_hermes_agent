@@ -194,7 +194,7 @@ def test_static_frontend() -> None:
         status, ctype, body = http_get(f"{fx.base}/")
         check("GET / 返回 200", status == 200)
         check("GET / 是 text/html", ctype.startswith("text/html"))
-        check("首页包含页面标题", "夜莺" in body.decode("utf-8", errors="replace"))
+        check("首页包含页面标题", "今天想构建什么" in body.decode("utf-8", errors="replace"))
 
         status, ctype, body = http_get(f"{fx.base}/web/app.js")
         check("GET /web/app.js 返回 200", status == 200)

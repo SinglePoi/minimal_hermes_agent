@@ -1,11 +1,11 @@
-# 夜莺（Nightingale）天气助手
+# Agent 骨架项目
 
-这是一个内部工具项目，以下是 Agent 需要知道的项目上下文。
+这是一个对齐 Hermes Agent 架构的迷你 Agent 骨架，以下是 Agent 需要知道的项目上下文。
 
 ## 项目信息
-- 产品名：夜莺（Nightingale）天气查询助手
-- 目标用户：公司内部客服团队
-- 核心功能：查询城市天气（通过 `get_weather` 工具）
+- 定位：通用 Agent 骨架，不限定业务领域（类似 Hermes 的通用助手形态）
+- 核心能力：Agent Loop、工具系统、三层记忆/召回、多轮对话、上下文压缩、
+  可插拔 memory provider、危险命令审批、Skills 按需加载、HTTP 服务化 + Web 前端
 - 技术栈：Python + DeepSeek API（OpenAI 兼容接口）
 
 ## 代码规范

@@ -1,5 +1,6 @@
 "use strict";
-/* 夜莺 Web 前端：连 server.py 的 /chat + 审批轮询/resolve。
+/* Agent Web 前端：连 server.py 的 /chat + 审批轮询/resolve。
+   布局参考 Codex 首页：左侧毛玻璃侧栏 + 顶部标题栏 + hero/建议卡片 + 底部输入框。
    与 Hermes dashboard 的交互契约对齐：/chat 阻塞等待审批，前端轮询
    /approvals/pending 发现待审批项，POST /approvals/resolve 后线程被唤醒。 */
 
@@ -10,7 +11,7 @@ const API = {
   health: "/health",
 };
 
-const STORAGE_KEY = "nightingale.session";
+const STORAGE_KEY = "agent.session";
 const POLL_INTERVAL_MS = 800;
 
 const state = {
@@ -20,15 +21,17 @@ const state = {
   abort: null,
   queueCount: 0,
   pendingItem: null,
+  hasMessages: false,
 };
 
 const $ = (id) => document.getElementById(id);
 const chatEl = $("chat");
-const emptyEl = $("empty-state");
+const homeEl = $("home");
 const inputEl = $("input");
 const sendBtn = $("btn-send");
 const statusEl = $("status");
 const statusText = $("status-text");
+const viewTitle = $("view-title");
 
 /* ---------- 工具函数 ---------- */
 
@@ -104,8 +107,26 @@ function renderMarkdown(text) {
   return out.join("");
 }
 
+/* ---------- 视图切换（首页 ↔ 会话线程） ---------- */
+
+function showThread() {
+  homeEl.classList.add("hidden");
+  chatEl.classList.remove("hidden");
+  viewTitle.textContent = state.sessionId
+    ? "会话 · " + state.sessionId
+    : "当前会话";
+  state.hasMessages = true;
+}
+
+function showHome() {
+  homeEl.classList.remove("hidden");
+  chatEl.classList.add("hidden");
+  viewTitle.textContent = "新对话";
+  state.hasMessages = false;
+}
+
 function appendMessage(role, text) {
-  emptyEl.classList.add("hidden");
+  if (!state.hasMessages) showThread();
   const div = document.createElement("div");
   div.className = "msg " + role;
   if (role === "assistant") {
@@ -123,8 +144,7 @@ function setThinking(on) {
     if (!chatEl.querySelector(".msg.thinking")) {
       const div = document.createElement("div");
       div.className = "msg thinking";
-      div.textContent = "夜莺思考中";
-      emptyEl.classList.add("hidden");
+      div.textContent = "思考中";
       chatEl.appendChild(div);
       chatEl.scrollTop = chatEl.scrollHeight;
     }
@@ -219,7 +239,10 @@ function renderPending(items) {
 async function pollApprovals() {
   if (!state.sessionId) return;
   try {
-    const data = await httpJson("GET", API.pending + "?session_id=" + encodeURIComponent(state.sessionId));
+    const data = await httpJson(
+      "GET",
+      API.pending + "?session_id=" + encodeURIComponent(state.sessionId)
+    );
     renderPending(data.pending || []);
   } catch (e) {
     /* 轮询失败静默重试，主请求的错误由 /chat 抛给用户 */
@@ -270,6 +293,7 @@ async function sendMessage() {
   setThinking(true);
   state.inFlight = true;
   sendBtn.disabled = true;
+  sendBtn.textContent = "…";
   inputEl.disabled = true;
   state.abort = new AbortController();
   startPolling();
@@ -283,6 +307,9 @@ async function sendMessage() {
       state.sessionId = data.session_id;
       $("session-id").value = data.session_id;
       saveSession(data.session_id);
+      if (state.hasMessages) {
+        viewTitle.textContent = "会话 · " + data.session_id;
+      }
     }
     setThinking(false);
     appendMessage("assistant", data.reply || "(空回复)");
@@ -294,6 +321,7 @@ async function sendMessage() {
   } finally {
     state.inFlight = false;
     sendBtn.disabled = false;
+    sendBtn.textContent = "发送";
     inputEl.disabled = false;
     stopPolling();
     inputEl.focus();
@@ -305,8 +333,8 @@ async function sendMessage() {
 }
 
 function newSession() {
-  if (state.inFlight) {
-    if (state.abort) state.abort.abort();
+  if (state.inFlight && state.abort) {
+    state.abort.abort();
   }
   state.sessionId = "";
   state.queueCount = 0;
@@ -314,14 +342,14 @@ function newSession() {
   $("session-id").value = "";
   saveSession("");
   chatEl.querySelectorAll(".msg").forEach((el) => el.remove());
-  emptyEl.classList.remove("hidden");
   stopPolling();
   $("approval-overlay").classList.add("hidden");
+  showHome();
 }
 
 function autoResize() {
   inputEl.style.height = "auto";
-  inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + "px";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 170) + "px";
 }
 
 /* ---------- 初始化 ---------- */
@@ -336,8 +364,16 @@ function bindEvents() {
   });
   inputEl.addEventListener("input", autoResize);
 
-  $("btn-new-session").addEventListener("click", () => {
-    if (state.inFlight || confirm("开始新会话？当前对话消息会被清空（历史仍在服务端）。")) {
+  // 建议卡片：点击即发送
+  document.querySelectorAll(".suggestion").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      inputEl.value = btn.dataset.prompt || btn.textContent.trim();
+      sendMessage();
+    });
+  });
+
+  $("btn-new-session-top").addEventListener("click", () => {
+    if (state.inFlight || confirm("开始新对话？当前对话消息会被清空（历史仍在服务端）。")) {
       newSession();
     }
   });
@@ -346,6 +382,9 @@ function bindEvents() {
     const id = $("session-id").value.trim();
     state.sessionId = id;
     saveSession(id);
+    if (id && state.hasMessages) {
+      viewTitle.textContent = "会话 · " + id;
+    }
   });
 
   // 审批按钮

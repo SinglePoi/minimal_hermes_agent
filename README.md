@@ -110,15 +110,17 @@
 20. **前端 Web 页面（web/ 静态站点）**：对齐 Hermes dashboard 的交互契约（参考
     Hermes `web/` 的 Vite + React 设计，按骨架惯例简化为原生 HTML/CSS/JS，
     零构建、零新依赖）——`server.py` 直接托管 `web/`（`GET /` 与 `/web/*`），
-    同一 origin 免跨域：
-    - 对话面板：`POST /chat` 发消息、渲染 Markdown 子集（代码块/行内代码/加粗/
-      斜体/列表，先转义再包标签防 XSS）、会话 ID 自动生成并持久化到
-      localStorage、可粘贴旧会话 ID 恢复、新会话按钮
+    同一 origin 免跨域；布局参考 Codex 首页：左侧毛玻璃侧栏（品牌/能力清单）+
+    顶部标题栏 + 首页 hero/四张建议卡片 + 底部毛玻璃输入框，首条消息后切到会话线程：
+    - 对话：`POST /chat` 发消息、渲染 Markdown 子集（代码块/行内代码/加粗/
+      斜体/列表，先转义再包标签防 XSS）、建议卡片一键发送、会话 ID 自动生成并
+      持久化到 localStorage、可粘贴旧会话 ID 恢复、新对话按钮
     - 审批弹窗：/chat 阻塞期间每 800ms 轮询 `GET /approvals/pending`，展示命令与
       原因（服务端已脱敏），按钮 允许一次/本会话允许/永久允许/拒绝（拒绝可填理由）；
       smart deny 场景按网关数据的 `allow_permanent=false` 自动隐藏"永久允许"
       （对齐 Hermes api_server 的 `_approval_event_choices`）
     - 连接状态：`/health` 探活指示器；请求失败/服务离线有明确提示
+    - 品牌：通用 Agent（不限定业务领域，对齐 Hermes 的通用助手形态）
     - 服务端配套：`list_pending_approvals` 暴露 `allow_permanent`；同一会话的
       /chat 加串行锁（对齐 Hermes turn lease，防并发请求竞争 messages 状态）
 
@@ -167,7 +169,7 @@ python server.py                 # 默认 127.0.0.1:8000
 # 或指定地址端口：python server.py 0.0.0.0 9000
 ```
 
-启动后浏览器打开 <http://127.0.0.1:8000/> 即进入夜莺 Web 页面（对话 + 审批按钮）。
+启动后浏览器打开 <http://127.0.0.1:8000/> 即进入 Agent Web 页面（对话 + 审批按钮）。
 
 端点一览：
 
@@ -234,8 +236,8 @@ python minimal_agent.py "我是谁？我喜欢喝什么咖啡？"
 在项目目录放一个 `AGENTS.md`（示例文件已附在脚本目录）：
 
 ```text
-# 夜莺（Nightingale）天气助手
-目标用户：公司内部客服团队
+# Agent 骨架项目
+定位：对齐 Hermes Agent 架构的通用 Agent 骨架，不限定业务领域
 技术栈：Python + DeepSeek API
 ```
 
@@ -260,7 +262,7 @@ $env:MEMORY_PROVIDER="keyword"
 # 2. 在 providers/keyword/memory.json 里预置知识条目
 
 # 3. 问相关问题，模型会用插件召回的记忆回答
-python minimal_agent.py "夜莺项目什么时候发版？"
+python minimal_agent.py "这个项目是做什么的？"
 ```
 
 运行时会看到「🔌 外部记忆 provider：keyword」和「🔌 外部记忆召回」两个面板，
@@ -272,7 +274,7 @@ provider 自带工具演示：
 
 ```powershell
 $env:MEMORY_PROVIDER="keyword"
-python minimal_agent.py "用 memory_search 工具搜索记忆库，看看关于夜莺项目有哪些记录"
+python minimal_agent.py "用 memory_search 工具搜索记忆库，看看有哪些记录"
 ```
 
 模型会主动调用 `memory_search` 工具并基于返回结果回答——这就是
@@ -283,7 +285,7 @@ python minimal_agent.py "用 memory_search 工具搜索记忆库，看看关于�
 ```powershell
 $env:MEMORY_PROVIDER="vector"
 # 默认零依赖：tfidf 词频向量（跑通管道，语义弱）
-python minimal_agent.py "夜莺项目什么时候发版？"
+python minimal_agent.py "这个项目是做什么的？"
 ```
 
 三种嵌入后端（`EMBEDDING_BACKEND`）：
@@ -312,7 +314,7 @@ $env:EMBEDDING_API_KEY="你的dashscope-key"
 其他 OpenAI 兼容供应商（OpenAI / 硅基流动等）只需覆盖这三个变量即可。
 
 ```powershell
-python minimal_agent.py "夜莺项目什么时候发版？"
+python minimal_agent.py "这个项目是做什么的？"
 ```
 
 > 注册地址：[阿里云百炼](https://bailian.console.aliyun.com/)（DashScope），
@@ -413,7 +415,7 @@ Windows 控制台无需手动设编码，脚本会自动切换 UTF-8。
 $env:PYTHONIOENCODING="utf-8"
 python minimal_agent.py
 
-# 问：夜莺项目发版前要检查什么？
+# 问：项目发版前要检查什么？
 # 模型会先 skills_list 看到 release-check，再 skill_view 加载检查清单回答
 ```
 
@@ -422,7 +424,7 @@ python minimal_agent.py
 ```text
 ---
 name: release-check
-description: 夜莺项目发版前的检查清单与发布步骤。
+description: 项目发版前的检查清单与发布步骤（示例技能）。
 platforms: [windows, linux, macos]
 ---
 ```

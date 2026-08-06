@@ -3,43 +3,97 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>夜莺 · 客服助手</title>
+  <title>Agent · 通用对话</title>
   <link rel="stylesheet" href="/web/style.css">
 </head>
 <body>
-  <div id="app">
-    <header class="topbar">
+  <div class="app">
+    <!-- 左侧状态栏（毛玻璃）：品牌 / 能力清单 -->
+    <aside class="sidebar">
       <div class="brand">
-        <span class="logo" aria-hidden="true">🌙</span>
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+               stroke-linejoin="round">
+            <path d="M12 3c.9 3.2 2.3 5.6 4.7 7.3 1.8 1.3 2.8 3.1 2.8 5.2 0 3.4-3.4 5.5-7.5 5.5S4.5 18.9 4.5 15.5c0-2.1 1-3.9 2.8-5.2C9.7 8.6 11.1 6.2 12 3z"/>
+          </svg>
+        </div>
         <div class="brand-text">
-          <h1>夜莺</h1>
-          <p class="subtitle">内部客服天气助手</p>
+          <h1>Agent</h1>
+          <p class="subtitle">Hermes 风格 · 通用助手</p>
         </div>
       </div>
-      <div class="session-box">
-        <label for="session-id">会话 ID</label>
-        <input id="session-id" type="text" spellcheck="false"
-               placeholder="留空自动新建" autocomplete="off"
-               title="粘贴已有会话 ID 可恢复历史对话">
-        <button id="btn-new-session" class="btn ghost" type="button">新会话</button>
-      </div>
-      <div class="status" id="status" title="服务连接状态">
-        <span class="dot"></span>
-        <span id="status-text">连接中…</span>
-      </div>
-    </header>
 
-    <main id="chat" class="chat" aria-live="polite">
-      <div class="empty" id="empty-state">
-        <div class="empty-icon" aria-hidden="true">🌙</div>
-        <p>夜莺在等你。试试：<em>“北京今天天气怎么样？”</em></p>
+      <div class="side-section">
+        <div class="side-label">能力</div>
+        <ul class="cap-list">
+          <li>Agent Loop · 多轮对话</li>
+          <li>工具系统 · 并行调度</li>
+          <li>三层记忆 · 历史检索</li>
+          <li>上下文压缩</li>
+          <li>危险命令审批</li>
+          <li>Skills 按需加载</li>
+          <li>HTTP 服务化 · Web 界面</li>
+        </ul>
       </div>
-    </main>
 
-    <footer class="composer">
-      <textarea id="input" rows="1" placeholder="输入问题，Enter 发送，Shift+Enter 换行" disabled></textarea>
-      <button id="btn-send" class="btn primary" type="button">发送</button>
-    </footer>
+      <div class="sidebar-footer">对齐 Hermes Agent 架构</div>
+    </aside>
+
+    <!-- 右侧主列：标题栏 + 内容区 + 输入框 -->
+    <div class="main-col">
+      <header class="topbar">
+        <div class="view-title" id="view-title">新对话</div>
+        <div class="topbar-right">
+          <label class="session-label" for="session-id">会话 ID</label>
+          <input id="session-id" type="text" spellcheck="false"
+                 placeholder="留空自动新建" autocomplete="off"
+                 title="粘贴已有会话 ID 可恢复历史对话">
+          <button id="btn-new-session-top" class="btn ghost" type="button">新对话</button>
+          <div class="status" id="status" title="服务连接状态">
+            <span class="dot"></span>
+            <span id="status-text">连接中…</span>
+          </div>
+        </div>
+      </header>
+
+      <main class="content">
+        <!-- 首页：hero + 建议卡片（参考 Codex 首页布局） -->
+        <section class="home" id="home">
+          <div class="hero">
+            <h2>今天想构建什么？</h2>
+            <p>一个对齐 Hermes 架构的通用 Agent —— 代码、文件、终端、记忆，随叫随到。</p>
+          </div>
+          <div class="suggestions" id="suggestions">
+            <button class="suggestion" type="button" data-prompt="看看这个仓库的结构">
+              <span class="sug-icon" aria-hidden="true">📁</span>
+              <span class="sug-label">看看这个仓库的结构</span>
+            </button>
+            <button class="suggestion" type="button" data-prompt="找出项目里还有哪些待办或 TODO">
+              <span class="sug-icon" aria-hidden="true">✅</span>
+              <span class="sug-label">找出项目里还有哪些待办或 TODO</span>
+            </button>
+            <button class="suggestion" type="button" data-prompt="帮我写一段 Python 脚本">
+              <span class="sug-icon" aria-hidden="true">🐍</span>
+              <span class="sug-label">帮我写一段 Python 脚本</span>
+            </button>
+            <button class="suggestion" type="button" data-prompt="回顾一下最近的会话里聊过什么">
+              <span class="sug-icon" aria-hidden="true">🕘</span>
+              <span class="sug-label">回顾一下最近的会话里聊过什么</span>
+            </button>
+          </div>
+        </section>
+
+        <!-- 会话线程（首条消息后显示） -->
+        <section class="thread hidden" id="chat" aria-live="polite"></section>
+      </main>
+
+      <footer class="composer">
+        <textarea id="input" rows="1"
+                  placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+        <button id="btn-send" class="btn primary" type="button">发送</button>
+      </footer>
+    </div>
   </div>
 
   <!-- 危险命令审批弹窗（轮询 /approvals/pending → POST /approvals/resolve） -->

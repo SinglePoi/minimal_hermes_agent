@@ -97,7 +97,7 @@ def test_planner_core_tools() -> None:
         make_call("t1", "get_weather", {"city": "北京"}),
         make_call("t2", "session_search", {"query": "评审会"}),
         make_call("t3", "terminal", {"command": "dir"}),
-        make_call("t4", "memory_search", {"query": "夜莺"}),
+        make_call("t4", "memory_search", {"query": "骨架"}),
     ])
     check("混合批 -> 并行段 + 顺序段",
           kinds(segs) == [("parallel", 2), ("sequential", 2)])
@@ -216,7 +216,7 @@ def test_executor_mixed_batch() -> None:
         make_call("c1", "get_weather", {"city": "北京"}),
         make_call("c2", "session_search", {"query": "评审会"}),
         make_call("c3", "terminal", {"command": "dir"}),
-        make_call("c4", "memory_search", {"query": "夜莺"}),
+        make_call("c4", "memory_search", {"query": "骨架"}),
     ]
     messages: list[dict] = []
     execute_tool_calls_segmented(calls, messages, run_one)

@@ -70,8 +70,8 @@ def test_env_json_yaml() -> None:
     check("DEEPSEEK_API_KEY 值被打码", "sk-abcdef1234567890" not in out)
     check("普通键 MODEL 不动", "MODEL=deepseek-chat" in out)
 
-    out = redact_sensitive_text('{"apiKey": "sk-abcdef1234567890", "name": "夜莺"}')
-    check("JSON apiKey 打码", "sk-abcdef1234567890" not in out and '"name": "夜莺"' in out)
+    out = redact_sensitive_text('{"apiKey": "sk-abcdef1234567890", "name": "骨架"}')
+    check("JSON apiKey 打码", "sk-abcdef1234567890" not in out and '"name": "骨架"' in out)
 
     out = redact_sensitive_text("password: hunter2\nport: 8080")
     check("YAML password 打码", "hunter2" not in out and "port: 8080" in out)
