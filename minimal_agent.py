@@ -33,6 +33,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -129,7 +130,10 @@ SYSTEM_PROMPT = """你是「小助手」，一个乐于助人的 AI 助手。
     直接说明需要先执行操作，或用工具真正做一次。
 12. 需要当前日期/时间时，用 get_current_time 工具；不要调用终端命令 date/time
     （Windows cmd 下它们是交互式命令，会等待输入并卡住）。需要联网查最新信息
-    （新闻、资料、事实核查等）时用 web_search / web_fetch，不要用 terminal 模拟联网。"""
+    （新闻、资料、事实核查等）时用 web_search / web_fetch，不要用 terminal 模拟联网。
+13. 用 skill_view 加载技能后，如果返回里带 setup_needed 或 missing_required_*
+    （技能缺少所需环境变量/命令，未就绪），要如实告诉用户缺什么、怎么补齐；
+    不要假装技能可用，也不要编造技能内容。"""
 
 
 def load_system_prompt() -> str:
@@ -231,13 +235,14 @@ def build_system_prompt(manager: MemoryManager | None = None) -> str:
     """组装系统提示词：基础人设 + 项目上下文（AGENTS.md）+ 记忆/用户画像 + 外部 provider。
 
     对齐 Hermes 的 system_prompt.py 分层：stable（人设）→ context（context files）
-    → volatile（记忆快照 + USER.md）。
+    → volatile（记忆快照 + USER.md）；技能索引按当前可用工具集做条件过滤
+    （对齐 Hermes build_skills_system_prompt(available_tools=...)）。
     """
     prompt = load_system_prompt()
     context_block = load_context_files()
     if context_block:
         prompt += "\n\n" + context_block
-    skills_block = build_skills_index()
+    skills_block = build_skills_index(available_tools=available_tool_names(manager))
     if skills_block:
         prompt += "\n\n" + skills_block
     for target in ("memory", "user"):
@@ -1084,19 +1089,22 @@ TOOLS = [
         "function": {
             "name": "patch",
             "description": (
-                "在文件中做局部替换：找到 old_string 换成 new_string（比整文件重写省 token）。"
-                "old_string 必须唯一，除非 replace_all=true；找不到时若 new_string 已存在"
-                "会判定补丁已应用。敏感文件（.env 等）拒绝修改。"
+                "修改文件。mode=replace（默认）：找到 old_string 换成 new_string，"
+                "支持模糊匹配兜底，old_string 必须唯一（除非 replace_all=true）。"
+                "mode=patch：V4A 补丁格式批量操作（*** Update/Add/Delete/Move File:），"
+                "先校验后应用。敏感文件（.env 等）与 .. 穿越路径一律拒绝。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "要修改的文件路径"},
-                    "old_string": {"type": "string", "description": "要被替换的原文（必须能唯一定位）"},
-                    "new_string": {"type": "string", "description": "替换后的新文本"},
+                    "mode": {"type": "string", "description": "replace（默认）或 patch（V4A 补丁）"},
+                    "path": {"type": "string", "description": "replace 模式要修改的文件路径"},
+                    "old_string": {"type": "string", "description": "replace 模式：要被替换的原文（必须能唯一定位）"},
+                    "new_string": {"type": "string", "description": "replace 模式：替换后的新文本"},
                     "replace_all": {"type": "boolean", "description": "出现多次时是否全部替换（默认 false）"},
+                    "patch": {"type": "string", "description": "patch 模式：V4A 补丁内容（*** Begin Patch ... *** End Patch）"},
                 },
-                "required": ["path", "old_string", "new_string"],
+                "required": ["mode"],
             },
         },
     },
@@ -1349,8 +1357,13 @@ def run_tool(
     session_key: str = "",
     client=None,
     interrupt_event: Any = None,
+    available_tools: set[str] | None = None,
 ) -> str:
-    """根据工具名找到对应函数并执行。以后加新工具就在这里加一行。"""
+    """根据工具名找到对应函数并执行。以后加新工具就在这里加一行。
+
+    available_tools 传给 skills_list 做条件激活过滤（对齐 Hermes：技能列表
+    按当前可用工具集展示）；None 时显示全部（向后兼容）。
+    """
     if name == "get_current_time":
         return get_current_time()
     if name == "memory":
@@ -1374,7 +1387,7 @@ def run_tool(
             interrupt_event=interrupt_event,
         )
     if name == "skills_list":
-        return skills_list()
+        return skills_list(available_tools=available_tools)
     if name == "skill_view":
         return skill_view(
             name=args.get("name", ""),
@@ -1397,6 +1410,8 @@ def run_tool(
             old_string=args.get("old_string", ""),
             new_string=args.get("new_string", ""),
             replace_all=bool(args.get("replace_all", False)),
+            mode=args.get("mode", "replace"),
+            patch=args.get("patch", ""),
         )
     if name == "search_files":
         return search_files_tool(
@@ -1425,6 +1440,19 @@ def get_tools(manager: MemoryManager | None = None) -> list[dict[str, Any]]:
     if manager:
         tools.extend(manager.get_all_tool_schemas())
     return tools
+
+
+def available_tool_names(manager: MemoryManager | None = None) -> set[str]:
+    """汇总核心工具 + provider 自带工具的名字集合（供技能条件过滤）。
+
+    对齐 Hermes：build_skills_system_prompt(available_tools=...) 用当前可用工具集
+    过滤 requires_tools / fallback_for_tools 条件。manager 为桩对象（无
+    get_all_tool_schemas）时只统计核心 TOOLS，保证压缩重建提示词等路径不崩。
+    """
+    names = {tool_name(t) for t in TOOLS}
+    if manager is not None and hasattr(manager, "get_all_tool_schemas"):
+        names.update(tool_name(t) for t in manager.get_all_tool_schemas())
+    return names
 
 
 # ---------------- 主循环：Agent Loop ----------------
@@ -1632,6 +1660,7 @@ def run_agent_turn(
                 return run_tool(
                     name, args, manager, session_key, client,
                     interrupt_event=interrupt_event,
+                    available_tools={tool_name(t) for t in tools},
                 )
 
             def on_segment(kind: str, calls: list) -> None:
@@ -1888,18 +1917,33 @@ def main():
         if user_input in ("退出", "exit", "quit", "/exit"):
             break
 
-        turn_count, turns_since_memory, persisted_count = process_turn(
-            client,
-            messages,
-            tools,
-            memory_manager,
-            session_id,
-            user_input,
-            turn_count,
-            turns_since_memory,
-            review_worker,
-            persisted_count,
-        )
+        # REPL 中断接线：每轮一个全新 interrupt_event，Ctrl+C 打断本轮而不是杀进程
+        # （对齐 Hermes：interrupt 置位后 run_agent_turn 在轮次边界停止；模型调用
+        # 在途时 Ctrl+C 直接中止本轮，回到输入提示继续对话）
+        turn_event = threading.Event()
+        try:
+            turn_count, turns_since_memory, persisted_count = process_turn(
+                client,
+                messages,
+                tools,
+                memory_manager,
+                session_id,
+                user_input,
+                turn_count,
+                turns_since_memory,
+                review_worker,
+                persisted_count,
+                interrupt_event=turn_event,
+            )
+        except KeyboardInterrupt:
+            turn_event.set()
+            console.print("\n[yellow]（已中断本轮，输入新问题继续对话）[/yellow]")
+            # 补一条中断标记，保持消息历史连贯（对齐 run_agent_turn 的"已中断"收尾）
+            if not messages or messages[-1].get("role") != "assistant":
+                messages.append({"role": "assistant", "content": "（已中断，本轮停止）"})
+            if one_shot_mode:
+                break
+            continue
 
         if one_shot_mode:
             break  # 一次性问题已答完，退出

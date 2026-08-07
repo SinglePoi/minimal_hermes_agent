@@ -242,6 +242,19 @@ def test_real_file_tools_path_scope() -> None:
             "path": path, "old_string": "a", "new_string": "b",
         })
 
+    def patch_v4a(path):
+        # V4A 模式没有显式 path 参数，路径藏在补丁头里
+        body = (
+            "*** Begin Patch\n"
+            f"*** Update File: {path}\n"
+            "-a\n"
+            "+b\n"
+            "*** End Patch\n"
+        )
+        return make_call(f"pv-{path}", "patch", {
+            "mode": "patch", "patch": body,
+        })
+
     segs = _plan_tool_batch_segments([write("src/a.py"), write("src/a.py")])
     check("真实工具：同路径双写 -> 顺序", kinds(segs) == [("sequential", 2)])
 
@@ -256,6 +269,15 @@ def test_real_file_tools_path_scope() -> None:
 
     segs = _plan_tool_batch_segments([patch("src/a.py"), write("src/b.py")])
     check("真实工具：patch+写不同路径 -> 并行", kinds(segs) == [("parallel", 2)])
+
+    segs = _plan_tool_batch_segments([patch_v4a("src/a.py"), write("src/a.py")])
+    check("V4A patch+写同路径 -> 顺序", kinds(segs) == [("sequential", 2)])
+
+    segs = _plan_tool_batch_segments([patch_v4a("src/a.py"), write("src/b.py")])
+    check("V4A patch+写不同路径 -> 并行", kinds(segs) == [("parallel", 2)])
+
+    segs = _plan_tool_batch_segments([patch_v4a("src/a.py"), patch_v4a("src/a.py")])
+    check("V4A patch+patch 同路径 -> 顺序", kinds(segs) == [("sequential", 2)])
 
 
 def test_get_current_time_tool() -> None:

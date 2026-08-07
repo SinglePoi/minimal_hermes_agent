@@ -223,6 +223,45 @@
       占管道导致 communicate 卡死的问题），返回 cancelled
     - 服务端 SSE：客户端断开（写帧失败）→ 置位中断事件，停止本轮（/chat/stream 生效；
       一次性 /chat 无法感知客户端断开，保持现状）
+30. **Skills 前置条件检查**（2026-08-07，对齐 Hermes `agent/skill_utils.py::extract_skill_conditions`
+    + `agent/prompt_builder.py::_skill_should_show` + `tools/skills_tool.py`）：
+    - frontmatter 解析器升级：支持缩进嵌套映射（`prerequisites.env_vars`、
+      `metadata.hermes.requires_tools` 等）与块式列表（`- item` / `- name: X`），
+      零依赖、不引 pyyaml
+    - 索引期条件激活：技能可声明 `metadata.hermes.requires_tools`（缺工具 → 从索引隐藏）
+      与 `fallback_for_tools`（主工具已存在 → 隐藏兜底技能），toolsets 两组同样支持；
+      系统提示词技能索引、`skills_list` 均按当前可用工具集过滤（对齐 Hermes
+      `build_skills_system_prompt(available_tools=...)`；未提供工具集时显示全部，向后兼容）
+    - 加载期前置检查：`skill_view` 返回 `required_environment_variables` /
+      `missing_required_environment_variables` / `setup_needed` / `readiness_status` /
+      `setup_note`（env 缺失 → setup_needed，补齐后 available）；`prerequisites.commands`
+      只做 advisory（列出缺失但阻塞，对齐 Hermes"command checks remain advisory only"）
+    - 环境变量查询：os.environ 优先、`BASE_DIR/.env` 兜底（空值视为缺失，
+      对齐 Hermes `_is_env_var_persisted` 的语义）
+    - `minimal_agent.py` 接入：`build_system_prompt` / `run_tool` 汇总核心 TOOLS +
+      provider 自带工具名传入过滤；SYSTEM_PROMPT 新增规则 13（skill_view 返回
+      setup_needed 时要如实告诉用户缺什么，不得假装技能可用）
+31. **patch 工具增强：V4A 补丁 + 模糊匹配**（2026-08-07，对齐 Hermes `tools/patch_parser.py`
+    + `tools/fuzzy_match.py` + `tools/file_tools.py::patch_tool`）：
+    - patch 工具新增 `mode=patch`（V4A 格式）：支持 `*** Update/Add/Delete/Move File:`
+      四类操作批量改文件（Move 自动建父目录），可一次完成"改两处 + 新建 + 删除"；
+      返回 files_modified/created/deleted + unified diff
+    - 两阶段应用：先全量校验（hunk 逐条模拟、纯新增 hunk 校验 @@ 上下文唯一、
+      多 hunk 中"已应用"的 hunk 自动跳过）后写盘，校验失败零写入
+    - 模糊匹配策略链（replace 与 V4A 共用）：exact → line_trimmed →
+      whitespace_normalized → indentation_flexible → escape_normalized →
+      context_aware（相似度兜底，保守）；非精确匹配自动按文件实际缩进重排新文本；
+      相似度策略在 replace_all 且多命中时拒绝执行
+    - 安全：V4A 补丁头拒绝 `..` 穿越（绝对路径允许，对齐 Hermes），Move 两端与
+      Update/Add/Delete 全部过敏感路径检查（.env 等拒绝）
+    - 陈旧检测（简化版，对齐 Hermes file_state 思路）：校验阶段记录 mtime，
+      应用阶段发现文件被外部修改即失败并保留外部内容，不覆盖
+    - 语法提示：.py 文件应用后 ast.parse 检查（信息性，不阻塞）
+    - 并行规划器沿用现有 V4A 路径提取：patch+写同路径顺序、不同路径并行
+32. **REPL 中断接线**（2026-08-07）：交互模式每轮一个全新 interrupt_event，
+    Ctrl+C 打断本轮（回到输入提示继续对话）而不是杀掉整个进程；
+    中断后补一条"（已中断，本轮停止）"消息保持历史连贯（对齐 Hermes 的
+    interrupt 语义；服务端 SSE 早已接好，这是 REPL 收尾）
 
 ## 你需要准备的
 
@@ -530,6 +569,7 @@ python tests/test_approval_deny.py
 python tests/test_tirith.py
 python tests/test_gateway_approval.py
 python tests/test_server.py
+python tests/test_skills_preconditions.py
 ```
 
 覆盖危险/硬性模式检测、deny/session/always 审批分支、允许列表落盘重载、
@@ -541,6 +581,8 @@ Skills 的 frontmatter 解析、发现、索引、加载与路径安全；文件
 UPSERT 覆盖与压缩后重建；会话清理的旧会话删除/FTS 清理/保护/禁用。
 记忆 nudge 的间隔触发、恢复水合与后台 worker 排空。
 技能压缩的标记往返、幽灵技能收集与摘要后补回。
+技能前置条件的嵌套 frontmatter 解析、条件激活过滤（requires/fallback）与
+env/command readiness 检查。
 用户 deny 规则的 glob 匹配、先于 allowlist/off 的优先级与返回结构。
 tirith 的终端注入/隐形字符/同形字/管道检测与审批集成。
 网关审批队列的阻塞/唤醒/FIFO/超时；HTTP 端点的 health/pending/resolve/chat。
@@ -563,12 +605,22 @@ python minimal_agent.py
 name: release-check
 description: 项目发版前的检查清单与发布步骤（示例技能）。
 platforms: [windows, linux, macos]
+prerequisites:
+  env_vars: [DEEPSEEK_API_KEY]
+  commands: [git]
+metadata:
+  hermes:
+    requires_tools: [terminal, web_search]
 ---
 ```
 
 说明：索引只注入名称 + 描述，不占上下文；`skill_view` 可加载 SKILL.md 全文，
 也可加载技能包内的 references/templates/scripts 等子文件；声明的 platforms
-与当前系统不匹配的技能不会出现在索引里。
+与当前系统不匹配的技能不会出现在索引里；`metadata.hermes.requires_tools` /
+`fallback_for_tools` 声明了所需/兜底工具，当前工具集不满足时技能会从索引隐藏
+（对齐 Hermes 的条件激活）。`skill_view` 加载时会检查前置条件：缺少
+`prerequisites.env_vars` 里的环境变量（或新式 `required_environment_variables`）
+返回 `setup_needed` 与缺失清单，`commands` 只做提示不阻塞。
 
 ## 体验文件工具
 
@@ -589,6 +641,29 @@ Agent cannot read or modify security-sensitive files.
 
 说明：相对路径按启动目录解析；`read_file` 带行号与分页（offset/limit），
 二进制文件拒绝读取；`write_file` 自动建父目录并返回实际写入的绝对路径。
+
+patch 工具支持两种模式：
+
+- `mode=replace`（默认）：找 `old_string` 换 `new_string`，找不到时自动走模糊匹配
+  （容忍缩进/空白差异），仍找不到且目标文本已存在则判定"补丁已应用"返回 no-change
+- `mode=patch`：V4A 补丁格式，一次批量操作多个文件——
+
+```text
+*** Begin Patch
+*** Update File: src/app.py
+@@ 上下文 @@
+ def old():
+-    return 1
++    return 2
+*** Add File: src/new.py
++print("hello")
+*** Delete File: old.txt
+*** Move File: src/a.py -> src/b.py
+*** End Patch
+```
+
+V4A 模式先全量校验（失败零写入）再应用；补丁头含 `..` 穿越或指向敏感文件
+（.env 等）直接拒绝；应用前有简化版陈旧检测（文件被外部改动会失败并保留原内容）。
 
 > 脱敏：读 `.env` 不再拒绝，而是把密钥打码——例如
 > `DEEPSEEK_API_KEY=«redacted:sk-…»`；审批面板里的命令同样打码。
@@ -674,18 +749,20 @@ python minimal_agent.py
 | 永久允许列表 `approval_allowlist.json` | `config.yaml` 的 `command_allowlist`（JSON 免去 YAML 依赖） |
 | 工具并行执行 `tool_dispatch.py` | `agent/tool_dispatch_helpers.py`（_plan_tool_batch_segments）+ `agent/tool_executor.py`（execute_tool_calls_segmented） |
 | Skills `skills.py` + `skills/` 目录 | `agent/skill_utils.py`（发现/frontmatter）+ `tools/skills_tool.py`（skills_list/skill_view）+ `agent/prompt_builder.py`（技能索引） |
+| Skills 前置条件检查 | `agent/skill_utils.py` 的 `extract_skill_conditions` + `agent/prompt_builder.py` 的 `_skill_should_show` + `tools/skills_tool.py` 的 `_get_required_environment_variables`（env 缺失 → setup_needed；commands 仅 advisory） |
 | 文件工具 `file_tools.py` | `tools/file_tools.py`（read_file_tool / write_file_tool / _check_sensitive_path） |
 | 敏感脱敏 `redact.py` | `agent/redact.py`（redact_sensitive_text / mask_secret / file_read 哨兵） |
-| patch 工具（replace 模式） | `tools/file_tools.py` 的 patch_tool + `tools/file_operations.py` 的 patch_replace |
+| patch 工具（replace + V4A 双模式） | `tools/file_tools.py` 的 patch_tool（mode=replace\|patch）+ `tools/patch_parser.py`（parse_v4a_patch / apply_v4a_operations）+ `tools/fuzzy_match.py`（fuzzy_find_and_replace） |
 | 审批增强（smart/熔断/混淆检测） | `tools/approval.py`（_smart_approve / _record_denial / DANGEROUS_PATTERNS） |
 | 记忆异步同步 `memory_manager.py` | `agent/memory_manager.py`（sync_all 后台 worker + flush_pending） |
 
 骨架简化掉了的工业级细节：文件锁、注入威胁扫描、外部漂移检测、可插拔 MemoryProvider、
 会话压缩后的 lineage 去重（压缩黑洞处理）、记忆主动 nudge、审批的 cron/gateway 上下文、
 Smart Approval（辅助 LLM 审批）与连续拒绝熔断、命令混淆检测、工具并行里的中断语义与
-turn 级 budget 收尾、Skills 的 hub/组织同步/插件命名空间/前置条件检查、压缩时的技能
-prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取、patch 的 V4A 补丁头/
-模糊匹配/语法检查、脱敏的 URL 查询参数/手机号/DB 连接串专项——这些是后续深入源码时值得关注的点。
+turn 级 budget 收尾、Skills 的 hub/组织同步/插件命名空间、压缩时的技能
+prune/reinject、文件工具的跨 profile/文件锁/文档抽取（陈旧检测已做简化版、
+V4A 补丁与模糊匹配已完成）、脱敏的 URL 查询参数/手机号/DB 连接串专项——
+这些是后续深入源码时值得关注的点。
 
 ## 加新工具
 
@@ -697,8 +774,10 @@ prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取、patch �
   （对齐 Hermes api_server 的 auth / DELETE / PATCH / fork）
 - 联网能力已完成（web_search / web_fetch，零依赖 + SSRF 防护）
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
-- 文件工具增强：V4A patch 头/模糊匹配/语法检查、陈旧检测/文件锁、文档抽取
+- 文件工具增强：V4A patch / 模糊匹配 / 语法提示 / 简化陈旧检测已完成（见 31）；
+  剩余文件锁、文档抽取
 - 并行执行的中断语义已完成（见 29），turn 级 budget 已完成（见 27）
-- Skills 增强：前置条件检查、技能 hub 同步
+- Skills 前置条件检查已完成（见 30）；剩余：技能 hub 同步
 - 脱敏专项已完成（URL 查询参数、手机号、DB 连接串，见 28）
+- REPL 中断接线已完成（见 32）
 - 运维：服务化下的日志、进程守护

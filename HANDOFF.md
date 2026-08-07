@@ -28,16 +28,20 @@ minimal_agent.py            主程序：Agent Loop + REPL 多轮 + 记忆审查 
 approval.py                 危险命令审批：模式检测 + 会话/永久批准 + 交互提示（对齐 tools/approval.py）
 approval_allowlist.json     永久允许列表（已 gitignore，运行时生成）
 tool_dispatch.py            工具并行执行：批分段规划 + 并发执行 + 路径重叠检测（对齐 tool_dispatch_helpers.py）
-skills.py                   Skills：frontmatter 解析 + 发现 + 技能索引 + skills_list/skill_view（对齐 skills_tool.py）
+skills.py                   Skills：frontmatter 解析（含嵌套前置条件）+ 发现 + 条件激活过滤 +
+                            技能索引 + skills_list/skill_view + readiness 检查（对齐 skill_utils/skills_tool）
 skills/                     示例技能包：release-check（发版清单），含 references/（weather-answer 已随
                              get_weather 删除，2026-08-07）
-file_tools.py               文件工具：read_file/write_file/search_files + 敏感路径保护（对齐 file_tools.py）
+file_tools.py               文件工具：read_file/write_file/search_files + patch（replace + V4A 双模式，
+                            模糊匹配/陈旧检测/语法提示）+ 敏感路径保护（对齐 file_tools.py + patch_parser.py
+                            + fuzzy_match.py）
 redact.py                   敏感文本脱敏：前缀密钥/赋值/JSON/YAML/请求头/JWT/私钥/URL userinfo（对齐 redact.py）
 tirith.py                   内容级安全扫描：终端注入/隐形字符/同形字域名/管道到解释器（tirith 的 Python 简化版）
 demo_file_tools.py          文件工具可视化演示（离线，python demo_file_tools.py 直接跑）
 tests/test_approval.py      审批回归测试（零依赖，python tests/test_approval.py 直接跑）
 tests/test_tool_dispatch.py 并行执行回归测试（零依赖，python tests/test_tool_dispatch.py 直接跑）
 tests/test_skills.py        Skills 回归测试（零依赖，python tests/test_skills.py 直接跑）
+tests/test_skills_preconditions.py Skills 前置条件回归测试（零依赖，直接跑）
 tests/test_file_tools.py    文件工具回归测试（零依赖，python tests/test_file_tools.py 直接跑）
 tests/test_redact.py        脱敏回归测试（零依赖，python tests/test_redact.py 直接跑）
 tests/test_approval_smart.py 审批增强回归测试（零依赖，python tests/test_approval_smart.py 直接跑）
@@ -54,7 +58,7 @@ server.py                    HTTP 服务化：/chat + /chat/stream(SSE) + /appro
                              /sessions* + /skills /plugins /tools + 静态托管 web/（零新依赖）
 dashboard_auth.py            用户名密码登录 + 无状态 session cookie（scrypt 哈希 + HMAC 签名，
                              对齐 Hermes plugins/dashboard_auth/basic；附 hash-password CLI）
-web/                         前端静态站点（原生 HTML/CSS/JS，零构建）：index.html + app.js + style.css
+web/                         前端静态站点（原生 HTML/CSS/JS，零构建）：index.html + login.html + app.js + style.css
 web_tools.py                  联网工具：web_search（DuckDuckGo HTML，零依赖）+ web_fetch（抓正文），
                               SSRF 防护（对齐 Hermes plugins/web 思路简化）
 context_compressor.py       上下文压缩（阈值 50%、protect_last_n、交接摘要）
@@ -117,7 +121,7 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     "补丁已应用"检测（new_string 已在文件里 → no_change 成功，防重复重发）；
     写前过 _check_sensitive_path；BOM 剥离/CRLF 归一化保留（Windows 写文件用
     write_bytes，避免 \r\r\n 双换行）；已加入并行规划器 _PATH_SCOPED_WRITERS
-    （与 write_file 同路径排队、不同路径并行）；V4A 补丁头格式简化掉
+    （与 write_file 同路径排队、不同路径并行）；V4A 补丁头格式已补齐（见 35）
 14. **审批增强**：对齐 Hermes approvals.mode / _smart_approve / 熔断 / 混淆检测——
     APPROVAL_MODE=manual|smart|off；smart 先用辅助 LLM 评估（approve 自动放行、
     deny 给一次"仅本次"人工覆盖且不持久化、escalate/无 client/LLM 失败落回人工）；
@@ -321,6 +325,49 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     - 服务端 SSE：`_sse` 改为返回 bool，客户端断开（写帧失败）置位事件停止本轮（/chat/stream）
     - 测试：test_tool_dispatch.py 新增 executor 中断组（预置/并行 pending 取消/顺序后续跳过）；
       test_approval.py 新增 terminal 中断组（预置 + 运行中 kill）；全套 17 套通过
+34. **Skills 前置条件检查**（2026-08-07，对齐 Hermes `agent/skill_utils.py::extract_skill_conditions`
+    + `agent/prompt_builder.py::_skill_should_show` + `tools/skills_tool.py`）：
+    - frontmatter 解析器升级：缩进嵌套映射（`prerequisites.env_vars` / `metadata.hermes.*`）
+      + 块式标量列表 + 块式映射列表（`- name: X`，现代 `required_environment_variables` 写法），
+      零依赖；`true/false` 解析为布尔
+    - 索引期条件激活：`metadata.hermes.requires_tools`（缺工具 → 隐藏）/ `fallback_for_tools`
+      （主工具在 → 隐藏兜底）+ toolsets 两组；`discover_skills` / `build_skills_index` /
+      `skills_list` 均支持 available_tools 过滤，None 时显示全部（对齐 Hermes 向后兼容语义）；
+      discover 条目带 conditions 字段
+    - 加载期 readiness：`check_skill_readiness` 合并旧式 `prerequisites.env_vars` 与新式
+      `required_environment_variables`（字符串或 {name, optional, prompt, help}），
+      os.environ 优先 + BASE_DIR/.env 兜底（空值视为缺失）；`skill_view` 主视图返回
+      required/missing/setup_needed/readiness_status/setup_note；`prerequisites.commands`
+      仅 advisory（列出缺失但不阻塞，对齐 Hermes 语义）；子文件视图不带 readiness
+    - `minimal_agent.py` 接线：`available_tool_names(manager)` 汇总核心 TOOLS + provider
+      工具名（桩 manager 无 get_all_tool_schemas 时只统计核心，压缩重建提示词路径不崩）；
+      `build_system_prompt` 与 `run_tool` 的 skills_list 传 available_tools；
+      SYSTEM_PROMPT 新增规则 13（setup_needed 时要如实报告缺失，不得假装技能可用）
+    - 示例技能 release-check 增加 prerequisites + metadata.hermes 演示 frontmatter
+    - 测试：新增 tests/test_skills_preconditions.py（9 组：嵌套解析/条件提取/过滤语义/
+      索引与列表过滤/readiness env/commands advisory/skill_view 字段/.env 兜底），
+      全套 18 套通过
+35. **patch 工具增强：V4A 补丁 + 模糊匹配**（2026-08-07，对齐 Hermes `tools/patch_parser.py`
+    + `tools/fuzzy_match.py` + `tools/file_tools.py::patch_tool`）：
+    - patch 新增 `mode=patch`（V4A）：*** Update/Add/Delete/Move File: 四类操作批量改文件，
+      Move 自动建父目录；返回 files_modified/created/deleted + unified diff
+    - 两阶段应用：先全量校验（hunk 逐条模拟、纯新增 hunk 校验 @@ 上下文唯一、多 hunk
+      已应用自动跳过、纯上下文无改动报错）后写盘，校验失败零写入
+    - 模糊匹配策略链（replace 与 V4A 共用）：exact → line_trimmed →
+      whitespace_normalized → indentation_flexible → escape_normalized → context_aware
+      （保守相似度兜底）；非精确匹配自动重排缩进；相似度策略 replace_all 多命中拒绝；
+      is_already_applied 判定"补丁已应用"
+    - 安全：V4A 补丁头拒绝 `..` 穿越（绝对路径允许，对齐 Hermes），Move 两端与
+      Update/Add/Delete 全过敏感路径检查
+    - 陈旧检测（简化版，对齐 Hermes file_state 思路）：校验记录 mtime，应用阶段发现
+      外部修改即失败并保留外部内容；本补丁自写文件刷新快照不误报
+    - 语法提示：.py 应用后 ast.parse 检查（信息性不阻塞）；并行规划器沿用 V4A 路径提取
+    - 测试：test_file_tools.py 新增 5 组（模糊策略/replace 兜底/V4A 解析/V4A 应用/安全/
+      陈旧检测），test_tool_dispatch.py 新增 V4A 路径重叠组
+36. **REPL 中断接线**（2026-08-07）：交互模式每轮一个全新 interrupt_event 传给
+    process_turn/run_agent_turn；Ctrl+C 打断本轮（回到输入提示继续对话）而非杀进程；
+    中断后补"（已中断，本轮停止）"消息保持历史连贯；一次性模式中断即退出
+    （对齐 Hermes interrupt 语义；服务端 SSE 早已接好，这是 REPL 收尾）
 
 ## 运行方式
 
@@ -343,13 +390,16 @@ python demo_file_tools.py
 - 常用开关：`MEMORY_PROVIDER=vector`（语义召回）、`CONTEXT_WINDOW`、`PROTECT_LAST_N`
 - Windows 中文乱码先设 `$env:PYTHONIOENCODING="utf-8"`
 - 本机测试可用内置 Python：`C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`
-- 提交策略：由用户手动提交；最近一次提交 `0c7ff4f`（前端完整版 + 过程活动/思考回显 + SSE）
-  之后工作树干净，新会话先看 `git status`
+- 提交策略：由用户手动提交；当前 HEAD `01d8b72`（脱敏专项 + 并行执行中断语义，2026-08-07），
+  前序 `b9a0a7f`（turn budget）、`4e07047`（骨架核心 + 服务增强线）；工作树干净，新会话先看 `git status`
+- `.env` 当前激活：`DASHBOARD_USERNAME=admin` + `DASHBOARD_PASSWORD_HASH`（用户自配登录）、
+  `MAX_AGENT_TURNS=5` / `TURN_TOKEN_BUDGET=0`、`AUDIT_LOG_PATH=audit.log`、
+  `MEMORY_PROVIDER=vector` + `EMBEDDING_*`（密钥勿外泄、勿提交）
 
 ## 已验证的测试
 
 > 注：下面各测试文件记录的"条数"是当时统计，可能随用例增改漂移；
-> 以直接运行 `python tests/test_xxx.py` 的输出为准（当前共 17 套）。
+> 以直接运行 `python tests/test_xxx.py` 的输出为准（当前共 18 套）。
 
 - 多轮对话跨轮次回答、`--resume` 恢复
 - Qwen embedding 真调成功（1024 维）、向量召回 → 模型引用召回回答
@@ -397,6 +447,11 @@ python demo_file_tools.py
 - 回归测试脚本 `tests/test_skills_compression.py`：14 条断言全过（标记往返/
   调用点识别/幽灵技能收集/补标记不重复/端到端：大技能裁标记 + 小技能留原文 +
   摘要后补回）
+- 回归测试脚本 `tests/test_skills_preconditions.py`（新增，2026-08-07）：嵌套
+  frontmatter（prerequisites/metadata.hermes/块式列表）、条件激活过滤（requires/
+  fallback/toolsets/向后兼容）、索引与 skills_list 过滤、readiness env（缺失 →
+  setup_needed、补齐 → available、optional 不阻塞）、commands advisory、
+  skill_view 字段与 .env 兜底
 - 回归测试脚本 `tests/test_approval_deny.py`：11 条断言全过（glob/大小写/多条、
   deny 先于 allowlist 与 off、返回结构）
 - 回归测试脚本 `tests/test_tirith.py`：16 条断言全过（终端注入/隐形字符/同形字/
@@ -425,6 +480,11 @@ python demo_file_tools.py
 - 回归测试脚本 `tests/test_tool_dispatch.py` 新增 executor 中断组（2026-08-07）：预置中断全跳过、
   并行段已完成保留 + 阻塞中 cancelled、顺序段后续跳过；`tests/test_approval.py` 新增 terminal
   中断组（预置 + 运行中 kill 整棵树，快速返回 cancelled）
+- 回归测试脚本 `tests/test_server.py` 新增 turn budget 组（2026-08-07）：轮数上限 3 →
+  3 次工具循环 + 1 次收尾 = 4 次模型调用；token 预算 250/每轮 100 → 第 4 轮预检触顶收尾
+- 回归测试脚本 `tests/test_redact.py` 新增专项组（2026-08-07）：postgres/redis/mongodb 连接串
+  密码打码、大陆/E.164 手机号、URL 查询参数敏感键打码与 token_count/session_id 不误伤、
+  日期数字不误伤
 - 回归测试脚本 `tests/test_dashboard_auth.py`（新增，2026-08-07）：scrypt 哈希往返/错误/非法、
   HMAC 签名往返/篡改/过期/密钥不匹配、登录 正确/错误/未知用户/未启用；
   HTTP 全流程 302 跳登录、登录种 HttpOnly cookie、带 cookie 放行、/api/auth/me、
@@ -432,6 +492,12 @@ python demo_file_tools.py
 - 回归测试脚本 `tests/test_file_tools.py` 新增 patch 组：唯一替换/多次报错/replace_all/
   已应用 no-change/.env 拒绝/CRLF 保留（修复了 Windows write_text 双换行 bug）；
   并行测试补 patch+write 同路径顺序、不同路径并行
+- 回归测试脚本 `tests/test_file_tools.py` 新增 V4A+模糊组（2026-08-07）：模糊策略链
+  （缩进差异/空白折叠/无关文本不匹配/相似度 replace_all 拒绝/is_already_applied）、
+  replace 模糊兜底、V4A 解析（四操作/CRLF/无定界/畸形 Move 行）、V4A 应用
+  （多操作/Move 自动建目录/校验失败零写入/纯上下文报错/多 hunk 已应用跳过）、
+  安全（.. 穿越/敏感路径/Move 两端/绝对路径允许）、陈旧检测（外部修改拦截且不覆盖）；
+  `tests/test_tool_dispatch.py` 新增 V4A 路径重叠组（patch+写同路径顺序、不同路径并行）
 
 ## 已知限制 / 下一步候选
 
@@ -444,15 +510,17 @@ python demo_file_tools.py
   Connection: close（keep-alive 会导致 http.server 不关连接）
 - ⚠️ `__pycache__/minimal_agent.cpython-312.pyc` 被 git 跟踪（.gitignore 已含
   __pycache__/ 但对已跟踪文件无效），建议 `git rm --cached` 一次
-- 文件工具简化：patch 只做 replace 模式（无 V4A 补丁头/模糊匹配/语法检查），
-  无陈旧检测/文件锁、无文档抽取；
+- ⚠️ `build/1.txt`（用户测试写文件工具的产物，内容"hello python / 肯德基疯狂星期四"）
+  已被 git 跟踪，如不需要可 `git rm`（新会话先确认是否保留）
+- 文件工具简化：V4A 补丁/模糊匹配/语法提示/简化陈旧检测已完成（见 35），
+  仍无文件锁、跨 profile 检查、文档抽取；
   搜索仍跳过敏感文件（Hermes 也过滤敏感路径的搜索结果）
 - 并行执行中断语义已完成（见 33）；turn 级 budget 已完成（见 31）
 - 外部协议接入（候补，暂不做）：MCP（连外部工具/数据源，Hermes 有
   `hermes_cli/mcp_config.py` + `mcp_picker.py` + `optional-mcps/`）与 ACP
   （被 VS Code/Zed/JetBrains 等编辑器客户端调用，Hermes 有 `acp_adapter/` +
   `hermes acp` 子命令）；2026-08-07 用户确认写入候补、暂不实施
-- Skills 增强：prune/reinject 已完成；剩余前置条件检查、技能 hub 同步
+- Skills 增强：prune/reinject（20）与前置条件检查（34）已完成；剩余技能 hub 同步
   （Hermes 有，骨架简化掉了）
 - 脱敏专项已完成（DB 连接串/手机号/URL 查询参数，见 32）；多外部 memory provider 同时挂
   **有意不做**（2026-08-07 用户确认，与 Hermes 单外部 provider 设计一致）
@@ -460,20 +528,25 @@ python demo_file_tools.py
 ## 下一阶段（前端 / 服务增强）
 
 - 服务增强线全部完成：请求鉴权、操作审计、用户名密码登录、会话删除/标题/fork（见 25~28，
-  对齐 Hermes api_server 的 auth / DELETE / PATCH / fork）；联网能力已完成（见 29）
+  对齐 Hermes api_server 的 auth / DELETE / PATCH / fork）；联网（29）、时间工具（30）、
+  turn budget（31）、脱敏专项（32）、并行中断语义（33）、技能前置条件（34）、
+  V4A patch + 模糊匹配（35）、REPL 中断接线（36）均已完成
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
-- 文件工具增强：V4A patch 头/模糊匹配/语法检查、陈旧检测/文件锁、文档抽取
-- 并行执行中断语义已完成（见 33）
-- Skills 增强：前置条件检查、技能 hub 同步
-- 脱敏专项已完成（见 32）
+- 文件工具剩余：文件锁、跨 profile 检查、文档抽取（V4A/模糊/语法提示/简化陈旧检测已完成）
+- Skills 剩余：技能 hub 同步
 - 运维：服务化下的日志、进程守护（Hermes 用 systemd/gateway daemon）
+- 中断接线：REPL Ctrl+C 已完成（36）；一次性 /chat 无法感知断连（保持现状）
+- 可选：web_search 升级为带 key 供应商（Tavily/SerpAPI 等，只改 web_tools.py 内部）
 
 ## 给新会话的起始指令（可直接粘贴）
 
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里：前端完整版 + 过程活动/思考回显 + SSE 流式全部完成
-  （提交 `0c7ff4f`，工作树干净；提交由用户手动进行）。
-> 下一步候选：请求鉴权 / 操作审计落库 / 会话删除与 fork / cron 审批 /
-  文件工具增强 / 运维日志与进程守护。
+> 我们上次停在这里（2026-08-07）：服务增强线全部完成（鉴权/审计/登录/会话删除/标题/fork，
+  见 25~28）+ 联网（29）+ 时间工具（30）+ turn budget（31）+ 脱敏专项（32）+
+  并行执行中断语义（33）+ Skills 前置条件检查（34）+ V4A patch/模糊匹配（35）+
+  REPL 中断接线（36）；全套 18 套回归通过；提交由用户手动进行（工作树含
+  HANDOFF/README 与本次改动，待用户提交）。
+> 下一步候选：cron 审批 / 文件工具剩余（文件锁/文档抽取）/ Skills hub 同步 /
+  运维日志与进程守护。

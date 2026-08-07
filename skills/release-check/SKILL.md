@@ -2,6 +2,12 @@
 name: release-check
 description: 项目发版前的检查清单与发布步骤（示例技能）。
 platforms: [windows, linux, macos]
+prerequisites:
+  env_vars: [DEEPSEEK_API_KEY]
+  commands: [git]
+metadata:
+  hermes:
+    requires_tools: [terminal, web_search]
 ---
 
 # 发版检查清单（示例）
