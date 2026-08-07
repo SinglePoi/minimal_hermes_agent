@@ -14,6 +14,7 @@ stdout/stderr 重配为 UTF-8。
 """
 
 import json
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -29,6 +30,7 @@ for stream in (sys.stdout, sys.stderr):
         pass
 
 import approval  # noqa: E402
+import minimal_agent  # noqa: E402
 from minimal_agent import run_terminal  # noqa: E402
 
 
@@ -170,6 +172,34 @@ def test_terminal_tool() -> None:
         approval._is_interactive_cli = original_interactive
 
 
+def test_terminal_stdin_devnull() -> None:
+    """终端工具：subprocess 必须带 stdin=DEVNULL，防止交互式命令（date/time）无限等待。"""
+    captured: dict = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    original_run = minimal_agent.subprocess.run
+
+    def fake_run(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    minimal_agent.subprocess.run = fake_run
+    try:
+        result = json.loads(run_terminal("echo hello-stdin", "sess-term-stdin"))
+        check("terminal 安全命令正常执行", result["exit_code"] == 0)
+        check(
+            "subprocess 传入 stdin=DEVNULL",
+            captured["kwargs"].get("stdin") is subprocess.DEVNULL,
+        )
+        check("subprocess 传入 timeout=120", captured["kwargs"].get("timeout") == 120)
+    finally:
+        minimal_agent.subprocess.run = original_run
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果（失败时返回非零退出码）。"""
     print("== 危险命令审批回归测试 ==")
@@ -178,6 +208,7 @@ def main() -> None:
         test_hardline_detection,
         test_approval_gate_branches,
         test_terminal_tool,
+        test_terminal_stdin_devnull,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

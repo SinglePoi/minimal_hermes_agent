@@ -39,12 +39,14 @@ _NEVER_PARALLEL_TOOLS = frozenset()
 
 # 只读、无共享可变状态的工具 → 可并行
 _PARALLEL_SAFE_TOOLS = frozenset({
-    "get_weather",
     "session_search",
     "memory_search",
     "vector_search",
     "skills_list",
     "skill_view",
+    "get_current_time",
+    "web_search",
+    "web_fetch",
 })
 
 # 路径作用域工具：按目标路径重叠决定能否并行（对齐 Hermes 的集合）

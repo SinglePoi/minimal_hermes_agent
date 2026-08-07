@@ -52,6 +52,7 @@ from tool_dispatch import (
     tool_name,
 )
 from skills import build_skills_index, skills_list, skill_view
+import web_tools
 from file_tools import (
     patch_file_tool,
     read_file_tool,
@@ -60,7 +61,8 @@ from file_tools import (
 )
 from redact import redact_sensitive_text
 
-load_dotenv()
+# 配置源：.env 优先于系统环境变量（override=True，2026-08-07 按用户要求调整）
+load_dotenv(override=True)
 
 # ---------------- 配置 ----------------
 API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -88,7 +90,8 @@ SYSTEM_PROMPT = """你是「小助手」，一个乐于助人的 AI 助手。
 
 ## 行为规则
 1. 回答要简洁、准确、友好。
-2. 需要实时信息（如天气）时，必须先调用 get_weather 工具，再基于工具结果回答。
+2. 需要实时/最新信息（天气、新闻、资料等）时，先用 web_search 工具查询，
+   再基于工具结果回答。
 3. 不确定的信息要如实说明，不要编造。
 4. 用户提到关于自己的信息（名字、偏好、习惯）时，用 memory 工具主动记下来：
    - 用户个人信息 → memory(target=user, action=add, content=...)
@@ -108,7 +111,10 @@ SYSTEM_PROMPT = """你是「小助手」，一个乐于助人的 AI 助手。
     需要用到该技能时，用标记里的 skill_view(name='...') 重新加载（每个技能一次即可）。
 11. 声称"已创建/已删除/已修改"任何文件或目录之前，必须真的通过 terminal 或文件工具
     执行过，并且看到了工具返回结果。没有真实工具返回时，不许说操作"已完成"——
-    直接说明需要先执行操作，或用工具真正做一次。"""
+    直接说明需要先执行操作，或用工具真正做一次。
+12. 需要当前日期/时间时，用 get_current_time 工具；不要调用终端命令 date/time
+    （Windows cmd 下它们是交互式命令，会等待输入并卡住）。需要联网查最新信息
+    （新闻、资料、事实核查等）时用 web_search / web_fetch，不要用 terminal 模拟联网。"""
 
 
 def load_system_prompt() -> str:
@@ -305,6 +311,9 @@ def _db_conn() -> sqlite3.Connection:
         conn.execute(
             "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
         )
+    if "title" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
+    if "archived" not in cols or "title" not in cols:
         conn.commit()
     return conn
 
@@ -403,6 +412,101 @@ def prune_sessions(
         conn.close()
 
 
+def delete_session(session_id: str) -> bool:
+    """硬删一个会话及其全部消息（对齐 Hermes SessionDB.delete_session）。
+
+    在单个事务里删除 messages_fts（全文索引）、messages 与 sessions 行；
+    返回是否真的存在并删除。供 HTTP DELETE /sessions/<id> 与前端删除入口使用。
+    """
+    conn = _db_conn()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        exists = bool(row and row[0])
+        # 先清全文索引，再删消息与会话行（与 prune_sessions 保持一致）
+        conn.execute(
+            "DELETE FROM messages_fts WHERE rowid IN "
+            "(SELECT id FROM messages WHERE session_id = ?)",
+            (session_id,),
+        )
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        conn.commit()
+        return exists
+    finally:
+        conn.close()
+
+
+def set_session_title(session_id: str, title: str) -> bool:
+    """设置会话标题（对齐 Hermes api_server 的 PATCH /api/sessions 标题更新）。
+
+    title 为空串表示清除标题（回退到自动标题/预览）；返回会话是否存在。
+    """
+    conn = _db_conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "UPDATE sessions SET title = ?, updated_at = datetime('now') "
+            "WHERE session_id = ?",
+            (title, session_id),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def fork_session(source_id: str, new_id: str, title: str = "") -> bool:
+    """复制会话历史开新会话（对齐 Hermes api_server 的 POST /api/sessions/<id>/fork）。
+
+    复制 system_prompt、标题与全部消息（含 FTS 全文索引）；新会话 archived=0。
+    源会话不存在或新 id 已占用返回 False。简化：无 parent_session_id 血缘列，
+    删除源会话不影响分支（与 Hermes"分支子会话独立"语义一致）。
+    """
+    conn = _db_conn()
+    try:
+        src = conn.execute(
+            "SELECT system_prompt, title FROM sessions WHERE session_id = ?",
+            (source_id,),
+        ).fetchone()
+        if src is None:
+            return False
+        if conn.execute(
+            "SELECT 1 FROM sessions WHERE session_id = ?", (new_id,)
+        ).fetchone():
+            return False
+        system_prompt, src_title = src
+        fork_title = title.strip() if title.strip() else (
+            f"{src_title.strip()} fork" if (src_title or "").strip() else "fork"
+        )
+        conn.execute(
+            "INSERT INTO sessions (session_id, system_prompt, updated_at, archived, title) "
+            "VALUES (?, ?, datetime('now'), 0, ?)",
+            (new_id, system_prompt, fork_title),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, created_at) "
+            "SELECT ?, role, content, created_at FROM messages WHERE session_id = ?",
+            (new_id, source_id),
+        )
+        for mid, content in conn.execute(
+            "SELECT id, content FROM messages WHERE session_id = ?", (new_id,)
+        ):
+            conn.execute(
+                "INSERT INTO messages_fts (rowid, search_text) VALUES (?, ?)",
+                (mid, " ".join(_search_tokens(content))),
+            )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
 def _search_tokens(text: str) -> list[str]:
     """检索分词：英文按单词、中文按相邻双字（2-gram）。
 
@@ -455,6 +559,18 @@ def persist_messages(
                 "INSERT INTO messages_fts (rowid, search_text) VALUES (?, ?)",
                 (cur.lastrowid, " ".join(_search_tokens(content))),
             )
+            # 首条用户消息自动生成标题（对齐 Hermes 自动标题，简化：取首条用户消息截断 40 字）
+            if role == "user":
+                row = conn.execute(
+                    "SELECT title FROM sessions WHERE session_id = ?", (session_id,)
+                ).fetchone()
+                if row is not None and not (row[0] or "").strip():
+                    auto_title = re.sub(r"\s+", " ", content).strip()[:40]
+                    if auto_title:
+                        conn.execute(
+                            "UPDATE sessions SET title = ? WHERE session_id = ?",
+                            (auto_title, session_id),
+                        )
         conn.commit()
     finally:
         conn.close()
@@ -484,7 +600,7 @@ def list_sessions(
     - 默认只列未归档会话（archived 会话从列表隐藏，但仍可按 id 恢复）
     - include_archived=True：未归档 + 已归档都返回
     - archived_only=True：只返回已归档会话（归档管理视图用）
-    每条包含 session_id、updated_at、archived、message_count 和最后一条用户消息的预览。
+    每条包含 session_id、updated_at、archived、title、message_count 和最后一条用户消息的预览。
     """
     if archived_only:
         where_clause = "WHERE s.archived = 1"
@@ -495,7 +611,7 @@ def list_sessions(
     conn = _db_conn()
     try:
         rows = conn.execute(
-            f"""SELECT s.session_id, s.updated_at, s.archived,
+            f"""SELECT s.session_id, s.updated_at, s.archived, s.title,
                       COUNT(m.id) AS message_count,
                       (SELECT m2.content FROM messages m2
                        WHERE m2.session_id = s.session_id AND m2.role = 'user'
@@ -513,8 +629,9 @@ def list_sessions(
                 "session_id": r[0],
                 "updated_at": r[1] or "",
                 "archived": bool(r[2]),
-                "message_count": r[3] or 0,
-                "preview": (r[4] or "").strip()[:80],
+                "title": r[3] or "",
+                "message_count": r[4] or 0,
+                "preview": (r[5] or "").strip()[:80],
             }
             for r in rows
         ]
@@ -791,26 +908,26 @@ def call_llm_stream(
 
 
 # ---------------- 工具：定义 + 执行 ----------------
-def get_weather(city: str) -> str:
-    """示例工具：假装查天气（离线假数据，不需要真联网）。"""
-    fake = {"北京": "晴，25°C", "上海": "多云，27°C", "广州": "阵雨，30°C"}
-    return fake.get(city, f"{city}：暂无数据，建议看天气预报网站")
+_WEEKDAYS_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
-# 工具清单：get_weather 查天气，memory 写记忆（Hermes 的 memory 工具）
+def get_current_time() -> str:
+    """返回当前本地日期时间与星期（模型问"今天几号/几点"时用，避免误调交互式 date 命令）。"""
+    now = time.localtime()
+    return time.strftime("%Y-%m-%d %H:%M:%S", now) + " " + _WEEKDAYS_CN[now.tm_wday]
+
+
+# 工具清单：get_current_time 查时间，memory 写记忆，web_search 联网（Hermes 工具体系）
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_weather",
-            "description": "查询指定城市的天气",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {"type": "string", "description": "城市名，例如：北京"},
-                },
-                "required": ["city"],
-            },
+            "name": "get_current_time",
+            "description": (
+                "获取当前本地日期时间与星期。模型需要知道今天几号、现在几点、星期几时用它，"
+                "不要调用终端命令 date/time（Windows 下会交互式等待输入而卡住）。"
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
@@ -894,7 +1011,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "技能名，如 weather-answer"},
+                    "name": {"type": "string", "description": "技能名，如 release-check"},
                     "file_path": {"type": "string", "description": "技能包内相对路径（可选）"},
                 },
                 "required": ["name"],
@@ -977,6 +1094,42 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "联网搜索：按关键词搜索互联网，返回标题/链接/摘要。"
+                "需要最新信息或本地知识库查不到时使用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词，例如：2026 年 AI 最新进展"},
+                    "limit": {"type": "integer", "description": "返回结果条数（1-10，默认 5）"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": (
+                "抓取网页正文：输入 http/https 网址，返回页面可读文本（自动去标签、截断）。"
+                "用于阅读搜索到的链接或指定网页；仅允许公网地址。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "完整的 http/https 网页地址"},
+                    "max_chars": {"type": "integer", "description": "返回最大字符数（默认 4000）"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 
@@ -1018,6 +1171,9 @@ def run_terminal(
             command,
             shell=True,
             capture_output=True,
+            # stdin 置空：防止交互式命令（如 Windows cmd 内置的 date/time）在
+            # 服务终端里等待输入造成"无限等待"（模型误调裸 date 曾卡住整轮）
+            stdin=subprocess.DEVNULL,
             text=True,
             timeout=timeout,
             errors="replace",
@@ -1064,8 +1220,8 @@ def run_tool(
     client=None,
 ) -> str:
     """根据工具名找到对应函数并执行。以后加新工具就在这里加一行。"""
-    if name == "get_weather":
-        return get_weather(args.get("city", ""))
+    if name == "get_current_time":
+        return get_current_time()
     if name == "memory":
         return memory_tool(
             action=args.get("action", ""),
@@ -1114,6 +1270,16 @@ def run_tool(
         return search_files_tool(
             path=args.get("path", ""),
             pattern=args.get("pattern", ""),
+        )
+    if name == "web_search":
+        return web_tools.web_search(
+            query=args.get("query", ""),
+            limit=int(args.get("limit", 5) or 5),
+        )
+    if name == "web_fetch":
+        return web_tools.web_fetch(
+            url=args.get("url", ""),
+            max_chars=int(args.get("max_chars", 4000) or 4000),
         )
     if manager is not None and manager.has_tool(name):
         # 外部 provider 自带工具（如 keyword 的 memory_search）

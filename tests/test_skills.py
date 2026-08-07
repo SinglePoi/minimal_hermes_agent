@@ -44,16 +44,16 @@ def test_frontmatter_parsing() -> None:
     """frontmatter 解析：BOM / 引号 / 列表 / 围栏兜底。"""
     with_bom = (
         "\ufeff---\n"
-        'name: weather-answer\n'
-        'description: "客服天气播报规范"\n'
+        'name: release-check\n'
+        'description: "发版检查清单规范"\n'
         "platforms: [windows, linux]\n"
         "---\n"
         "# 正文\n"
         "内容……"
     )
     meta, body = skills.parse_frontmatter(with_bom)
-    check("BOM 被剥离且元数据解析", meta.get("name") == "weather-answer")
-    check("引号描述被剥离", meta.get("description") == "客服天气播报规范")
+    check("BOM 被剥离且元数据解析", meta.get("name") == "release-check")
+    check("引号描述被剥离", meta.get("description") == "发版检查清单规范")
     check("列表值解析", meta.get("platforms") == ["windows", "linux"])
     check("正文与 frontmatter 分离", body.strip().startswith("# 正文"))
 
@@ -70,32 +70,31 @@ def test_frontmatter_parsing() -> None:
 def test_discovery_and_index() -> None:
     """示例技能被发现，索引与列表内容正确。"""
     found = {s["name"]: s for s in skills.discover_skills()}
-    check("示例技能 weather-answer 被发现", "weather-answer" in found)
     check("示例技能 release-check 被发现", "release-check" in found)
-    check("描述解析", "话术" in found["weather-answer"]["description"])
-    check("references/ 不单独成技能", all(s["name"] != "faq" for s in skills.discover_skills()))
+    check("描述解析", "发版" in found["release-check"]["description"])
+    check("references/ 不单独成技能", all(s["name"] != "rollback" for s in skills.discover_skills()))
 
     index = skills.build_skills_index()
     check("技能索引含标题", index.startswith("## 可用技能（Skills）"))
-    check("技能索引含两个技能", "weather-answer" in index and "release-check" in index)
+    check("技能索引含示例技能", "release-check" in index)
 
     data = json.loads(skills.skills_list())
     check("skills_list success", data["success"] is True)
-    check("skills_list count=2", data["count"] == 2)
+    check("skills_list count=1", data["count"] == 1)
     check("skills_list 只含元数据",
           all(set(s) == {"name", "description", "category"} for s in data["skills"]))
 
 
 def test_skill_view() -> None:
     """skill_view：全文加载、子文件加载、非法名字拒绝。"""
-    data = json.loads(skills.skill_view("weather-answer"))
+    data = json.loads(skills.skill_view("release-check"))
     check("skill_view success", data["success"] is True)
     check("skill_view 正文不含 frontmatter", "name:" not in data["content"])
-    check("skill_view 正文含标题", "# 天气播报规范" in data["content"])
-    check("skill_view 列出子文件", "references/faq.md" in data["files"])
+    check("skill_view 正文含标题", "# 发版检查清单（示例）" in data["content"])
+    check("skill_view 列出子文件", "references/rollback.md" in data["files"])
 
-    sub = json.loads(skills.skill_view("weather-answer", "references/faq.md"))
-    check("skill_view 子文件加载", sub["success"] is True and "预报能力" in sub["content"])
+    sub = json.loads(skills.skill_view("release-check", "references/rollback.md"))
+    check("skill_view 子文件加载", sub["success"] is True and "回滚说明" in sub["content"])
 
     missing = json.loads(skills.skill_view("no-such-skill"))
     check("不存在的技能 -> success=False", missing["success"] is False)
@@ -103,7 +102,7 @@ def test_skill_view() -> None:
     traversal = json.loads(skills.skill_view("../minimal_agent.py"))
     check("路径穿越名字被拒绝", traversal["success"] is False)
 
-    traversal2 = json.loads(skills.skill_view("weather-answer", "../../minimal_agent.py"))
+    traversal2 = json.loads(skills.skill_view("release-check", "../../minimal_agent.py"))
     check("子文件路径穿越被拒绝", traversal2["success"] is False)
 
     absolute = json.loads(skills.skill_view(str(ROOT / "minimal_agent.py")))

@@ -13,11 +13,17 @@ const API = {
   plugins: "/plugins",
   skills: "/skills",
   tools: "/tools",
+  authConfig: "/api/auth/config",
+  authMe: "/api/auth/me",
+  authLogout: "/api/auth/logout",
   sessionsMessages: (id) => "/sessions/" + encodeURIComponent(id) + "/messages",
   sessionsArchive: (id) => "/sessions/" + encodeURIComponent(id) + "/archive",
+  sessionDelete: (id) => "/sessions/" + encodeURIComponent(id),
+  sessionFork: (id) => "/sessions/" + encodeURIComponent(id) + "/fork",
 };
 
 const STORAGE_KEY = "agent.session";
+const AUTH_TOKEN_KEY = "agent.auth.token";
 const POLL_INTERVAL_MS = 800;
 
 const state = {
@@ -30,6 +36,7 @@ const state = {
   queueCount: 0,
   pendingItem: null,
   hasMessages: false,
+  loginAvailable: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -232,8 +239,8 @@ function setThinking(on) {
   }
 }
 
-async function httpJson(method, url, body) {
-  const opts = { method, headers: {} };
+async function httpJson(method, url, body, retried) {
+  const opts = { method, headers: authHeaders() };
   if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
@@ -241,7 +248,17 @@ async function httpJson(method, url, body) {
   if (state.abort && method === "POST") {
     opts.signal = state.abort.signal;
   }
-  const resp = await fetch(url, opts);
+  let resp = await fetch(url, opts);
+  if (resp.status === 401 && !retried) {
+    if (state.loginAvailable) {
+      window.location.href = "/login";
+      const err = new Error("未登录");
+      err.status = 401;
+      throw err;
+    }
+    const ok = await requestToken();
+    if (ok) return httpJson(method, url, body, true);
+  }
   let data = {};
   try {
     data = await resp.json();
@@ -273,6 +290,132 @@ function saveSession(id) {
   }
 }
 
+function loadToken() {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_KEY) || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+function saveToken(token) {
+  try {
+    if (token) localStorage.setItem(AUTH_TOKEN_KEY, token);
+    else localStorage.removeItem(AUTH_TOKEN_KEY);
+  } catch (e) {
+    /* 隐私模式忽略 */
+  }
+}
+
+function authHeaders() {
+  const token = loadToken();
+  return token ? { Authorization: "Bearer " + token } : {};
+}
+
+/* 服务鉴权 token 弹窗：接口 401 时弹出，保存后自动重试一次 */
+let tokenResolver = null;
+
+function showTokenOverlay() {
+  $("token-input").value = loadToken();
+  $("token-overlay").classList.remove("hidden");
+  $("token-input").focus();
+}
+
+function hideTokenOverlay() {
+  $("token-overlay").classList.add("hidden");
+}
+
+function requestToken() {
+  return new Promise((resolve) => {
+    tokenResolver = resolve;
+    showTokenOverlay();
+  });
+}
+
+function finishToken(resolved) {
+  hideTokenOverlay();
+  if (tokenResolver) {
+    const fn = tokenResolver;
+    tokenResolver = null;
+    fn(resolved);
+  }
+}
+
+/* ---------- 通用对话框（替代原生 confirm/prompt） ---------- */
+let dialogResolver = null;
+let dialogValidate = null;
+
+function showDialog(opts) {
+  $("dialog-title").textContent = opts.title || "提示";
+  const desc = $("dialog-desc");
+  if (opts.desc) {
+    desc.textContent = opts.desc;
+    desc.classList.remove("hidden");
+  } else {
+    desc.classList.add("hidden");
+  }
+  const input = $("dialog-input");
+  if (opts.input) {
+    input.classList.remove("hidden");
+    input.value = opts.inputValue || "";
+    input.type = "text";
+  } else {
+    input.classList.add("hidden");
+    input.value = "";
+  }
+  dialogValidate = opts.validate || null;
+  $("btn-dialog-ok").textContent = opts.okText || "确定";
+  $("btn-dialog-ok").classList.toggle("hidden", !!opts.danger);
+  $("btn-dialog-danger").textContent = opts.dangerText || "确认";
+  $("btn-dialog-danger").classList.toggle("hidden", !opts.danger);
+  $("dialog-error").classList.add("hidden");
+  $("dialog-overlay").classList.remove("hidden");
+  if (opts.input) input.focus();
+  return new Promise((resolve) => {
+    dialogResolver = resolve;
+  });
+}
+
+function finishDialog(result) {
+  $("dialog-overlay").classList.add("hidden");
+  if (dialogResolver) {
+    const fn = dialogResolver;
+    dialogResolver = null;
+    dialogValidate = null;
+    fn(result);
+  }
+}
+
+function closeDialog() {
+  finishDialog({ ok: false, value: "" });
+}
+
+/* ---------- 侧栏用户信息 ---------- */
+
+async function refreshUserCard() {
+  const card = $("user-card");
+  if (!state.loginAvailable) {
+    card.classList.add("hidden");
+    return;
+  }
+  card.classList.remove("hidden");
+  try {
+    const data = await httpJson("GET", API.authMe);
+    $("user-name").textContent = data.username || "已登录";
+  } catch (e) {
+    $("user-name").textContent = "未登录";
+  }
+}
+
+async function logout() {
+  try {
+    await httpJson("POST", API.authLogout, {});
+  } catch (e) {
+    /* 即使接口失败也跳登录页，cookie 清理是尽力而为 */
+  }
+  window.location.href = "/login";
+}
+
 /* ---------- 会话列表（侧栏） ---------- */
 
 function renderSessionList(list) {
@@ -290,10 +433,10 @@ function renderSessionList(list) {
     item.className = "session-item";
     if (s.session_id === state.sessionId) item.classList.add("active");
 
-    // 只显示标题：优先用最后一条用户消息作为会话标题，空会话回退到会话 ID
+    // 只显示标题：优先用用户自定义/自动标题，其次最后一条用户消息预览，空会话回退会话 ID
     const title = document.createElement("div");
     title.className = "session-item-title";
-    title.textContent = s.preview || s.session_id;
+    title.textContent = s.title || s.preview || s.session_id;
     item.appendChild(title);
 
     const action = document.createElement("button");
@@ -305,12 +448,26 @@ function renderSessionList(list) {
       if (s.archived) unarchiveSession(s.session_id);
       else archiveSession(s.session_id);
     });
-    item.appendChild(action);
+
+    const fork = document.createElement("button");
+    fork.type = "button";
+    fork.className = "session-item-action";
+    fork.textContent = "分支";
+    fork.addEventListener("click", (e) => {
+      e.stopPropagation();
+      forkSession(s.session_id);
+    });
+    item.append(action, fork);
 
     item.addEventListener(
       "click",
-      () => switchSession(s.session_id, s.preview || s.session_id)
+      () => switchSession(s.session_id, s.title || s.preview || s.session_id)
     );
+    // 双击会话条目打开改名对话框（替换原"改名"按钮）
+    item.addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      renameSession(s.session_id, s.title || s.preview || "");
+    });
     box.appendChild(item);
   });
 }
@@ -319,12 +476,12 @@ async function loadSessionList() {
   try {
     const data = await httpJson("GET", API.sessions);
     renderSessionList(data.sessions || []);
-    // 当前会话的标题跟随列表里的预览（最后一条用户消息），与侧栏保持一致
+    // 当前会话的标题跟随列表（优先自定义/自动标题，其次最后一条用户消息预览）
     const current = (data.sessions || []).find(
       (s) => s.session_id === state.sessionId
     );
     if (current) {
-      state.sessionTitle = current.preview || current.session_id;
+      state.sessionTitle = current.title || current.preview || current.session_id;
       if (state.hasMessages) {
         viewTitle.textContent = state.sessionTitle;
       }
@@ -357,6 +514,63 @@ async function unarchiveSession(id) {
   refreshArchivedList();
 }
 
+async function deleteSession(id) {
+  const result = await showDialog({
+    title: "删除会话",
+    desc: "确定删除该会话？删除后不可恢复。",
+    danger: true,
+    dangerText: "删除",
+  });
+  if (!result.ok) return;
+  try {
+    await httpJson("DELETE", API.sessionDelete(id));
+  } catch (e) {
+    appendMessage("error", "删除失败：" + e.message);
+    return;
+  }
+  // 删除的是当前会话：切回新对话（newSession 内部会刷新列表）
+  if (state.sessionId === id) {
+    newSession();
+  } else {
+    loadSessionList();
+  }
+  refreshArchivedList();
+}
+
+async function renameSession(id, currentName) {
+  const result = await showDialog({
+    title: "重命名会话",
+    desc: "输入新标题（留空清除自定义标题）",
+    input: true,
+    inputValue: currentName || "",
+    okText: "保存",
+    validate: (v) => (v.length > 100 ? "标题最长 100 字" : ""),
+  });
+  if (!result.ok) return;
+  try {
+    await httpJson("PATCH", API.sessionDelete(id), { title: result.value });
+  } catch (e) {
+    appendMessage("error", "改名失败：" + e.message);
+    return;
+  }
+  loadSessionList();
+  if (state.sessionId === id) {
+    const titleEl = $("view-title");
+    if (titleEl) titleEl.textContent = result.value || "会话";
+  }
+}
+
+async function forkSession(id) {
+  try {
+    const data = await httpJson("POST", API.sessionFork(id), {});
+    const forkId = data.session_id;
+    if (!forkId) throw new Error("服务器未返回新会话 id");
+    switchSession(forkId, data.title || "分支副本");
+  } catch (e) {
+    appendMessage("error", "分支失败：" + e.message);
+  }
+}
+
 async function refreshArchivedList() {
   try {
     const data = await httpJson("GET", API.sessions + "?archived_only=1");
@@ -387,7 +601,16 @@ async function refreshArchivedList() {
         unarchiveSession(s.session_id);
       });
 
-      item.append(title, action);
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "session-item-action session-item-del";
+      del.textContent = "删除";
+      del.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteSession(s.session_id);
+      });
+
+      item.append(title, action, del);
       box.appendChild(item);
     });
   } catch (e) {
@@ -700,10 +923,10 @@ function createAssistantBubble() {
   return div;
 }
 
-async function sendStreaming(body) {
+async function sendStreaming(body, retried) {
   const opts = {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
     body: JSON.stringify(body),
   };
   if (state.abort) opts.signal = state.abort.signal;
@@ -714,6 +937,15 @@ async function sendStreaming(body) {
   } catch (e) {
     // 主动取消（新对话/切换会话）不再回退；连接失败回退非流式
     if (state.abort && state.abort.signal.aborted) return true;
+    return false;
+  }
+  if (resp.status === 401 && !retried) {
+    if (state.loginAvailable) {
+      window.location.href = "/login";
+      return false;
+    }
+    const ok = await requestToken();
+    if (ok) return sendStreaming(body, true);
     return false;
   }
   if (!resp.ok || !resp.body) return false;
@@ -871,12 +1103,66 @@ function bindEvents() {
     $("deny-box").classList.add("hidden");
   });
   $("btn-deny-confirm").addEventListener("click", () => resolveApproval("deny"));
+
+  // 鉴权 token 弹窗按钮
+  $("btn-token-save").addEventListener("click", () => {
+    saveToken($("token-input").value.trim());
+    finishToken(true);
+  });
+  $("btn-token-cancel").addEventListener("click", () => finishToken(false));
+  $("token-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      $("btn-token-save").click();
+    }
+  });
+
+  // 通用对话框按钮
+  $("btn-dialog-ok").addEventListener("click", () => {
+    const input = $("dialog-input");
+    const usingInput = !input.classList.contains("hidden");
+    const value = usingInput ? input.value.trim() : "";
+    if (dialogValidate) {
+      const err = dialogValidate(value);
+      if (err) {
+        $("dialog-error").textContent = err;
+        $("dialog-error").classList.remove("hidden");
+        return;
+      }
+    }
+    finishDialog({ ok: true, value });
+  });
+  $("btn-dialog-danger").addEventListener("click", () => {
+    finishDialog({ ok: true, value: "" });
+  });
+  $("btn-dialog-cancel").addEventListener("click", closeDialog);
+  $("dialog-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      $("btn-dialog-ok").click();
+    }
+  });
+
+  // 侧栏用户卡片：切换账号 / 退出登录（都先注销并回到登录页）
+  $("btn-switch-account").addEventListener("click", logout);
+  $("btn-logout").addEventListener("click", logout);
 }
 
 function init() {
   state.sessionId = loadSession();
   bindEvents();
   loadSessionList();
+  // 探测服务端是否提供用户名密码登录：401 时决定跳 /login 还是弹 token 输入框
+  fetch(API.authConfig)
+    .then((r) => r.json().catch(() => ({})))
+    .then((data) => {
+      state.loginAvailable = !!data.login_available;
+      refreshUserCard();
+    })
+    .catch(() => {
+      state.loginAvailable = false;
+      refreshUserCard();
+    });
   inputEl.disabled = false;
   inputEl.focus();
 }

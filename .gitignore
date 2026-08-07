@@ -4,5 +4,6 @@ MEMORY.md
 USER.md
 sessions.db
 approval_allowlist.json
+audit.log
 providers/keyword/memory.json
 providers/vector/vectors.json

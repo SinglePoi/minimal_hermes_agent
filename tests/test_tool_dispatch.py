@@ -11,6 +11,7 @@
 """
 
 import json
+import re
 import sys
 import threading
 import time
@@ -27,7 +28,9 @@ for stream in (sys.stdout, sys.stderr):
         pass
 
 import tool_dispatch  # noqa: E402
+import minimal_agent  # noqa: E402
 from tool_dispatch import (  # noqa: E402
+    _PARALLEL_SAFE_TOOLS,
     _plan_tool_batch_segments,
     _should_parallelize_tool_batch,
     execute_tool_calls_segmented,
@@ -66,35 +69,35 @@ def kinds(segments) -> list[tuple[str, int]]:
 def test_planner_core_tools() -> None:
     """核心工具的分段：只读工具并行、memory/terminal 为顺序屏障。"""
     # 单调用 → 顺序
-    segs = _plan_tool_batch_segments([make_call("t1", "get_weather", {"city": "北京"})])
+    segs = _plan_tool_batch_segments([make_call("t1", "web_search", {"query": "测试"})])
     check("单调用 -> 顺序段", kinds(segs) == [("sequential", 1)])
 
     # 两个只读工具 → 单一并行段
     segs = _plan_tool_batch_segments([
-        make_call("t1", "get_weather", {"city": "北京"}),
+        make_call("t1", "web_search", {"query": "测试"}),
         make_call("t2", "session_search", {"query": "评审会"}),
     ])
     check("只读 x2 -> 并行段", kinds(segs) == [("parallel", 2)])
     check("整批可并行 -> True", _should_parallelize_tool_batch([
-        make_call("t1", "get_weather", {"city": "北京"}),
+        make_call("t1", "web_search", {"query": "测试"}),
         make_call("t2", "session_search", {"query": "评审会"}),
     ]))
 
     # memory 是顺序屏障：与只读工具混批后整批降级为顺序
     segs = _plan_tool_batch_segments([
-        make_call("t1", "get_weather", {"city": "北京"}),
+        make_call("t1", "web_search", {"query": "测试"}),
         make_call("t2", "memory", {"action": "add", "target": "user", "content": "x"}),
     ])
     check("weather + memory -> 全顺序", kinds(segs) == [("sequential", 2)])
     check("weather + memory -> 不可并行",
           not _should_parallelize_tool_batch([
-              make_call("t1", "get_weather", {"city": "北京"}),
+              make_call("t1", "web_search", {"query": "测试"}),
               make_call("t2", "memory", {"action": "add", "target": "user", "content": "x"}),
           ]))
 
     # 三工具：前两个只读并行，terminal 屏障后 memory_search 因单元素降级并入顺序段
     segs = _plan_tool_batch_segments([
-        make_call("t1", "get_weather", {"city": "北京"}),
+        make_call("t1", "web_search", {"query": "测试"}),
         make_call("t2", "session_search", {"query": "评审会"}),
         make_call("t3", "terminal", {"command": "dir"}),
         make_call("t4", "memory_search", {"query": "骨架"}),
@@ -105,10 +108,10 @@ def test_planner_core_tools() -> None:
     # 参数解析失败 → 顺序屏障
     broken = SimpleNamespace(
         id="t9",
-        function=SimpleNamespace(name="get_weather", arguments="{not-json"),
+        function=SimpleNamespace(name="web_search", arguments="{not-json"),
     )
     segs = _plan_tool_batch_segments([
-        make_call("t1", "get_weather", {"city": "北京"}),
+        make_call("t1", "web_search", {"query": "测试"}),
         broken,
     ])
     check("参数解析失败 -> 全顺序", kinds(segs) == [("sequential", 2)])
@@ -186,7 +189,7 @@ def test_executor_parallel_and_order() -> None:
         return f"result-{tool_call_id(tc)}"
 
     calls = [
-        make_call("c1", "get_weather", {"city": "北京"}),
+        make_call("c1", "web_search", {"query": "测试"}),
         make_call("c2", "session_search", {"query": "评审会"}),
     ]
     messages: list[dict] = []
@@ -213,7 +216,7 @@ def test_executor_mixed_batch() -> None:
         return f"result-{tool_call_id(tc)}"
 
     calls = [
-        make_call("c1", "get_weather", {"city": "北京"}),
+        make_call("c1", "web_search", {"query": "测试"}),
         make_call("c2", "session_search", {"query": "评审会"}),
         make_call("c3", "terminal", {"command": "dir"}),
         make_call("c4", "memory_search", {"query": "骨架"}),
@@ -255,6 +258,16 @@ def test_real_file_tools_path_scope() -> None:
     check("真实工具：patch+写不同路径 -> 并行", kinds(segs) == [("parallel", 2)])
 
 
+def test_get_current_time_tool() -> None:
+    """get_current_time：返回本地日期时间+星期，注册进 TOOLS/run_tool/并行白名单。"""
+    out = minimal_agent.run_tool("get_current_time", {})
+    pattern = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (周一|周二|周三|周四|周五|周六|周日)$"
+    check("返回日期时间+星期", re.match(pattern, out) is not None)
+    names = [t["function"]["name"] for t in minimal_agent.TOOLS]
+    check("注册进 TOOLS", "get_current_time" in names)
+    check("进并行白名单", "get_current_time" in _PARALLEL_SAFE_TOOLS)
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== 工具并行执行回归测试 ==")
@@ -264,6 +277,7 @@ def main() -> None:
         test_executor_parallel_and_order,
         test_executor_mixed_batch,
         test_real_file_tools_path_scope,
+        test_get_current_time_tool,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

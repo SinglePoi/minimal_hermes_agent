@@ -17,6 +17,7 @@ HTTP 服务化 + 网关审批端点的回归测试（零依赖，直接运行）
 """
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -83,12 +84,19 @@ class FakeClient:
         self.chat = FakeChat(self)
 
 
-def http_json(method: str, url: str, payload: dict | None = None) -> dict:
+def http_json(
+    method: str,
+    url: str,
+    payload: dict | None = None,
+    headers: dict | None = None,
+) -> dict:
     """发 HTTP 请求并解析 JSON 响应。"""
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload else None
     req = urllib.request.Request(url, data=data, method=method)
     if data:
         req.add_header("Content-Type", "application/json")
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -97,7 +105,33 @@ class ServerFixture:
     """起一个临时服务器，测完关闭。"""
 
     def __init__(self, client=None):
+        # 备份并清空鉴权/审计环境变量，保证其他用例不受开发者 .env 影响
+        self._env_backup = {
+            key: os.environ.get(key)
+            for key in (
+                "SERVER_AUTH_TOKEN",
+                "AUDIT_LOG_PATH",
+                "DASHBOARD_USERNAME",
+                "DASHBOARD_PASSWORD",
+                "DASHBOARD_PASSWORD_HASH",
+                "DASHBOARD_AUTH_SECRET",
+                "DASHBOARD_SESSION_TTL_SECONDS",
+                "DASHBOARD_COOKIE_SECURE",
+            )
+        }
+        os.environ.pop("SERVER_AUTH_TOKEN", None)
+        for key in (
+            "DASHBOARD_USERNAME",
+            "DASHBOARD_PASSWORD",
+            "DASHBOARD_PASSWORD_HASH",
+            "DASHBOARD_AUTH_SECRET",
+            "DASHBOARD_SESSION_TTL_SECONDS",
+            "DASHBOARD_COOKIE_SECURE",
+        ):
+            os.environ.pop(key, None)
         self.tmp = tempfile.TemporaryDirectory()
+        # 审计默认落到临时目录，避免测试污染项目根目录的 audit.log
+        os.environ["AUDIT_LOG_PATH"] = str(Path(self.tmp.name) / "audit.log")
         minimal_agent.SESSION_DB = Path(self.tmp.name) / "sessions.db"
         self.app = AgentServer(client=client or FakeClient())
         self.server = _Server(("127.0.0.1", 0), self.app)
@@ -115,6 +149,11 @@ class ServerFixture:
         self.app.shutdown()
         self.tmp.cleanup()
         minimal_agent.SESSION_DB = Path(ROOT) / "sessions.db"
+        for key, value in self._env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def test_health_and_pending() -> None:
@@ -353,7 +392,7 @@ def test_skills_and_plugins_endpoints() -> None:
     try:
         skills = http_json("GET", f"{fx.base}/skills")
         names = {s["name"] for s in skills["skills"]}
-        check("技能列表包含示例技能", {"weather-answer", "release-check"} <= names)
+        check("技能列表包含示例技能", {"release-check"} <= names)
         check(
             "技能条目含描述",
             all(isinstance(s.get("description"), str) for s in skills["skills"]),
@@ -380,7 +419,7 @@ def test_tools_endpoint() -> None:
         names = {t["name"] for t in tools["tools"]}
         check(
             "工具列表含核心工具",
-            {"get_weather", "memory", "terminal", "read_file"} <= names,
+            {"web_search", "memory", "terminal", "read_file"} <= names,
         )
         check(
             "工具条目含描述",
@@ -566,6 +605,293 @@ def test_chat_stream_sse() -> None:
         fx.close()
 
 
+def test_auth_and_audit() -> None:
+    """鉴权 + 审计：配置 SERVER_AUTH_TOKEN 后 API 需 Bearer token（/health 与静态豁免），
+    每个请求落一行审计 JSON（含 401/200，token 不打明文）。"""
+    import urllib.error
+
+    fx = ServerFixture()
+    try:
+        # 基线：未配置 token 时 API 免鉴权（fixture 已清空 SERVER_AUTH_TOKEN）
+        sessions0 = http_json("GET", f"{fx.base}/sessions")
+        check("未配置 token 时 API 免鉴权", "sessions" in sessions0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["SERVER_AUTH_TOKEN"] = "test-secret-token"
+            os.environ["AUDIT_LOG_PATH"] = str(Path(tmp) / "audit.log")
+
+            # 未带 token → 401
+            try:
+                http_json("GET", f"{fx.base}/sessions")
+                check("未带 token -> 401", False)
+            except urllib.error.HTTPError as exc:
+                check("未带 token -> 401", exc.code == 401)
+
+            # 错误 token → 401
+            try:
+                http_json(
+                    "GET",
+                    f"{fx.base}/sessions",
+                    headers={"Authorization": "Bearer wrong-token"},
+                )
+                check("错误 token -> 401", False)
+            except urllib.error.HTTPError as exc:
+                check("错误 token -> 401", exc.code == 401)
+
+            # 正确 token → 200
+            sessions = http_json(
+                "GET",
+                f"{fx.base}/sessions",
+                headers={"Authorization": "Bearer test-secret-token"},
+            )
+            check("正确 token -> 200", "sessions" in sessions)
+
+            # /chat 与审批端点同样受保护
+            try:
+                http_json("POST", f"{fx.base}/chat", {"message": "你好"})
+                check("/chat 未带 token -> 401", False)
+            except urllib.error.HTTPError as exc:
+                check("/chat 未带 token -> 401", exc.code == 401)
+
+            try:
+                http_json(
+                    "POST",
+                    f"{fx.base}/approvals/resolve",
+                    {"session_id": "s1", "choice": "once"},
+                )
+                check("/approvals/resolve 未带 token -> 401", False)
+            except urllib.error.HTTPError as exc:
+                check("/approvals/resolve 未带 token -> 401", exc.code == 401)
+
+            try:
+                http_json("DELETE", f"{fx.base}/sessions/ghost-auth")
+                check("DELETE 未带 token -> 401", False)
+            except urllib.error.HTTPError as exc:
+                check("DELETE 未带 token -> 401", exc.code == 401)
+
+            try:
+                http_json(
+                    "PATCH", f"{fx.base}/sessions/ghost-auth", {"title": "x"}
+                )
+                check("PATCH 未带 token -> 401", False)
+            except urllib.error.HTTPError as exc:
+                check("PATCH 未带 token -> 401", exc.code == 401)
+
+            # 带 token 的 /chat 正常执行（FakeClient 返回固定回复）
+            reply = http_json(
+                "POST",
+                f"{fx.base}/chat",
+                {"message": "你好", "session_id": "sess-auth"},
+                headers={"Authorization": "Bearer test-secret-token"},
+            )
+            check("带 token /chat 正常", reply.get("reply") == "你好，我是助手")
+
+            # /health 与静态页面豁免鉴权
+            health = http_json("GET", f"{fx.base}/health")
+            check("/health 免鉴权", health.get("ok") is True)
+            code, _, _ = http_get(f"{fx.base}/")
+            check("静态页免鉴权", code == 200)
+
+            # 审计日志：JSON Lines，含 401 与 200，动作/会话齐全，token 不打明文
+            log_file = Path(tmp) / "audit.log"
+            lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+            entries = [json.loads(line) for line in lines]
+            check("审计日志非空", len(entries) >= 8)
+            check("审计含 401 记录", any(e["status"] == 401 for e in entries))
+            check("审计含 200 记录", any(e["status"] == 200 for e in entries))
+            check("审计记录动作名", any(e["action"] == "sessions:list" for e in entries))
+            check(
+                "审计记录 /chat 会话 id",
+                any(e["session_id"] == "sess-auth" for e in entries),
+            )
+            dump = json.dumps(entries, ensure_ascii=False)
+            check("审计不打 token 明文", "test-secret-token" not in dump)
+    finally:
+        fx.close()
+
+
+def test_delete_session_endpoint() -> None:
+    """DELETE /sessions/<id>：仅已归档会话可删；未归档 400；未知 404；进行中 409；审计记录。"""
+    import urllib.error
+
+    fx = ServerFixture()
+    try:
+        # 建一个有消息的会话（FakeClient 返回固定回复）
+        http_json(
+            "POST", f"{fx.base}/chat",
+            {"message": "你好，待删除", "session_id": "sess-del"},
+        )
+        sessions = http_json("GET", f"{fx.base}/sessions")
+        check(
+            "删除前列表含该会话",
+            any(s["session_id"] == "sess-del" for s in sessions["sessions"]),
+        )
+        hits = minimal_agent.search_messages_db("待删除")
+        check(
+            "删除前 FTS 可搜到",
+            any(h.get("session_id") == "sess-del" for h in hits),
+        )
+
+        # 未归档会话不可删 → 400
+        try:
+            http_json("DELETE", f"{fx.base}/sessions/sess-del")
+            check("未归档会话删除 -> 400", False)
+        except urllib.error.HTTPError as exc:
+            check("未归档会话删除 -> 400", exc.code == 400)
+
+        # 归档后删除成功
+        http_json(
+            "POST", f"{fx.base}/sessions/sess-del/archive", {"archived": True}
+        )
+        result = http_json("DELETE", f"{fx.base}/sessions/sess-del")
+        check("归档后删除返回 deleted=true", result.get("deleted") is True)
+        check("归档后删除返回会话 id", result.get("session_id") == "sess-del")
+
+        sessions = http_json("GET", f"{fx.base}/sessions")
+        check(
+            "删除后列表不含",
+            not any(s["session_id"] == "sess-del" for s in sessions["sessions"]),
+        )
+        hits = minimal_agent.search_messages_db("待删除")
+        check(
+            "删除后 FTS 不可搜",
+            not any(h.get("session_id") == "sess-del" for h in hits),
+        )
+        check("删除后消息为空", minimal_agent.load_session_messages("sess-del") == [])
+        check("删除后进程内状态已清理", "sess-del" not in fx.app.sessions)
+
+        # 未知会话 404
+        try:
+            http_json("DELETE", f"{fx.base}/sessions/ghost-404")
+            check("未知会话 -> 404", False)
+        except urllib.error.HTTPError as exc:
+            check("未知会话 -> 404", exc.code == 404)
+
+        # 进行中（turn 锁被占用）→ 409；释放后可删
+        http_json(
+            "POST", f"{fx.base}/chat",
+            {"message": "正在处理", "session_id": "sess-busy"},
+        )
+        http_json(
+            "POST", f"{fx.base}/sessions/sess-busy/archive", {"archived": True}
+        )
+        state = fx.app.sessions["sess-busy"]
+        state["lock"].acquire()
+        try:
+            try:
+                http_json("DELETE", f"{fx.base}/sessions/sess-busy")
+                check("进行中删除 -> 409", False)
+            except urllib.error.HTTPError as exc:
+                check("进行中删除 -> 409", exc.code == 409)
+        finally:
+            state["lock"].release()
+        result = http_json("DELETE", f"{fx.base}/sessions/sess-busy")
+        check("释放后删除成功", result.get("deleted") is True)
+
+        # 审计：sessions:delete + 会话 id + 409
+        log_file = Path(fx.tmp.name) / "audit.log"
+        entries = [
+            json.loads(line)
+            for line in log_file.read_text(encoding="utf-8").strip().splitlines()
+        ]
+        dels = [e for e in entries if e.get("action") == "sessions:delete"]
+        check("审计记录删除动作", len(dels) >= 2)
+        check("审计含删除会话 id", any(e.get("session_id") == "sess-del" for e in dels))
+        check("审计含 409 记录", any(e.get("status") == 409 for e in entries))
+    finally:
+        fx.close()
+
+
+def test_session_title_and_fork() -> None:
+    """会话标题 + fork：自动标题、手动改名与校验、fork 复制历史、删除源不影响分支。"""
+    import urllib.error
+
+    fx = ServerFixture()
+    try:
+        # 建两个消息的会话 → 自动标题取首条用户消息
+        http_json(
+            "POST", f"{fx.base}/chat",
+            {"message": "帮我规划北京行程", "session_id": "sess-tt"},
+        )
+        http_json(
+            "POST", f"{fx.base}/chat",
+            {"message": "再加一天故宫", "session_id": "sess-tt"},
+        )
+        sessions = http_json("GET", f"{fx.base}/sessions")
+        cur = next(s for s in sessions["sessions"] if s["session_id"] == "sess-tt")
+        check("自动标题取首条用户消息", cur["title"].startswith("帮我规划北京行程"))
+
+        # PATCH 改名
+        patched = http_json(
+            "PATCH", f"{fx.base}/sessions/sess-tt", {"title": "北京五天行程"}
+        )
+        check("改名返回标题", patched.get("title") == "北京五天行程")
+        sessions = http_json("GET", f"{fx.base}/sessions")
+        cur = next(s for s in sessions["sessions"] if s["session_id"] == "sess-tt")
+        check("列表显示新标题", cur["title"] == "北京五天行程")
+
+        # PATCH 校验：缺 title 400、未知 404、超长 400
+        try:
+            http_json("PATCH", f"{fx.base}/sessions/sess-tt", {})
+            check("PATCH 缺 title -> 400", False)
+        except urllib.error.HTTPError as exc:
+            check("PATCH 缺 title -> 400", exc.code == 400)
+        try:
+            http_json("PATCH", f"{fx.base}/sessions/ghost-title", {"title": "x"})
+            check("PATCH 未知会话 -> 404", False)
+        except urllib.error.HTTPError as exc:
+            check("PATCH 未知会话 -> 404", exc.code == 404)
+        try:
+            http_json("PATCH", f"{fx.base}/sessions/sess-tt", {"title": "长" * 101})
+            check("PATCH 超长标题 -> 400", False)
+        except urllib.error.HTTPError as exc:
+            check("PATCH 超长标题 -> 400", exc.code == 400)
+
+        # fork：复制全部消息 + 标题，独立出现在列表
+        fork = http_json("POST", f"{fx.base}/sessions/sess-tt/fork", {})
+        fork_id = fork["session_id"]
+        check("fork 返回新会话 id", bool(fork_id) and fork_id != "sess-tt")
+        check("fork 返回源会话 id", fork.get("source_session_id") == "sess-tt")
+        msgs = http_json("GET", f"{fx.base}/sessions/{fork_id}/messages")
+        check("fork 复制全部消息", len(msgs["messages"]) >= 4)
+        sessions = http_json("GET", f"{fx.base}/sessions")
+        fork_row = next(s for s in sessions["sessions"] if s["session_id"] == fork_id)
+        check("fork 出现在列表", fork_row["session_id"] == fork_id)
+        check("fork 标题继承", fork_row["title"].startswith("北京五天行程"))
+
+        # 删除源会话（先归档）不影响分支
+        http_json(
+            "POST", f"{fx.base}/sessions/sess-tt/archive", {"archived": True}
+        )
+        http_json("DELETE", f"{fx.base}/sessions/sess-tt")
+        msgs2 = http_json("GET", f"{fx.base}/sessions/{fork_id}/messages")
+        check("删除源后分支仍可用", len(msgs2["messages"]) == len(msgs["messages"]))
+
+        # fork 未知源 → 404
+        try:
+            http_json("POST", f"{fx.base}/sessions/ghost-fork/fork", {})
+            check("fork 未知源 -> 404", False)
+        except urllib.error.HTTPError as exc:
+            check("fork 未知源 -> 404", exc.code == 404)
+
+        # 审计：sessions:title 与 sessions:fork
+        log_file = Path(fx.tmp.name) / "audit.log"
+        entries = [
+            json.loads(line)
+            for line in log_file.read_text(encoding="utf-8").strip().splitlines()
+        ]
+        check(
+            "审计记录改名",
+            any(e.get("action") == "sessions:title" and e["status"] == 200 for e in entries),
+        )
+        check(
+            "审计记录 fork",
+            any(e.get("action") == "sessions:fork" and e["status"] == 200 for e in entries),
+        )
+    finally:
+        fx.close()
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== HTTP 服务化回归测试 ==")
@@ -579,6 +905,9 @@ def main() -> None:
         test_tools_endpoint,
         test_chat_events_tool_call,
         test_chat_stream_sse,
+        test_auth_and_audit,
+        test_delete_session_endpoint,
+        test_session_title_and_fork,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

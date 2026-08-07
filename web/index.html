@@ -37,7 +37,18 @@
         <div class="session-list" id="session-list"></div>
       </div>
 
-      <div class="sidebar-footer">对齐 Hermes Agent 架构</div>
+      <div class="sidebar-footer">
+        <div class="user-card hidden" id="user-card">
+          <div class="user-avatar" aria-hidden="true">👤</div>
+          <div class="user-meta">
+            <div class="user-name" id="user-name">未登录</div>
+            <div class="user-actions">
+              <button id="btn-switch-account" class="user-link" type="button">切换账号</button>
+              <button id="btn-logout" class="user-link" type="button">退出登录</button>
+            </div>
+          </div>
+        </div>
+      </div>
     </aside>
 
     <!-- 右侧主列：标题栏 + 内容区 + 输入框 -->
@@ -140,6 +151,42 @@
           <button id="btn-deny-cancel" class="btn ghost" type="button">取消</button>
           <button id="btn-deny-confirm" class="btn danger" type="button">确认拒绝</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 服务鉴权 token 弹窗（接口返回 401 时弹出；token 只存 localStorage） -->
+  <div id="token-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="token-title">
+    <div class="approval-card">
+      <div class="approval-head">
+        <h2 id="token-title">🔑 需要访问令牌</h2>
+      </div>
+      <p class="field-label">Token（需与服务器 SERVER_AUTH_TOKEN 一致）</p>
+      <input id="token-input" class="token-input" type="password" placeholder="粘贴访问令牌"
+             autocomplete="off" spellcheck="false" />
+      <div class="approval-actions">
+        <button class="btn" id="btn-token-cancel" type="button">取消</button>
+        <span class="spacer" aria-hidden="true"></span>
+        <button class="btn primary" id="btn-token-save" type="button">保存并重试</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 通用对话框（替代原生 confirm/prompt：删除确认 / 会话改名） -->
+  <div id="dialog-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+    <div class="approval-card">
+      <div class="approval-head">
+        <h2 id="dialog-title">提示</h2>
+      </div>
+      <p id="dialog-desc" class="approval-desc hidden"></p>
+      <input id="dialog-input" class="token-input hidden" type="text"
+             autocomplete="off" spellcheck="false" />
+      <p id="dialog-error" class="approval-note hidden"></p>
+      <div class="approval-actions">
+        <button class="btn" id="btn-dialog-cancel" type="button">取消</button>
+        <span class="spacer" aria-hidden="true"></span>
+        <button class="btn danger hidden" id="btn-dialog-danger" type="button">确认</button>
+        <button class="btn primary hidden" id="btn-dialog-ok" type="button">确定</button>
       </div>
     </div>
   </div>

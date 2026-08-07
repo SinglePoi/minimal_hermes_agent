@@ -10,7 +10,7 @@
 
 ## 代码规范
 - 所有函数必须写中文 docstring
-- 工具名一律使用下划线命名（如 `get_weather`、`session_search`）
+- 工具名一律使用下划线命名（如 `web_search`、`session_search`）
 - 记忆文件条目之间用 § 分隔，不要混用其他分隔符
 
 ## 运维约定

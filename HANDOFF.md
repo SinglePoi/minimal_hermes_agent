@@ -29,7 +29,8 @@ approval.py                 危险命令审批：模式检测 + 会话/永久批
 approval_allowlist.json     永久允许列表（已 gitignore，运行时生成）
 tool_dispatch.py            工具并行执行：批分段规划 + 并发执行 + 路径重叠检测（对齐 tool_dispatch_helpers.py）
 skills.py                   Skills：frontmatter 解析 + 发现 + 技能索引 + skills_list/skill_view（对齐 skills_tool.py）
-skills/                     示例技能包：weather-answer（播报规范）、release-check（发版清单），含 references/
+skills/                     示例技能包：release-check（发版清单），含 references/（weather-answer 已随
+                             get_weather 删除，2026-08-07）
 file_tools.py               文件工具：read_file/write_file/search_files + 敏感路径保护（对齐 file_tools.py）
 redact.py                   敏感文本脱敏：前缀密钥/赋值/JSON/YAML/请求头/JWT/私钥/URL userinfo（对齐 redact.py）
 tirith.py                   内容级安全扫描：终端注入/隐形字符/同形字域名/管道到解释器（tirith 的 Python 简化版）
@@ -51,7 +52,11 @@ tests/test_gateway_approval.py 网关审批队列回归测试（零依赖，pyth
 tests/test_server.py          HTTP 服务化回归测试（零依赖，python tests/test_server.py 直接跑）
 server.py                    HTTP 服务化：/chat + /chat/stream(SSE) + /approvals/* +
                              /sessions* + /skills /plugins /tools + 静态托管 web/（零新依赖）
+dashboard_auth.py            用户名密码登录 + 无状态 session cookie（scrypt 哈希 + HMAC 签名，
+                             对齐 Hermes plugins/dashboard_auth/basic；附 hash-password CLI）
 web/                         前端静态站点（原生 HTML/CSS/JS，零构建）：index.html + app.js + style.css
+web_tools.py                  联网工具：web_search（DuckDuckGo HTML，零依赖）+ web_fetch（抓正文），
+                              SSRF 防护（对齐 Hermes plugins/web 思路简化）
 context_compressor.py       上下文压缩（阈值 50%、protect_last_n、交接摘要）
 memory_provider.py          MemoryProvider 抽象基类 + LLM 事实提取助手
 memory_manager.py           外部 provider 编排（加载/召回/同步/工具路由）
@@ -68,7 +73,9 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
 ## 已完成功能（均对齐 Hermes）
 
 1. **Agent Loop**：调模型 → 工具调用 → 结果回传 → 循环（`run_agent_turn`）
-2. **工具系统**：`get_weather`（演示）+ `memory`（模型主动写记忆）+ `session_search`（FTS5 历史检索）+ provider 自带工具（`memory_search` / `vector_search`）
+2. **工具系统**：`memory`（模型主动写记忆）+ `session_search`（FTS5 历史检索）+
+   `web_search` / `web_fetch`（联网）+ `get_current_time`（时间）+ provider 自带工具
+   （`memory_search` / `vector_search`）；演示天气工具 `get_weather` 已删除（2026-08-07）
 3. **三层记忆**：
    - 会话历史 → `sessions.db`（原始档案，FTS5 检索）
    - 外部同步 → LLM 提取事实 → 向量库（`sync_turn`，对齐 mem0 `infer=True`）
@@ -84,7 +91,7 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
    DANGEROUS_PATTERNS / HARDLINE_PATTERNS / prompt_dangerous_approval / command_allowlist）
 9. **工具并行执行**：`tool_dispatch.py` 对齐 Hermes `agent/tool_dispatch_helpers.py` 的
    `_plan_tool_batch_segments` + `agent/tool_executor.py` 的 `execute_tool_calls_segmented`；
-   只读工具（get_weather / session_search / memory_search / vector_search）并发，
+   只读工具（session_search / 记忆检索 / skills / 时间 / 联网等）并发，
    memory / terminal 顺序屏障，路径重叠逻辑预留（读者↔读者可并行、含写者重叠关闭并行段），
    结果按原始顺序回填；vector provider 本地嵌入懒加载已加锁保证线程安全
 10. **Skills（按需加载）**：`skills.py` + `skills/` 目录，对齐 Hermes 的渐进披露设计——
@@ -218,6 +225,71 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
       加串行锁（对齐 Hermes turn lease）
     - 回归测试：tests/test_server.py 新增静态端点、路径穿越拒绝、allow_permanent
       断言；另用 Node DOM 桩冒烟验证 发送→回复→审批弹窗→once/always/deny 全流程
+25. **服务鉴权 + 操作审计**（2026-08-07）：对齐 Hermes `plugins/dashboard_auth` 的思路，
+    简化为单静态 token（无 OIDC，零新依赖）——
+    - `SERVER_AUTH_TOKEN` 设置后，除 `/health` 与静态页面（`/`、`/web/*`）外，所有 API
+      要求 `Authorization: Bearer <token>`，未带/错误返回 401；hmac 常量时间比较防时序侧信道
+    - 前端 401 时弹出 token 输入框，保存到 localStorage 后自动重试一次（流式/非流式都支持）；
+      token 只存浏览器，请求自动带 `Authorization` 头
+    - 操作审计：每个请求追加一行 JSON 到 `AUDIT_LOG_PATH`（默认 `audit.log`，已 gitignore），
+      记录时间/来源 IP/方法/路径/动作/会话/状态/是否成功，token 一律 `«redacted»` 不打明文；
+      审计失败不影响主流程（对齐 Hermes observability / api_server 操作日志，简化版）
+    - 三同步完成：`.env` / `.env.example` / README 变量表（`SERVER_AUTH_TOKEN`、`AUDIT_LOG_PATH`）
+26. **用户名密码登录 + session cookie**（2026-08-07）：对齐 Hermes
+    `plugins/dashboard_auth/basic`（新文件 `dashboard_auth.py`，零新依赖——scrypt/HMAC 均 stdlib）——
+    - `DASHBOARD_USERNAME` + 密码（`DASHBOARD_PASSWORD_HASH` 推荐 / `DASHBOARD_PASSWORD` 备用）
+      配置后启用：未登录访问 `/` 302 跳 `/login`，API 需 session cookie 或 Bearer token
+    - 密码用 stdlib scrypt 哈希（`python dashboard_auth.py hash-password <密码>` 生成），
+      未知用户名也跑 dummy hash + 常量时间比较，防时序侧信道（对齐 Hermes basic）
+    - 会话是无状态 HMAC-SHA256 签名 token（payload+签名，base64url），cookie
+      HttpOnly + SameSite=Lax + Max-Age=TTL（默认 12h，`DASHBOARD_SESSION_TTL_SECONDS` 可调）；
+      `DASHBOARD_AUTH_SECRET` 未配置时进程内随机（重启失效，同 Hermes basic 语义）
+    - 双通道并存：人走 cookie、机器走 Bearer（`SERVER_AUTH_TOKEN`）；前端启动探测
+      `/api/auth/config`，401 时登录可用则跳 `/login`、否则弹 token 输入框
+    - 端点：GET /login（web/login.html）、POST /api/auth/login、POST /api/auth/logout、
+      GET /api/auth/me、GET /api/auth/config（公开）；登录成功/失败进审计（identity=用户名）
+    - 侧栏底部改为用户卡片：显示当前用户名（/api/auth/me），
+      支持「切换账号 / 退出登录」（POST /api/auth/logout 后回 /login）；未启用人机登录时隐藏
+    - 三同步完成：`.env` / `.env.example` / README 变量表（`DASHBOARD_*` 5 个）
+27. **会话删除**（2026-08-07）：对齐 Hermes api_server 的 `_handle_delete_session` +
+    `SessionDB.delete_session`——
+    - `DELETE /sessions/<id>`（新增 do_DELETE 处理）：单个事务硬删 sessions + messages +
+      messages_fts，返回 `{"session_id", "deleted": true}`；**仅已归档会话可删**（未归档 400），未知 404
+    - 会话正在处理中（turn 锁被占用）→ 409 "session is busy"，防删进行中的对话
+    - 同时清理进程内状态（AgentServer.remove_session：会话字典 + 网关审批注销，未决审批按拒绝唤醒）
+    - 交互限制：删除按钮只在"已归档"列表出现（先归档、再删除），服务端一并强制校验
+      （用户 2026-08-07 要求）；复用统一鉴权门卫 + 审计（action=sessions:delete）
+    - 无新增环境变量；tests/test_server.py 新增删除端点组（未归档 400/归档后可删/硬删/FTS/404/409/审计）
+28. **会话标题 + fork**（2026-08-07）：对齐 Hermes api_server 的 `_handle_patch_session` /
+    `_handle_fork_session`——
+    - sessions 表新增 title 列（_db_conn 自动迁移）；首条用户消息自动生成标题（40 字截断），
+      list_sessions 返回 title（显示优先级 title → preview → session_id）
+    - `PATCH /sessions/<id>`（新增 do_PATCH）：{"title"} 改名，空串清除；缺 title/超长 400、未知 404
+    - `POST /sessions/<id>/fork`：fork_session 复制 system_prompt + 标题 + 全部消息（含 FTS），
+      默认标题 "<源标题> fork"；未知 404、新 id 冲突 409；删除源不影响分支
+      （简化：无 parent 血缘列，语义同 Hermes 分支子会话独立）
+    - 前端"最近"列表每条新增【分支】；改名改为**双击会话条目**打开对话框；
+      新增通用对话框组件（替代原生 confirm/prompt，删除确认也走它，2026-08-07 用户要求）
+    - 审计 action=sessions:title / sessions:fork（_audit_action 增加 method 参数区分 PATCH/DELETE）
+    - 无新增环境变量；tests/test_server.py 新增标题+fork 组（自动标题/改名/校验/fork 复制/删除源独立/审计）
+29. **联网能力**（2026-08-07）：对齐 Hermes `plugins/web/` 思路，零依赖简化版（新文件 web_tools.py）——
+    - `web_search`：多源链式回退——必应 RSS 优先（cn.bing.com/search?format=rss，中国大陆可达性
+      好）→ DuckDuckGo HTML 兜底（uddg 还原真实链接）；单源失败自动切换，全挂时错误带各来源原因
+      （2026-08-07 修复：DDG 在中国大陆不稳定，用户报"搜索失败 timed out"后实测确认并加回退）
+    - `web_fetch`：抓 http/https 正文，去 script/style/标签、charset 识别、截断（默认 4000，1MB 上限）
+    - SSRF 防护：仅 http/https 公网；拒绝 file/ftp、localhost、回环/私网/链路本地/未指定/保留/组播 IP
+    - 已注册进 TOOLS + run_tool 分发 + 并行只读白名单；失败返回可读错误不中断 Agent Loop
+    - 无新增环境变量；tests/test_web_tools.py 新增（解析/limit/错误/截断/charset/SSRF/分发/白名单）；
+      真实联网验证通过（2026-08-07：搜索返回 10 条真实结果、example.com 抓取正常）
+30. **终端无限等待修复 + 时间工具**（2026-08-07）：
+    - 复现：模型误调 `terminal({"command": "date"})` 卡死——Windows cmd 的 date/time 是交互式
+      内置命令，subprocess 继承服务终端 stdin 等输入，直到 120s 超时（用户报"无限等待"）
+    - 修复：run_terminal 的 subprocess.run 加 `stdin=subprocess.DEVNULL`（实测 date 0.01s 返回）
+    - 新增 `get_current_time` 工具（本地日期时间+星期，中文 docstring，进并行白名单）；
+      SYSTEM_PROMPT 新增规则 12（日期时间用 get_current_time；联网用 web_search/web_fetch，
+      不要用 terminal 模拟联网；不要调裸 date/time）
+    - 测试：test_approval.py 新增 stdin=DEVNULL 断言组；test_tool_dispatch.py 新增
+      get_current_time 格式/注册/白名单组；全套 17 套通过
 
 ## 运行方式
 
@@ -236,6 +308,7 @@ python demo_file_tools.py
 ```
 
 - 环境变量在 `.env`（DeepSeek 用 `DEEPSEEK_API_KEY`；向量用 `EMBEDDING_*`，已配好）
+- 配置源：`.env` 优先于系统环境变量（`load_dotenv(override=True)`，2026-08-07 按用户要求调整）
 - 常用开关：`MEMORY_PROVIDER=vector`（语义召回）、`CONTEXT_WINDOW`、`PROTECT_LAST_N`
 - Windows 中文乱码先设 `$env:PYTHONIOENCODING="utf-8"`
 - 本机测试可用内置 Python：`C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`
@@ -245,7 +318,7 @@ python demo_file_tools.py
 ## 已验证的测试
 
 > 注：下面各测试文件记录的"条数"是当时统计，可能随用例增改漂移；
-> 以直接运行 `python tests/test_xxx.py` 的输出为准（当前共 15 套）。
+> 以直接运行 `python tests/test_xxx.py` 的输出为准（当前共 17 套）。
 
 - 多轮对话跨轮次回答、`--resume` 恢复
 - Qwen embedding 真调成功（1024 维）、向量召回 → 模型引用召回回答
@@ -302,6 +375,26 @@ python demo_file_tools.py
 - 回归测试脚本 `tests/test_server.py`：断言全过（health/pending/resolve/chat 400、
   静态端点与路径穿越、会话列表与历史、归档含 archived_only、技能/插件/工具列表、
   过程事件含思考推理与工具结果、SSE 流式 activity/token/message/done 全链路）
+- 回归测试脚本 `tests/test_server.py` 新增鉴权+审计组（2026-08-07）：未配 token 免鉴权、
+  无/错 token 401、正确 token 放行、/health 与静态豁免、/chat 与审批端点受保护、
+  审计 JSON Lines 含 401/200、动作名与会话 id，token 不打明文
+- 回归测试脚本 `tests/test_server.py` 新增会话删除组（2026-08-07）：删除后列表/FTS/消息全清、
+  进程内状态清理、未归档 400、归档后删除、未知 404、进行中 409、释放后可删、
+  审计含 sessions:delete 与会话 id
+- 回归测试脚本 `tests/test_server.py` 新增标题+fork 组（2026-08-07）：自动标题取首条用户消息、
+  改名往返、缺 title/超长/未知校验、fork 复制全部消息与标题、删除源后分支仍可用、
+  审计含 sessions:title 与 sessions:fork
+- 回归测试脚本 `tests/test_web_tools.py`（新增，2026-08-07）：DuckDuckGo HTML 解析（标题/真实 URL/摘要）、
+  limit/空关键词/无结果/请求失败、抓取去标签/截断/charset、SSRF 全类地址拒绝、run_tool 分发与并行白名单
+- 回归测试脚本 `tests/test_web_tools.py` 新增多源组（2026-08-07）：必应 RSS 优先（有结果只调一次、
+  请求必应域名）、全源失败错误带"必应/DuckDuckGo"来源与原因；真实联网验证 2.4s 返回 10 条真实结果
+- 回归测试脚本 `tests/test_approval.py` 新增 stdin 断言组（2026-08-07）：subprocess 必须带
+  stdin=DEVNULL 且 timeout=120（防 Windows 交互式 date/time 卡死）；`tests/test_tool_dispatch.py`
+  新增 get_current_time 组（格式/注册/白名单）
+- 回归测试脚本 `tests/test_dashboard_auth.py`（新增，2026-08-07）：scrypt 哈希往返/错误/非法、
+  HMAC 签名往返/篡改/过期/密钥不匹配、登录 正确/错误/未知用户/未启用；
+  HTTP 全流程 302 跳登录、登录种 HttpOnly cookie、带 cookie 放行、/api/auth/me、
+  过期会话 401、登出清 cookie、Bearer 双通道并存、登录失败审计（身份=用户名、密码不打明文）
 - 回归测试脚本 `tests/test_file_tools.py` 新增 patch 组：唯一替换/多次报错/replace_all/
   已应用 no-change/.env 拒绝/CRLF 保留（修复了 Windows write_text 双换行 bug）；
   并行测试补 patch+write 同路径顺序、不同路径并行
@@ -311,7 +404,7 @@ python demo_file_tools.py
 - 审批增强已完成（smart/熔断/混淆/deny/tirith）；剩余仅 cron 审批上下文
   （`approvals.cron_mode`，对齐 `tools/approval.py` 剩余部分）
 - 前端 + 流式已完成（对话/审批/会话列表/归档/插件技能工具视图/过程活动/思考回显/SSE）；
-  剩余服务增强：请求鉴权（token）、操作审计落库、会话删除/标题/fork
+  请求鉴权、操作审计、用户名密码登录、会话删除/标题/fork 全部完成（见 25~28）
   （Hermes web/ 有完整 dashboard，骨架只做最小聊天页）
 - 思考内容回显依赖模型暴露 reasoning_content（deepseek-chat 无）；SSE 响应必须
   Connection: close（keep-alive 会导致 http.server 不关连接）
@@ -321,14 +414,18 @@ python demo_file_tools.py
   无陈旧检测/文件锁、无文档抽取；
   搜索仍跳过敏感文件（Hermes 也过滤敏感路径的搜索结果）
 - 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）
+- 外部协议接入（候补，暂不做）：MCP（连外部工具/数据源，Hermes 有
+  `hermes_cli/mcp_config.py` + `mcp_picker.py` + `optional-mcps/`）与 ACP
+  （被 VS Code/Zed/JetBrains 等编辑器客户端调用，Hermes 有 `acp_adapter/` +
+  `hermes acp` 子命令）；2026-08-07 用户确认写入候补、暂不实施
 - Skills 增强：prune/reinject 已完成；剩余前置条件检查、技能 hub 同步
   （Hermes 有，骨架简化掉了）
 - 脱敏简化：URL 查询参数（Hermes 默认关闭）、手机号、DB 连接串专项未做
 
 ## 下一阶段（前端 / 服务增强）
 
-- 服务增强：请求鉴权（token）/ 操作审计落库 / 会话删除、标题与 fork（对齐 Hermes
-  api_server 的 DELETE /api/sessions 与 /fork）
+- 服务增强线全部完成：请求鉴权、操作审计、用户名密码登录、会话删除/标题/fork（见 25~28，
+  对齐 Hermes api_server 的 auth / DELETE / PATCH / fork）；联网能力已完成（见 29）
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
 - 文件工具增强：V4A patch 头/模糊匹配/语法检查、陈旧检测/文件锁、文档抽取
 - 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有）

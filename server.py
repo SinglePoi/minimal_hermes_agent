@@ -31,7 +31,9 @@ resolve 与 /chat 可以同时进行）。
 """
 
 import json
+import hmac
 import os
+import secrets
 import sys
 import threading
 import time
@@ -44,9 +46,11 @@ from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-load_dotenv()
+# 配置源：.env 优先于系统环境变量（与 minimal_agent.py 保持一致）
+load_dotenv(override=True)
 
 import minimal_agent  # noqa: E402
+import dashboard_auth  # noqa: E402
 import skills  # noqa: E402
 from approval import (  # noqa: E402
     list_pending_approvals,
@@ -83,6 +87,64 @@ def _is_within(path: Path, base: Path) -> bool:
         return os.path.commonpath([str(path.resolve()), base_resolved]) == base_resolved
     except (OSError, ValueError):
         return False
+
+
+# 服务鉴权与操作审计（对齐 Hermes plugins/dashboard_auth 的思路，简化为单静态 token）：
+# - SERVER_AUTH_TOKEN：Bearer token；留空 = 不鉴权（本地开发）
+# - AUDIT_LOG_PATH：审计日志路径（JSON Lines，每请求一行）；空串 = 关闭审计
+AUDIT_LOG_LOCK = threading.Lock()
+
+
+def _auth_token() -> str:
+    """读取服务鉴权 token（生产密钥只走环境变量注入，未配置则鉴权关闭）。"""
+    return os.environ.get("SERVER_AUTH_TOKEN", "").strip()
+
+
+def _audit_log_path() -> Path:
+    """读取审计日志路径；空串表示关闭审计，默认落在项目根目录 audit.log。"""
+    raw = os.environ.get("AUDIT_LOG_PATH", "").strip()
+    return Path(raw) if raw else ROOT / "audit.log"
+
+
+def _audit_action(path: str, method: str = "GET") -> str:
+    """把请求映射成简短动作名（审计日志用；method 用于区分同名路径的不同动作）。"""
+    if path.startswith("/api/auth/login"):
+        return "auth:login"
+    if path.startswith("/api/auth/logout"):
+        return "auth:logout"
+    if path.startswith("/api/auth/me"):
+        return "auth:me"
+    if path.startswith("/api/auth/config"):
+        return "auth:config"
+    if path.startswith("/chat/stream"):
+        return "chat:stream"
+    if path.startswith("/chat"):
+        return "chat"
+    if path.startswith("/approvals/pending"):
+        return "approvals:pending"
+    if path.startswith("/approvals/resolve"):
+        return "approvals:resolve"
+    if path.startswith("/sessions/") and path.endswith("/fork"):
+        return "sessions:fork"
+    if path.startswith("/sessions/") and path.endswith("/archive"):
+        return "sessions:archive"
+    if path.startswith("/sessions/") and path.endswith("/messages"):
+        return "sessions:messages"
+    if path.startswith("/sessions/"):
+        return "sessions:delete" if method == "DELETE" else "sessions:title"
+    if path.startswith("/sessions"):
+        return "sessions:list"
+    if path.startswith("/skills"):
+        return "skills"
+    if path.startswith("/plugins"):
+        return "plugins"
+    if path.startswith("/tools"):
+        return "tools"
+    if path.startswith("/health"):
+        return "health"
+    if path.startswith("/web/") or path in ("/", "/index.html"):
+        return "static"
+    return "other"
 
 
 class AgentServer:
@@ -171,6 +233,13 @@ class AgentServer:
             self.manager.flush_pending(timeout=10)
             self.manager.shutdown()
 
+    def remove_session(self, session_id: str) -> None:
+        """删除会话的进程内状态（会话字典 + 网关审批注册），供 DELETE 端点使用。"""
+        with self._lock:
+            if session_id in self.sessions:
+                unregister_gateway_notify(session_id)
+                del self.sessions[session_id]
+
 
     def handle_message_stream(
         self,
@@ -213,13 +282,30 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:
         pass
 
-    def _send_json(self, status: int, payload: dict) -> None:
+    def _send_json(
+        self,
+        status: int,
+        payload: dict,
+        extra_headers: dict | None = None,
+    ) -> None:
+        """发送 JSON 响应并记录状态码（供审计使用）。"""
+        self._last_status = status
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _redirect(self, location: str) -> None:
+        """302 跳转（未登录访问页面时指向 /login，对齐 Hermes HTML 路由行为）。"""
+        self._last_status = 302
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _serve_static(self, rel_path: str) -> None:
         """从 web/ 目录提供静态文件；拒绝路径穿越与不存在的文件。"""
@@ -229,6 +315,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         mime = _MIME_TYPES.get(target.suffix.lower(), "application/octet-stream")
         body = target.read_bytes()
+        self._last_status = 200
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(body)))
@@ -237,6 +324,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _begin_sse(self) -> None:
         """开始 SSE 响应（text/event-stream 头）。"""
+        self._last_status = 200
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -268,22 +356,119 @@ class _Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return {}
 
+    def _authorized(self) -> bool:
+        """请求鉴权：有效 session cookie（人）或 Bearer token（机器）任一通过。
+
+        对齐 Hermes dashboard_auth：机器走 token_auth seam（Bearer），人走会话
+        cookie；两者都未配置时免鉴权。token 用 hmac 常量时间比较防时序侧信道。
+        校验结果同时写入 self._audit_identity（审计用，token 一律打码）。
+        """
+        if not (_auth_token() or dashboard_auth.auth_enabled()):
+            self._audit_identity = ""
+            return True
+
+        # 机器通道：Authorization: Bearer <token>
+        token = _auth_token()
+        if token:
+            header = (self.headers.get("Authorization") or "").strip()
+            if hmac.compare_digest(
+                header.encode("utf-8"), f"Bearer {token}".encode("utf-8")
+            ):
+                self._audit_identity = "«redacted»"
+                return True
+
+        # 人机通道：session cookie（HMAC 签名的无状态会话）
+        session_token = dashboard_auth.read_session_token(
+            self.headers.get("Cookie") or ""
+        )
+        payload = dashboard_auth.verify_session(session_token) if session_token else None
+        if payload is not None:
+            self._audit_identity = dashboard_auth.session_username(payload)
+            return True
+
+        self._audit_identity = ""
+        return False
+
+    def _audit(self, method: str, path: str) -> None:
+        """操作审计：每个请求追加一行 JSON（时间/来源/动作/会话/状态），token 不打明文。"""
+        try:
+            target = _audit_log_path()
+            if not target:
+                return
+            status = getattr(self, "_last_status", 0)
+            entry = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "remote": self.client_address[0] if self.client_address else "",
+                "method": method,
+                "path": path,
+                "action": _audit_action(path, method),
+                "session_id": getattr(self, "_audit_session_id", "") or "",
+                "status": status,
+                "ok": status < 400,
+                "identity": getattr(self, "_audit_identity", "") or "",
+            }
+            with AUDIT_LOG_LOCK:
+                with open(target, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass  # 审计失败不影响主流程
+
     def do_GET(self) -> None:
+        """GET 入口：统一兜底状态码并记录审计（对齐 Hermes dashboard 请求日志）。"""
+        self._last_status = 404
+        try:
+            self._handle_GET()
+        finally:
+            self._audit("GET", self.path)
+
+    def _handle_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self._send_json(200, {"ok": True})
             return
+        if parsed.path == "/login":
+            self._serve_static("login.html")
+            return
+        if parsed.path == "/api/auth/config":
+            # 前端启动时探测：服务是否提供用户名密码登录（401 时决定弹 token 还是跳登录页）
+            self._send_json(200, {"login_available": dashboard_auth.auth_enabled()})
+            return
         if parsed.path in ("/", "/index.html"):
+            if dashboard_auth.auth_enabled() and not self._authorized():
+                self._redirect("/login")
+                return
             self._serve_static("index.html")
             return
         if parsed.path.startswith("/web/"):
             self._serve_static(unquote(parsed.path[len("/web/"):]))
+            return
+        if not self._authorized():
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        if parsed.path == "/api/auth/me":
+            session_token = dashboard_auth.read_session_token(
+                self.headers.get("Cookie") or ""
+            )
+            payload = (
+                dashboard_auth.verify_session(session_token) if session_token else None
+            )
+            if payload is None:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            self._send_json(
+                200,
+                {
+                    "username": dashboard_auth.session_username(payload),
+                    "expires_at": payload.get("exp", 0),
+                },
+            )
             return
         if parsed.path == "/approvals/pending":
             session_id = (parse_qs(parsed.query).get("session_id") or [""])[0]
             if not session_id:
                 self._send_json(400, {"error": "session_id required"})
                 return
+            self._audit_session_id = session_id
             pending = list_pending_approvals(session_id)
             self._send_json(200, {"session_id": session_id, "pending": pending})
             return
@@ -340,6 +525,7 @@ class _Handler(BaseHTTPRequestHandler):
             if not session_id or "/" in session_id:
                 self._send_json(404, {"error": "not found"})
                 return
+            self._audit_session_id = session_id
             messages = minimal_agent.load_session_messages(session_id)
             self._send_json(
                 200,
@@ -349,8 +535,45 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        """POST 入口：统一兜底状态码并记录审计。"""
+        self._last_status = 404
+        try:
+            self._handle_POST()
+        finally:
+            self._audit("POST", self.path)
+
+    def _handle_POST(self) -> None:
         parsed = urlparse(self.path)
         body = self._read_body()
+        if parsed.path == "/api/auth/login":
+            username = str(body.get("username", ""))
+            password = str(body.get("password", ""))
+            self._audit_identity = username  # 审计记录尝试登录的用户名（非密钥）
+            token = dashboard_auth.complete_password_login(username, password)
+            if token is None:
+                self._send_json(401, {"error": "invalid username or password"})
+                return
+            self._send_json(
+                200,
+                {"ok": True, "username": username},
+                extra_headers={
+                    "Set-Cookie": dashboard_auth.session_cookie_value(
+                        token, dashboard_auth.session_ttl_seconds()
+                    )
+                },
+            )
+            return
+        if parsed.path == "/api/auth/logout":
+            # 注销不要求已登录：无会话时也能清 cookie
+            self._send_json(
+                200,
+                {"ok": True},
+                extra_headers={"Set-Cookie": dashboard_auth.clear_session_cookie_value()},
+            )
+            return
+        if not self._authorized():
+            self._send_json(401, {"error": "unauthorized"})
+            return
         if parsed.path == "/chat":
             message = body.get("message", "")
             if not isinstance(message, str) or not message.strip():
@@ -359,6 +582,7 @@ class _Handler(BaseHTTPRequestHandler):
             session_id = body.get("session_id") or time.strftime(
                 "session-%Y%m%d-%H%M%S"
             )
+            self._audit_session_id = session_id
             try:
                 state = self.server.app.get_session(session_id)
                 reply, events = self.server.app.handle_message(session_id, state, message)
@@ -382,6 +606,7 @@ class _Handler(BaseHTTPRequestHandler):
             session_id = body.get("session_id") or time.strftime(
                 "session-%Y%m%d-%H%M%S"
             )
+            self._audit_session_id = session_id
             self._begin_sse()
             try:
                 state = self.server.app.get_session(session_id)
@@ -407,6 +632,7 @@ class _Handler(BaseHTTPRequestHandler):
                     {"error": "session_id and choice (once/session/always/deny) required"},
                 )
                 return
+            self._audit_session_id = session_id
             count = resolve_gateway_approval(
                 session_id, choice, reason=body.get("reason")
             )
@@ -417,6 +643,7 @@ class _Handler(BaseHTTPRequestHandler):
             if not session_id or "/" in session_id:
                 self._send_json(404, {"error": "not found"})
                 return
+            self._audit_session_id = session_id
             archived = body.get("archived")
             if not isinstance(archived, bool):
                 self._send_json(
@@ -433,7 +660,128 @@ class _Handler(BaseHTTPRequestHandler):
                 {"session_id": session_id, "archived": archived},
             )
             return
+        if parsed.path.startswith("/sessions/") and parsed.path.endswith("/fork"):
+            source_id = unquote(parsed.path[len("/sessions/"):-len("/fork")])
+            if not source_id or "/" in source_id:
+                self._send_json(404, {"error": "not found"})
+                return
+            self._audit_session_id = source_id
+            requested = str(body.get("id") or body.get("session_id") or "").strip()
+            if requested and ("/" in requested or "\x00" in requested):
+                self._send_json(400, {"error": "invalid session id"})
+                return
+            fork_id = requested or (
+                time.strftime("session-%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
+            )
+            title = str(body.get("title") or "")
+            if not minimal_agent.fork_session(source_id, fork_id, title):
+                if minimal_agent.load_session_prompt(source_id) is None:
+                    self._send_json(404, {"error": "session not found"})
+                else:
+                    self._send_json(409, {"error": "session already exists"})
+                return
+            self._send_json(
+                200,
+                {
+                    "session_id": fork_id,
+                    "source_session_id": source_id,
+                    "title": title or "",
+                },
+            )
+            return
         self._send_json(404, {"error": "not found"})
+
+    def do_PATCH(self) -> None:
+        """PATCH 入口：统一兜底状态码并记录审计。"""
+        self._last_status = 404
+        try:
+            self._handle_PATCH()
+        finally:
+            self._audit("PATCH", self.path)
+
+    def _handle_PATCH(self) -> None:
+        """处理 PATCH 请求：目前只有 PATCH /sessions/<id> 会话标题更新。"""
+        if not self._authorized():
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        parsed = urlparse(self.path)
+        body = self._read_body()
+        rest = (
+            parsed.path[len("/sessions/"):]
+            if parsed.path.startswith("/sessions/")
+            else ""
+        )
+        if not rest or "/" in rest:
+            self._send_json(404, {"error": "not found"})
+            return
+        session_id = unquote(rest)
+        self._audit_session_id = session_id
+        title = body.get("title")
+        if not isinstance(title, str):
+            self._send_json(400, {"error": "title (string) required"})
+            return
+        title = title.strip()
+        if len(title) > 100:
+            self._send_json(400, {"error": "title too long (max 100)"})
+            return
+        if not minimal_agent.set_session_title(session_id, title):
+            self._send_json(404, {"error": "session not found"})
+            return
+        self._send_json(200, {"session_id": session_id, "title": title})
+
+    def do_DELETE(self) -> None:
+        """DELETE 入口：统一兜底状态码并记录审计。"""
+        self._last_status = 404
+        try:
+            self._handle_DELETE()
+        finally:
+            self._audit("DELETE", self.path)
+
+    def _handle_DELETE(self) -> None:
+        """处理 DELETE 请求：目前只有 DELETE /sessions/<id> 会话删除（仅限已归档会话）。"""
+        if not self._authorized():
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        parsed = urlparse(self.path)
+        rest = parsed.path[len("/sessions/"):] if parsed.path.startswith("/sessions/") else ""
+        if not rest or "/" in rest:
+            self._send_json(404, {"error": "not found"})
+            return
+        session_id = unquote(rest)
+        self._audit_session_id = session_id
+
+        # 只允许删除已归档会话（用户交互要求，服务端一并强制，防 API 误删未归档数据）
+        found = next(
+            (
+                s
+                for s in minimal_agent.list_sessions(
+                    limit=200, include_archived=True
+                )
+                if s["session_id"] == session_id
+            ),
+            None,
+        )
+        if found is None:
+            self._send_json(404, {"error": "session not found"})
+            return
+        if not found["archived"]:
+            self._send_json(400, {"error": "only archived sessions can be deleted"})
+            return
+
+        # 会话正在处理中（turn 锁被占用）→ 409，避免删除进行中的对话（对齐 Hermes turn lease）
+        state = self.server.app.sessions.get(session_id)
+        if state is not None and not state["lock"].acquire(blocking=False):
+            self._send_json(409, {"error": "session is busy"})
+            return
+        if state is not None:
+            state["lock"].release()
+            self.server.app.remove_session(session_id)
+
+        deleted = minimal_agent.delete_session(session_id)
+        if not deleted:
+            self._send_json(404, {"error": "session not found"})
+            return
+        self._send_json(200, {"session_id": session_id, "deleted": True})
 
 
 class _Server(ThreadingHTTPServer):

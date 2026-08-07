@@ -98,10 +98,10 @@ class FakeClient:
 
 def test_marker_roundtrip() -> None:
     """裁剪标记：生成后能被解析回技能名。"""
-    marker = cc._skill_pruned_marker("weather-answer")
-    check("标记含重载指令", "skill_view(name='weather-answer')" in marker)
+    marker = cc._skill_pruned_marker("release-check")
+    check("标记含重载指令", "skill_view(name='release-check')" in marker)
     check("标记可解析回技能名",
-          cc._extract_pruned_skill_names(marker) == ["weather-answer"])
+          cc._extract_pruned_skill_names(marker) == ["release-check"])
     check("无标记文本 -> 空", cc._extract_pruned_skill_names("普通文本") == [])
 
 
