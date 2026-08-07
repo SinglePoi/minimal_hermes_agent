@@ -84,6 +84,61 @@ class FakeClient:
         self.chat = FakeChat(self)
 
 
+class ToolLoopMessage:
+    """模拟"模型持续要求调工具"的消息（带 model_dump，含 tool_calls）。"""
+
+    def __init__(self, name: str = "get_current_time", args: dict | None = None):
+        self.content = ""
+        self.reasoning_content = ""
+        self.tool_calls = [
+            SimpleNamespace(
+                id="call_loop",
+                type="function",
+                function=SimpleNamespace(
+                    name=name,
+                    arguments=json.dumps(args or {}, ensure_ascii=False),
+                ),
+            )
+        ]
+
+    def model_dump(self, exclude_none=True):
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in self.tool_calls
+            ],
+        }
+
+
+class BudgetFakeClient:
+    """计数假 client：带 tools 的调用返回工具调用，收尾调用（无 tools）返回文本。"""
+
+    def __init__(self):
+        self.calls = 0
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        self.calls += 1
+        if kwargs.get("tools"):
+            return SimpleNamespace(
+                usage=SimpleNamespace(prompt_tokens=100),
+                choices=[SimpleNamespace(message=ToolLoopMessage("get_current_time"))],
+            )
+        return SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=50),
+            choices=[SimpleNamespace(message=FakeMessage("收尾完成"))],
+        )
+
+
 def http_json(
     method: str,
     url: str,
@@ -892,6 +947,43 @@ def test_session_title_and_fork() -> None:
         fx.close()
 
 
+def test_turn_budget() -> None:
+    """turn 级预算：轮数上限与 token 预算触发收尾，最终回复为收尾文本。"""
+    original_turns = minimal_agent.MAX_AGENT_TURNS
+    original_budget = minimal_agent.TURN_TOKEN_BUDGET
+    try:
+        # 轮数上限：MAX_AGENT_TURNS=3 → 3 次工具循环 + 1 次收尾 = 4 次模型调用
+        minimal_agent.MAX_AGENT_TURNS = 3
+        minimal_agent.TURN_TOKEN_BUDGET = 0
+        fx = ServerFixture(client=BudgetFakeClient())
+        try:
+            reply = http_json(
+                "POST", f"{fx.base}/chat",
+                {"message": "一直查下去", "session_id": "sess-budget-turns"},
+            )
+            check("轮数上限收尾回复", reply.get("reply") == "收尾完成")
+            check("轮数上限调用次数=4", fx.app.client.calls == 4)
+        finally:
+            fx.close()
+
+        # token 预算：每轮 100 token、预算 250 → 第 4 轮预检触顶 → 收尾
+        minimal_agent.MAX_AGENT_TURNS = 10
+        minimal_agent.TURN_TOKEN_BUDGET = 250
+        fx = ServerFixture(client=BudgetFakeClient())
+        try:
+            reply = http_json(
+                "POST", f"{fx.base}/chat",
+                {"message": "一直查下去", "session_id": "sess-budget-tokens"},
+            )
+            check("token 预算收尾回复", reply.get("reply") == "收尾完成")
+            check("token 预算调用次数=4", fx.app.client.calls == 4)
+        finally:
+            fx.close()
+    finally:
+        minimal_agent.MAX_AGENT_TURNS = original_turns
+        minimal_agent.TURN_TOKEN_BUDGET = original_budget
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== HTTP 服务化回归测试 ==")
@@ -908,6 +1000,7 @@ def main() -> None:
         test_auth_and_audit,
         test_delete_session_endpoint,
         test_session_title_and_fork,
+        test_turn_budget,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

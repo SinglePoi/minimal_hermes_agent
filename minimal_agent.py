@@ -82,6 +82,21 @@ SESSION_RETENTION_DAYS = float(os.environ.get("SESSION_RETENTION_DAYS", "90") or
 # 记忆 nudge 间隔（用户轮次；对齐 Hermes memory.nudge_interval 默认 10；0 = 禁用周期性审查）
 MEMORY_NUDGE_INTERVAL = int(os.environ.get("MEMORY_NUDGE_INTERVAL", "10") or 10)
 
+
+def _env_int(name: str, default: int, min_value: int = 0) -> int:
+    """读取环境变量整数配置（非法值回退默认，避免启动崩溃）。"""
+    try:
+        return max(min_value, int(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return default
+
+
+# turn 级预算（对齐 Hermes 的 max_iterations / iteration_budget，简化版）：
+# - MAX_AGENT_TURNS：单次提问内"调模型"的最大轮数（默认 5）
+# - TURN_TOKEN_BUDGET：单次提问累计 prompt token 预算（0 = 不限制）
+MAX_AGENT_TURNS = _env_int("MAX_AGENT_TURNS", 5, 1)
+TURN_TOKEN_BUDGET = _env_int("TURN_TOKEN_BUDGET", 0, 0)
+
 console = Console()
 
 
@@ -800,18 +815,23 @@ def create_client() -> OpenAI:
 
 
 def call_llm(client: OpenAI, messages: list[dict[str, Any]], tools: list[dict[str, Any]]):
-    """把对话消息 + 工具清单发给大模型，返回模型的回复（message 对象）。"""
+    """把对话消息 + 工具清单发给大模型，返回 (message, prompt_tokens)。
+
+    prompt_tokens 供 turn 级 token 预算统计真实用量（对齐 Hermes 优先用 API 真实值）。
+    """
     response = client.chat.completions.create(
         model=MODEL,
         messages=messages,
         tools=tools,
     )
-    # 记录真实 token 用量，供上下文压缩判断（对齐 Hermes：优先用 API 真实值）
     try:
-        record_usage(response.usage.prompt_tokens)
+        prompt_tokens = int(response.usage.prompt_tokens or 0)
     except Exception:
-        pass
-    return response.choices[0].message
+        prompt_tokens = 0
+    if prompt_tokens:
+        # 记录真实 token 用量，供上下文压缩判断（对齐 Hermes：优先用 API 真实值）
+        record_usage(prompt_tokens)
+    return response.choices[0].message, prompt_tokens
 
 
 class _StreamMessage:
@@ -852,7 +872,7 @@ def call_llm_stream(
 
     对齐 Hermes 的流式接口语义：delta 里的 content 增量逐段给 on_token，
     tool_calls 按 index 累积出完整参数。返回 _StreamMessage
-    （接口与非流式 message 一致，run_agent_turn 无需分支）。
+    （接口与非流式 message 一致）+ 流内累积的 prompt_tokens（供 turn budget 统计）。
     """
     response = client.chat.completions.create(
         model=MODEL,
@@ -862,11 +882,15 @@ def call_llm_stream(
     )
     msg = _StreamMessage()
     calls: dict[int, dict[str, str]] = {}
+    stream_tokens = 0
     for chunk in response:
         try:
             usage = getattr(chunk, "usage", None)
             if usage is not None:
-                record_usage(getattr(usage, "prompt_tokens", 0) or 0)
+                tokens = getattr(usage, "prompt_tokens", 0) or 0
+                if tokens:
+                    stream_tokens = int(tokens)
+                    record_usage(stream_tokens)
         except Exception:
             pass
         if not chunk.choices:
@@ -904,7 +928,7 @@ def call_llm_stream(
                 ),
             )
         )
-    return msg
+    return msg, stream_tokens
 
 
 # ---------------- 工具：定义 + 执行 ----------------
@@ -1343,6 +1367,36 @@ def _record_event(
     return event
 
 
+def _finalize_turn_summary(
+    client: OpenAI,
+    messages: list[dict[str, Any]],
+) -> None:
+    """轮数/token 预算耗尽时收尾：请求模型基于已有信息给出最终回答（对齐 Hermes
+    handle_max_iterations 的"Requesting summary"行为）。
+
+    不带工具再调一次模型（工具被禁用，防止无限递归）；失败时退回占位消息。
+    """
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "已经达到本轮执行上限（轮数或 token 预算）。"
+                "请基于已有信息直接给出最终回答，不要再调用任何工具。"
+            ),
+        }
+    )
+    try:
+        response = client.chat.completions.create(model=MODEL, messages=messages)
+        reply = response.choices[0].message.content or ""
+    except Exception as exc:
+        reply = ""
+        console.print(f"[dim]（收尾调用失败：{exc}）[/dim]")
+    if reply:
+        messages.append({"role": "assistant", "content": reply})
+        console.print()
+        console.print(Panel(reply, title="🤖 助手", border_style="green"))
+
+
 def run_agent_turn(
     client: OpenAI,
     messages: list[dict[str, Any]],
@@ -1357,10 +1411,22 @@ def run_agent_turn(
 
     对应 Hermes 的 run_conversation()——一次用户输入驱动整个 while 循环。
     最终回答也会写回 messages（多轮对话依赖它）。
+    turn 级预算：MAX_AGENT_TURNS 限轮数、TURN_TOKEN_BUDGET 限累计 token（0 不限制），
+    触顶后请求模型基于已有信息收尾（对齐 Hermes 的 max_iterations / iteration_budget）。
     """
-    max_turns = 5  # 最大轮数：防止模型无限调工具
+    max_turns = max(1, int(MAX_AGENT_TURNS))
+    token_budget = max(0, int(TURN_TOKEN_BUDGET))
+    api_call_count = 0  # 累计模型调用次数（对齐 Hermes api_call_count）
+    token_used = 0  # 累计 prompt token（真实值；流式仅在 chunk 带 usage 时计入）
 
     for turn in range(max_turns):
+        # token 预算预检：触顶即收尾，不再调模型（对齐 Hermes 的 budget 收尾）
+        if token_budget and token_used >= token_budget:
+            console.print(
+                f"[yellow]（token 预算已达上限 {token_budget}，请求模型收尾）[/yellow]"
+            )
+            _finalize_turn_summary(client, messages)
+            return
         # 预检压缩：上下文超过阈值 → 中间轮次摘要化（对齐 Hermes 的 preflight compression）
         if should_compress(messages):
             # 对齐 Hermes commit_memory_session：压缩边界先把当前对话的记忆
@@ -1391,9 +1457,13 @@ def run_agent_turn(
             },
         )
         if on_token is not None:
-            msg = call_llm_stream(client, messages, tools, on_token=on_token)
+            msg, prompt_tokens = call_llm_stream(
+                client, messages, tools, on_token=on_token
+            )
         else:
-            msg = call_llm(client, messages, tools)
+            msg, prompt_tokens = call_llm(client, messages, tools)
+        api_call_count += 1
+        token_used += prompt_tokens
         reasoning = getattr(msg, "reasoning_content", None) or ""
         if reasoning:
             think_event["result"] = redact_sensitive_text(
@@ -1478,7 +1548,8 @@ def run_agent_turn(
         console.print(Panel(msg.content or "", title="🤖 助手", border_style="green"))
         return
 
-    console.print("\n[yellow]（达到最大轮数，循环结束）[/yellow]")
+    console.print(f"\n[yellow]（达到最大轮数 {max_turns}，请求模型收尾）[/yellow]")
+    _finalize_turn_summary(client, messages)
 
 
 def review_memory_turn(client: OpenAI, messages: list[dict[str, Any]]) -> None:

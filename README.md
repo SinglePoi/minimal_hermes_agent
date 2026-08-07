@@ -198,6 +198,14 @@
       不再碰终端命令；已进并行只读白名单
     - SYSTEM_PROMPT 新增规则 12：日期时间用 get_current_time；联网用 web_search/web_fetch，
       不要用 terminal 模拟联网；不要调用裸 date/time
+27. **turn 级预算（Agent Loop 预算控制）**（2026-08-07，对齐 Hermes max_iterations /
+    iteration_budget，简化版）：
+    - `MAX_AGENT_TURNS`（默认 5）：单次提问内"调模型"最大轮数，替代原先写死的 5；
+      `TURN_TOKEN_BUDGET`（默认 0 = 不限制）：单次提问累计 prompt token 预算
+    - 循环内累计模型调用次数与真实 token 用量（call_llm/call_llm_stream 现在返回用量）；
+      每轮模型调用前做预算预检，触顶即收尾
+    - 收尾对齐 Hermes `handle_max_iterations`：不带工具再调一次模型，请求"基于已有信息给出
+      最终回答、不要再调工具"，失败时退回占位消息；回复照常写回 messages 供前端展示
 
 ## 你需要准备的
 
@@ -298,6 +306,8 @@ Web 页面已内置该流程：请求期间每 800ms 轮询，弹出审批框点
 | `APPROVAL_DENIAL_BREAKER` | 连续智能拒绝多少次后触发熔断（0 = 禁用） | `3` |
 | `SESSION_RETENTION_DAYS` | 会话历史保留天数，启动时清理不活跃旧会话（0 = 禁用） | `90` |
 | `MEMORY_NUDGE_INTERVAL` | 记忆 nudge 间隔（用户轮次）：每 N 轮后台审查一次（0 = 禁用） | `10` |
+| `MAX_AGENT_TURNS` | 单次提问内"调模型"最大轮数（防无限调工具） | `5` |
+| `TURN_TOKEN_BUDGET` | 单次提问累计 prompt token 预算（0 = 不限制；触顶请求模型收尾） | `0` |
 | `APPROVAL_DENY` | 用户自定义拒绝规则（; 分隔的 fnmatch glob，命中即无条件拦截） | 空 |
 | `TIRITH_ENABLED` | 内容级安全扫描开关（false 关闭） | `true` |
 | `TIRITH_FAIL_OPEN` | 扫描器异常时放行（true）还是拦截（false） | `true` |
@@ -639,6 +649,7 @@ python minimal_agent.py
 | 会话 fork `POST /sessions/<id>/fork` | `gateway/platforms/api_server.py` 的 `_handle_fork_session`（简化：无 parent 血缘列） |
 | 联网 `web_search` / `web_fetch` | `plugins/web/`（tavily/searxng 等思路简化：必应 RSS 优先 + DuckDuckGo 兜底，urllib 零依赖无 key） |
 | 时间工具 `get_current_time` + `stdin=DEVNULL` | Hermes 无直接对应（骨架修复 Windows cmd 交互式 date/time 卡死问题） |
+| turn 级预算 `MAX_AGENT_TURNS` / `TURN_TOKEN_BUDGET` | `agent/agent_init.py` 的 `max_iterations` / `agent/iteration_budget.py` + `chat_completion_helpers.py` 的 `handle_max_iterations` |
 | 危险命令审批 `approval.py` | `tools/approval.py`（DANGEROUS_PATTERNS、HARDLINE_PATTERNS、prompt_dangerous_approval） |
 | `terminal` 工具（先审批再执行） | `tools/terminal_tool.py`（check_all_command_guards + subprocess） |
 | 永久允许列表 `approval_allowlist.json` | `config.yaml` 的 `command_allowlist`（JSON 免去 YAML 依赖） |

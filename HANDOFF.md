@@ -290,6 +290,16 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
       不要用 terminal 模拟联网；不要调裸 date/time）
     - 测试：test_approval.py 新增 stdin=DEVNULL 断言组；test_tool_dispatch.py 新增
       get_current_time 格式/注册/白名单组；全套 17 套通过
+31. **turn 级预算（Agent Loop 预算控制）**（2026-08-07）：对齐 Hermes max_iterations /
+    iteration_budget / handle_max_iterations，简化版——
+    - 新环境变量 `MAX_AGENT_TURNS`（默认 5，替代写死的 5）与 `TURN_TOKEN_BUDGET`
+      （默认 0 = 不限制）；三同步完成（.env / .env.example / README 变量表）
+    - call_llm / call_llm_stream 改为返回 (message, prompt_tokens)，循环内累计
+      api_call_count 与 token_used；每轮模型调用前预算预检，触顶即收尾
+    - 收尾 `_finalize_turn_summary`：不带工具再调一次模型请求最终回答（对齐 Hermes
+      "Requesting summary"），失败退回占位消息；回复写回 messages 供 REPL/前端展示
+    - 测试：tests/test_server.py 新增 turn budget 组（轮数上限 3 → 3 次工具循环+1 次收尾=4 次调用；
+      token 预算 250/每轮 100 → 第 4 轮预检触顶收尾），全套 17 套通过
 
 ## 运行方式
 
@@ -413,7 +423,7 @@ python demo_file_tools.py
 - 文件工具简化：patch 只做 replace 模式（无 V4A 补丁头/模糊匹配/语法检查），
   无陈旧检测/文件锁、无文档抽取；
   搜索仍跳过敏感文件（Hermes 也过滤敏感路径的搜索结果）
-- 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）
+- 并行执行的中断语义（Hermes executor 有，骨架简化掉了；turn 级 budget 已完成，见 31）
 - 外部协议接入（候补，暂不做）：MCP（连外部工具/数据源，Hermes 有
   `hermes_cli/mcp_config.py` + `mcp_picker.py` + `optional-mcps/`）与 ACP
   （被 VS Code/Zed/JetBrains 等编辑器客户端调用，Hermes 有 `acp_adapter/` +
@@ -428,7 +438,7 @@ python demo_file_tools.py
   对齐 Hermes api_server 的 auth / DELETE / PATCH / fork）；联网能力已完成（见 29）
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
 - 文件工具增强：V4A patch 头/模糊匹配/语法检查、陈旧检测/文件锁、文档抽取
-- 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有）
+- 并行执行的中断语义（Hermes executor 有；turn 级 budget 已完成，见 31）
 - Skills 增强：前置条件检查、技能 hub 同步
 - 脱敏专项：URL 查询参数、手机号、DB 连接串
 - 运维：服务化下的日志、进程守护（Hermes 用 systemd/gateway daemon）
