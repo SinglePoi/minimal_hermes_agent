@@ -1157,17 +1157,121 @@ TOOLS = [
 ]
 
 
+def _kill_process_tree(proc) -> None:
+    """杀掉子进程（Windows 用 taskkill /T 杀整棵树）。
+
+    shell=True 时 ping 这类命令是 cmd 的孙进程：只 kill cmd 的话孙进程仍占着
+    stdout 管道，communicate() 会一直阻塞；taskkill /T 连子孙一起杀（对齐
+    Hermes 中断时终止整棵进程树的语义）。
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        else:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _run_terminal_interruptible(
+    command: str,
+    timeout: int,
+    interrupt_event: Any,
+) -> str:
+    """带中断的终端执行：事件置位立即 kill 子进程（对齐 Hermes 线程级中断信号）。
+
+    用 Popen + 0.5s 轮询 communicate；返回结构与 run_terminal 一致（JSON），
+    中断时带 status=cancelled。
+    """
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            errors="replace",
+        )
+    except Exception as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "exit_code": -1,
+                "output": "",
+                "error": f"执行失败：{exc}",
+            },
+            ensure_ascii=False,
+        )
+    deadline = time.time() + timeout
+    while True:
+        if interrupt_event.is_set():
+            _kill_process_tree(proc)
+            try:
+                out, err = proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                out, err = "", ""
+            return json.dumps(
+                {
+                    "success": False,
+                    "exit_code": -1,
+                    "output": (out or "").strip(),
+                    "error": "命令被用户中断",
+                    "status": "cancelled",
+                },
+                ensure_ascii=False,
+            )
+        try:
+            out, err = proc.communicate(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            if time.time() > deadline:
+                _kill_process_tree(proc)
+                try:
+                    out, err = proc.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    out, err = "", ""
+                return json.dumps(
+                    {
+                        "success": False,
+                        "exit_code": -1,
+                        "output": "",
+                        "error": f"命令超时（>{timeout}s），已终止等待",
+                    },
+                    ensure_ascii=False,
+                )
+    return json.dumps(
+        {
+            "success": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "output": (out or "").strip(),
+            "stderr": (err or "").strip(),
+        },
+        ensure_ascii=False,
+    )
+
+
 def run_terminal(
     command: str,
     session_key: str,
     timeout: int = 120,
     client=None,
+    interrupt_event: Any = None,
 ) -> str:
     """执行本地 shell 命令：先过审批门卫，再运行（对齐 Hermes terminal_tool）。
 
     审批逻辑在 approval.check_dangerous_command()：危险命令需用户批准
     （once/session/always/deny），拒绝或超时返回 BLOCKED 消息且不执行。
     client 供 APPROVAL_MODE=smart 时辅助 LLM 评估用（没有也能跑，落回人工审批）。
+    interrupt_event 置位时立即杀掉子进程并返回 cancelled（对齐 Hermes 线程级中断信号）。
     返回结构与 Hermes terminal_tool 一致：JSON 的 output / exit_code / error 字段，
     用户批准过则附带 approval 说明。
     """
@@ -1191,6 +1295,8 @@ def run_terminal(
         )
 
     try:
+        if interrupt_event is not None:
+            return _run_terminal_interruptible(command, timeout, interrupt_event)
         result = subprocess.run(
             command,
             shell=True,
@@ -1242,6 +1348,7 @@ def run_tool(
     manager: MemoryManager | None = None,
     session_key: str = "",
     client=None,
+    interrupt_event: Any = None,
 ) -> str:
     """根据工具名找到对应函数并执行。以后加新工具就在这里加一行。"""
     if name == "get_current_time":
@@ -1264,6 +1371,7 @@ def run_tool(
             session_key=session_key,
             timeout=int(args.get("timeout", 120) or 120),
             client=client,
+            interrupt_event=interrupt_event,
         )
     if name == "skills_list":
         return skills_list()
@@ -1406,6 +1514,7 @@ def run_agent_turn(
     events: list[dict[str, Any]] | None = None,
     sink: Any = None,
     on_token: Any = None,
+    interrupt_event: Any = None,
 ) -> None:
     """执行一轮对话：模型 + 工具循环，直到模型给出最终回答。
 
@@ -1413,6 +1522,8 @@ def run_agent_turn(
     最终回答也会写回 messages（多轮对话依赖它）。
     turn 级预算：MAX_AGENT_TURNS 限轮数、TURN_TOKEN_BUDGET 限累计 token（0 不限制），
     触顶后请求模型基于已有信息收尾（对齐 Hermes 的 max_iterations / iteration_budget）。
+    interrupt_event 置位（如客户端断开）时停止本轮：跳过未执行的工具并回填
+    cancelled 结果，再以"已中断"收尾（对齐 Hermes 的 agent.interrupt()）。
     """
     max_turns = max(1, int(MAX_AGENT_TURNS))
     token_budget = max(0, int(TURN_TOKEN_BUDGET))
@@ -1420,6 +1531,11 @@ def run_agent_turn(
     token_used = 0  # 累计 prompt token（真实值；流式仅在 chunk 带 usage 时计入）
 
     for turn in range(max_turns):
+        # 中断检查：每轮模型调用前看是否被用户/客户端中断
+        if interrupt_event is not None and interrupt_event.is_set():
+            console.print("[yellow]（用户中断，本轮停止）[/yellow]")
+            messages.append({"role": "assistant", "content": "（已中断，本轮停止）"})
+            return
         # token 预算预检：触顶即收尾，不再调模型（对齐 Hermes 的 budget 收尾）
         if token_budget and token_used >= token_budget:
             console.print(
@@ -1513,7 +1629,10 @@ def run_agent_turn(
                 """执行单个工具调用（parallel 段的工作线程也会调用它）。"""
                 name = tool_name(tc)
                 args = tool_arguments(tc) or {}
-                return run_tool(name, args, manager, session_key, client)
+                return run_tool(
+                    name, args, manager, session_key, client,
+                    interrupt_event=interrupt_event,
+                )
 
             def on_segment(kind: str, calls: list) -> None:
                 """每段执行前提示（对齐 Hermes 并发的"running N tools concurrently"）。"""
@@ -1527,6 +1646,7 @@ def run_agent_turn(
                 messages,
                 run_one,
                 on_segment=on_segment,
+                interrupt_event=interrupt_event,
             )
 
             # 按原始顺序回显工具返回（本段新增的 tool 消息正好一一对应）
@@ -1608,6 +1728,7 @@ def process_turn(
     events: list[dict[str, Any]] | None = None,
     sink: Any = None,
     on_token: Any = None,
+    interrupt_event: Any = None,
 ) -> tuple[int, int, int]:
     """处理一条用户消息（REPL 与服务器共用）：召回 → 对话 → 落库 → 同步 → nudge。
 
@@ -1646,6 +1767,7 @@ def process_turn(
         events=events,
         sink=sink,
         on_token=on_token,
+        interrupt_event=interrupt_event,
     )
 
     # 增量落库（对齐 Hermes：消息逐轮写入 SessionDB，中途退出也不丢）

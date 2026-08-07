@@ -111,6 +111,49 @@ def test_headers_keys_jwt_url() -> None:
     check("URL userinfo 密码打码", "s3cret" not in out and "admin:***@" in out)
 
 
+def test_special_redaction() -> None:
+    """脱敏专项：DB 连接串 / 手机号 / URL 查询参数。"""
+    # DB 连接串：只打码密码
+    out = redact_sensitive_text(
+        "postgres://app:hunter2@db.example.com:5432/prod"
+    )
+    check("postgres 连接串密码打码", "hunter2" not in out and "app:***@" in out)
+    out = redact_sensitive_text("redis://:r3dispass@cache:6379/0")
+    check("redis 连接串密码打码", "r3dispass" not in out)
+    out = redact_sensitive_text(
+        "mongodb+srv://admin:secret123@cluster.mongodb.net/db"
+    )
+    check("mongodb+srv 连接串密码打码", "secret123" not in out)
+    out = redact_sensitive_text("https://example.com/index")
+    check("普通 https 不带密码不动", "example.com/index" in out)
+
+    # 手机号
+    out = redact_sensitive_text("联系电话 13812345678，别外传")
+    check("大陆手机号打码", "13812345678" not in out and "138****5678" in out)
+    out = redact_sensitive_text("国际号码 +8613812345678")
+    check("E.164 手机号打码", "+8613812345678" not in out and "+86****5678" in out)
+    out = redact_sensitive_text("版本号 1.0.20260807 正常")
+    check("日期数字不误伤", "20260807" in out)
+
+    # URL 查询参数
+    out = redact_sensitive_text(
+        "https://example.com/cb?code=ABC123&state=xyz&token=sekret"
+    )
+    check("查询参数 code/token 打码", "ABC123" not in out and "sekret" not in out)
+    check("非敏感参数 state 保留", "state=xyz" in out)
+    out = redact_sensitive_text("https://example.com/search?q=hello&limit=10")
+    check("非敏感查询串不动", "q=hello&limit=10" in out)
+    out = redact_sensitive_text(
+        "https://example.com/api?token_count=3&session_id=abc"
+    )
+    check("token_count/session_id 不误伤",
+          "token_count=3" in out and "session_id=abc" in out)
+    out = redact_sensitive_text(
+        "https://example.com/cb?access_token=xxx&x-amz-signature=yyy"
+    )
+    check("access_token/x-amz-signature 打码", "xxx" not in out and "yyy" not in out)
+
+
 def test_file_read_sentinel() -> None:
     """file_read 模式：不可复用哨兵，不保留密钥字节。"""
     out = redact_sensitive_text(
@@ -146,6 +189,7 @@ def main() -> None:
         test_prefix_keys,
         test_env_json_yaml,
         test_headers_keys_jwt_url,
+        test_special_redaction,
         test_file_read_sentinel,
         test_force_and_switch,
     ):

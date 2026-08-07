@@ -268,6 +268,79 @@ def test_get_current_time_tool() -> None:
     check("进并行白名单", "get_current_time" in _PARALLEL_SAFE_TOOLS)
 
 
+def test_executor_interrupt() -> None:
+    """执行器中断：预置中断全跳过；并行段取消 pending；顺序段中断后续跳过。"""
+    # 1) 预置中断：全部跳过，run_one 不执行，结果按原始顺序回填 cancelled
+    ev = threading.Event()
+    ev.set()
+    calls = [
+        make_call("c1", "web_search", {"query": "x"}),
+        make_call("c2", "web_search", {"query": "y"}),
+    ]
+    messages: list[dict] = []
+    ran: list[str] = []
+
+    def run_one(tc):
+        ran.append(tool_call_id(tc))
+        return "ok"
+
+    execute_tool_calls_segmented(calls, messages, run_one, interrupt_event=ev)
+    check("预置中断 -> run_one 未执行", ran == [])
+    check("预置中断 -> 全部 cancelled",
+          len(messages) == 2
+          and all('"status": "cancelled"' in m["content"] for m in messages))
+    check("预置中断 -> 结果按原始顺序",
+          [m["tool_call_id"] for m in messages] == ["c1", "c2"])
+
+    # 2) 并行段执行中置位：已完成的保留真实结果，阻塞中的回填 cancelled
+    ev = threading.Event()
+    release = threading.Event()
+    c2_blocked = threading.Event()
+
+    def run_gated(tc):
+        if tool_call_id(tc) == "c1":
+            return "done-1"
+        c2_blocked.set()
+        release.wait(timeout=15)
+        return "done-2"
+
+    def watcher():
+        c2_blocked.wait(timeout=5)
+        ev.set()
+
+    threading.Thread(target=watcher, daemon=True).start()
+    calls = [
+        make_call("c1", "web_search", {"query": "a"}),
+        make_call("c2", "web_search", {"query": "b"}),
+    ]
+    messages = []
+    execute_tool_calls_segmented(calls, messages, run_gated, interrupt_event=ev)
+    check("并行中断：已完成保留真实结果", messages[0]["content"] == "done-1")
+    check("并行中断：阻塞中回填 cancelled",
+          '"status": "cancelled"' in messages[1]["content"])
+    check("并行中断：结果按原始顺序",
+          [m["tool_call_id"] for m in messages] == ["c1", "c2"])
+    release.set()  # 放行后台线程，避免测试进程退出时 join 等待
+
+    # 3) 顺序段：第一个执行后置位 → 后续跳过并回填 cancelled
+    ev = threading.Event()
+    calls = [
+        make_call("s1", "terminal", {"command": "echo a"}),
+        make_call("s2", "terminal", {"command": "echo b"}),
+    ]
+    messages = []
+
+    def run_seq(tc):
+        ev.set()  # 第一个执行完就触发中断
+        return "ok-1"
+
+    execute_tool_calls_segmented(calls, messages, run_seq, interrupt_event=ev)
+    check("顺序中断：第一个正常",
+          messages[0]["content"] == "ok-1" and messages[0]["tool_call_id"] == "s1")
+    check("顺序中断：后续 cancelled",
+          '"status": "cancelled"' in messages[1]["content"])
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== 工具并行执行回归测试 ==")
@@ -278,6 +351,7 @@ def main() -> None:
         test_executor_mixed_batch,
         test_real_file_tools_path_scope,
         test_get_current_time_tool,
+        test_executor_interrupt,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

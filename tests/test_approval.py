@@ -17,6 +17,8 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -200,6 +202,41 @@ def test_terminal_stdin_devnull() -> None:
         minimal_agent.subprocess.run = original_run
 
 
+def test_terminal_interrupt() -> None:
+    """终端工具中断：interrupt_event 置位时快速杀掉子进程并返回 cancelled。"""
+    # 1) 预置中断：立即返回，不等命令跑完
+    ev = threading.Event()
+    ev.set()
+    t0 = time.time()
+    result = json.loads(
+        run_terminal(
+            "ping -n 30 127.0.0.1", "sess-term-int",
+            timeout=60, interrupt_event=ev,
+        )
+    )
+    check("预置中断 -> 快速返回 cancelled",
+          result.get("status") == "cancelled" and (time.time() - t0) < 5)
+
+    # 2) 运行中置位：命令跑到一半被 kill，同样返回 cancelled
+    ev = threading.Event()
+    box: dict = {}
+
+    def worker():
+        box["r"] = json.loads(
+            run_terminal(
+                "ping -n 30 127.0.0.1", "sess-term-int2",
+                timeout=60, interrupt_event=ev,
+            )
+        )
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    time.sleep(1.0)  # 让命令真正跑起来
+    ev.set()
+    thread.join(timeout=10)
+    check("运行中中断 -> cancelled", box.get("r", {}).get("status") == "cancelled")
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果（失败时返回非零退出码）。"""
     print("== 危险命令审批回归测试 ==")
@@ -209,6 +246,7 @@ def main() -> None:
         test_approval_gate_branches,
         test_terminal_tool,
         test_terminal_stdin_devnull,
+        test_terminal_interrupt,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

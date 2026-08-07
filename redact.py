@@ -8,6 +8,8 @@
     - 环境变量赋值（DEEPSEEK_API_KEY=xxx、PASSWORD=xxx）
     - JSON 字段（"apiKey": "xxx"）与 YAML/配置键（password: xxx）
     - Authorization 请求头、JWT、私钥块、URL 里的 user:pass@
+    - 脱敏专项（2026-08-07）：DB 连接串（scheme://user:pass@host）、手机号
+      （大陆 11 位 + E.164）、URL 查询参数（token/api_key/code 等敏感键打码）
 
 两种打码风格（与 Hermes 一致）：
     - _mask_token：保留头 6 / 尾 4 字符（适合日志与审批展示，方便辨认）
@@ -15,7 +17,8 @@
       防止模型读了打码值再写回文件，把密钥毁成假值——对齐 Hermes 的教训）
 
 简化掉的部分（Hermes 有，骨架不做）：
-    - URL 查询参数打码（Hermes 默认关闭）、手机号、DB 连接串专项
+    - URL 查询参数打码在 Hermes 的 Web URL 场景默认关闭（防破坏 OAuth 回跳），
+      骨架为展示安全默认开启（本骨架无 OAuth 回跳链路）
     - 每个模式家族的子串预检加速（骨架量小，直接跑正则）
 """
 
@@ -91,6 +94,25 @@ _PRIVATE_KEY_RE = re.compile(
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
 # URL 里的 user:pass@：只打码密码
 _URL_USERINFO_RE = re.compile(r"(://[^:/@\s]+):([^@\s]+)@")
+# DB 连接串：scheme://user:PASSWORD@host（只打码密码，对齐 Hermes _DB_CONNSTR_RE）
+# 用户名部分用 * 允许空用户名（redis://:pass@host 常见写法；Hermes 要求 user: 前缀）
+_DB_CONNSTR_RE = re.compile(
+    r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:\s]*:)([^@\s]+)(@)",
+    re.IGNORECASE,
+)
+# 大陆手机号：1[3-9] 开头 11 位，前后非数字（防命中长串/日期）
+_PHONE_CN_RE = re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")
+# E.164 手机号：+ 国家码 + 7~15 位数字（对齐 Hermes _SIGNAL_PHONE_RE）
+_SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")
+# URL 查询串里的敏感参数名（对齐 Hermes _SENSITIVE_QUERY_PARAMS，大小写不敏感精确匹配）
+_SENSITIVE_QUERY_PARAMS = frozenset({
+    "access_token", "refresh_token", "id_token", "token", "api_key",
+    "apikey", "client_secret", "password", "auth", "jwt", "session",
+    "code", "signature", "x-amz-signature",
+})
+_URL_WITH_QUERY_RE = re.compile(
+    r"(https?|wss?|ftp)://([^\s/?#]+)([^\s?#]*)\?([^\s#]+)(#\S*)?"
+)
 
 
 def mask_secret(
@@ -133,6 +155,39 @@ def _redact_env(m: re.Match) -> str:
     if "getenv" in value or ("(" in value and ")" in value):
         return m.group(0)
     return f"{name}={quote}{_mask_token(value)}{quote}"
+
+
+def _mask_phone(value: str) -> str:
+    """手机号打码：保留前 3 位与后 4 位（E.164 的前 3 位即国家码，如 +86）。"""
+    return value[:3] + "****" + value[-4:]
+
+
+def _redact_query_string(query: str) -> str:
+    """把 URL 查询串里敏感键的值替换成 ***（对齐 Hermes _redact_query_string）。"""
+    if not query:
+        return query
+    parts = []
+    for pair in query.split("&"):
+        if "=" not in pair:
+            parts.append(pair)
+            continue
+        key, _, value = pair.partition("=")
+        if key.lower() in _SENSITIVE_QUERY_PARAMS:
+            parts.append(f"{key}=***")
+        else:
+            parts.append(pair)
+    return "&".join(parts)
+
+
+def _redact_url_query_params(text: str) -> str:
+    """扫描文本里的 URL，对查询串中的敏感参数打码（对齐 Hermes）。"""
+    def _sub(m: re.Match) -> str:
+        return (
+            f"{m.group(1)}://{m.group(2)}{m.group(3)}"
+            f"?{_redact_query_string(m.group(4))}{m.group(5) or ''}"
+        )
+
+    return _URL_WITH_QUERY_RE.sub(_sub, text)
 
 
 def redact_sensitive_text(
@@ -189,4 +244,12 @@ def redact_sensitive_text(
         text = _JWT_RE.sub(lambda m: _mask_token(m.group(0)), text)
     if "://" in text and "@" in text:
         text = _URL_USERINFO_RE.sub(r"\1:***@", text)
+
+    # 4. 脱敏专项：DB 连接串 / 手机号 / URL 查询参数（2026-08-07 新增）
+    if "://" in text:
+        text = _DB_CONNSTR_RE.sub(r"\1***\3", text)
+    text = _PHONE_CN_RE.sub(lambda m: _mask_phone(m.group(1)), text)
+    text = _SIGNAL_PHONE_RE.sub(lambda m: _mask_phone(m.group(1)), text)
+    if "?" in text:
+        text = _redact_url_query_params(text)
     return text

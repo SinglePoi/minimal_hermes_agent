@@ -248,9 +248,13 @@ class AgentServer:
         message: str,
         emit_event,
         emit_token,
+        interrupt_event: threading.Event | None = None,
     ) -> str:
         """处理一条消息（SSE 流式）：思考/工具/召回事件实时经 emit_event 推送，
-        回复 token 经 emit_token 推送；返回最终回答文本。"""
+        回复 token 经 emit_token 推送；返回最终回答文本。
+
+        interrupt_event 供调用方在客户端断开时置位，中断本轮工具执行（对齐 Hermes interrupt）。
+        """
         events: list[dict[str, Any]] = []
         with state["lock"]:
             turn_count, turns_since_memory, persisted_count = minimal_agent.process_turn(
@@ -267,6 +271,7 @@ class AgentServer:
                 events,
                 sink=emit_event,
                 on_token=emit_token,
+                interrupt_event=interrupt_event,
             )
             state["turn_count"] = turn_count
             state["turns_since_memory"] = turns_since_memory
@@ -333,8 +338,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
-    def _sse(self, event: str, data: Any) -> None:
-        """写一条 SSE 帧（客户端断开时静默，不抛错）。"""
+    def _sse(self, event: str, data: Any) -> bool:
+        """写一条 SSE 帧；客户端断开返回 False（供中断信号使用），不抛错。"""
         try:
             body = (
                 f"event: {event}\n"
@@ -342,8 +347,9 @@ class _Handler(BaseHTTPRequestHandler):
             ).encode("utf-8")
             self.wfile.write(body)
             self.wfile.flush()
+            return True
         except Exception:
-            pass
+            return False
 
     def _read_body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
@@ -610,12 +616,24 @@ class _Handler(BaseHTTPRequestHandler):
             self._begin_sse()
             try:
                 state = self.server.app.get_session(session_id)
+                # 客户端断开（SSE 写失败）→ 置位中断信号，停止本轮工具执行
+                interrupt_event = threading.Event()
+
+                def emit_activity(ev: dict) -> None:
+                    if not self._sse("activity", ev):
+                        interrupt_event.set()
+
+                def emit_token(text: str) -> None:
+                    if not self._sse("token", {"text": text}):
+                        interrupt_event.set()
+
                 reply = self.server.app.handle_message_stream(
                     session_id,
                     state,
                     message,
-                    emit_event=lambda ev: self._sse("activity", ev),
-                    emit_token=lambda text: self._sse("token", {"text": text}),
+                    emit_event=emit_activity,
+                    emit_token=emit_token,
+                    interrupt_event=interrupt_event,
                 )
             except Exception as exc:
                 self._sse("error", {"error": str(exc)})

@@ -300,6 +300,27 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
       "Requesting summary"），失败退回占位消息；回复写回 messages 供 REPL/前端展示
     - 测试：tests/test_server.py 新增 turn budget 组（轮数上限 3 → 3 次工具循环+1 次收尾=4 次调用；
       token 预算 250/每轮 100 → 第 4 轮预检触顶收尾），全套 17 套通过
+32. **脱敏专项**（2026-08-07，对齐 Hermes `agent/redact.py`）：
+    - DB 连接串：`_DB_CONNSTR_RE` 打码 `scheme://user:pass@` 的密码；用户名用 `*` 支持空用户名
+      `redis://:pass@`（Hermes 要求 user: 前缀，骨架小扩展）
+    - 手机号：`_PHONE_CN_RE`（大陆 11 位，前后数字边界）+ `_SIGNAL_PHONE_RE`（E.164），
+      打码 `138****5678` / `+86****5678`
+    - URL 查询参数：`_SENSITIVE_QUERY_PARAMS` 精确匹配（token/api_key/code/access_token/
+      x-amz-signature 等），`token_count`/`session_id` 不误伤；Hermes 对 Web URL 默认关闭，
+      骨架为展示安全默认开启（无 OAuth 回跳）
+    - 全部接入 redact_sensitive_text 第 4 步管线，read_file/审批面板/工具展示自动生效；
+      tests/test_redact.py 新增专项组，全套 17 套通过
+33. **并行执行中断语义**（2026-08-07，对齐 Hermes `agent/tool_executor.py`）：
+    - `execute_tool_calls_segmented(..., interrupt_event)`：预置中断全跳过；并行段 0.2s 轮询
+      事件 → cancel pending future + 3s grace + `shutdown(wait=False)` 放弃卡住的线程；
+      未完成回填 `{"status": "cancelled"}`，结果顺序回填不破坏
+    - `run_agent_turn` / `process_turn` / `run_tool` / `run_terminal` 均新增 interrupt_event 透传；
+      每轮模型调用前检查，中断即"已中断"收尾
+    - terminal 中断：`_kill_process_tree`（Windows `taskkill /F /T`）——shell=True 时 ping 等是
+      cmd 孙进程，只 kill 父进程会因孙进程占管道让 communicate 卡死（实测复现后修复）
+    - 服务端 SSE：`_sse` 改为返回 bool，客户端断开（写帧失败）置位事件停止本轮（/chat/stream）
+    - 测试：test_tool_dispatch.py 新增 executor 中断组（预置/并行 pending 取消/顺序后续跳过）；
+      test_approval.py 新增 terminal 中断组（预置 + 运行中 kill）；全套 17 套通过
 
 ## 运行方式
 
@@ -401,6 +422,9 @@ python demo_file_tools.py
 - 回归测试脚本 `tests/test_approval.py` 新增 stdin 断言组（2026-08-07）：subprocess 必须带
   stdin=DEVNULL 且 timeout=120（防 Windows 交互式 date/time 卡死）；`tests/test_tool_dispatch.py`
   新增 get_current_time 组（格式/注册/白名单）
+- 回归测试脚本 `tests/test_tool_dispatch.py` 新增 executor 中断组（2026-08-07）：预置中断全跳过、
+  并行段已完成保留 + 阻塞中 cancelled、顺序段后续跳过；`tests/test_approval.py` 新增 terminal
+  中断组（预置 + 运行中 kill 整棵树，快速返回 cancelled）
 - 回归测试脚本 `tests/test_dashboard_auth.py`（新增，2026-08-07）：scrypt 哈希往返/错误/非法、
   HMAC 签名往返/篡改/过期/密钥不匹配、登录 正确/错误/未知用户/未启用；
   HTTP 全流程 302 跳登录、登录种 HttpOnly cookie、带 cookie 放行、/api/auth/me、
@@ -423,14 +447,15 @@ python demo_file_tools.py
 - 文件工具简化：patch 只做 replace 模式（无 V4A 补丁头/模糊匹配/语法检查），
   无陈旧检测/文件锁、无文档抽取；
   搜索仍跳过敏感文件（Hermes 也过滤敏感路径的搜索结果）
-- 并行执行的中断语义（Hermes executor 有，骨架简化掉了；turn 级 budget 已完成，见 31）
+- 并行执行中断语义已完成（见 33）；turn 级 budget 已完成（见 31）
 - 外部协议接入（候补，暂不做）：MCP（连外部工具/数据源，Hermes 有
   `hermes_cli/mcp_config.py` + `mcp_picker.py` + `optional-mcps/`）与 ACP
   （被 VS Code/Zed/JetBrains 等编辑器客户端调用，Hermes 有 `acp_adapter/` +
   `hermes acp` 子命令）；2026-08-07 用户确认写入候补、暂不实施
 - Skills 增强：prune/reinject 已完成；剩余前置条件检查、技能 hub 同步
   （Hermes 有，骨架简化掉了）
-- 脱敏简化：URL 查询参数（Hermes 默认关闭）、手机号、DB 连接串专项未做
+- 脱敏专项已完成（DB 连接串/手机号/URL 查询参数，见 32）；多外部 memory provider 同时挂
+  **有意不做**（2026-08-07 用户确认，与 Hermes 单外部 provider 设计一致）
 
 ## 下一阶段（前端 / 服务增强）
 
@@ -438,9 +463,9 @@ python demo_file_tools.py
   对齐 Hermes api_server 的 auth / DELETE / PATCH / fork）；联网能力已完成（见 29）
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
 - 文件工具增强：V4A patch 头/模糊匹配/语法检查、陈旧检测/文件锁、文档抽取
-- 并行执行的中断语义（Hermes executor 有；turn 级 budget 已完成，见 31）
+- 并行执行中断语义已完成（见 33）
 - Skills 增强：前置条件检查、技能 hub 同步
-- 脱敏专项：URL 查询参数、手机号、DB 连接串
+- 脱敏专项已完成（见 32）
 - 运维：服务化下的日志、进程守护（Hermes 用 systemd/gateway daemon）
 
 ## 给新会话的起始指令（可直接粘贴）

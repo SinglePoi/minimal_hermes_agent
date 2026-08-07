@@ -62,7 +62,7 @@
     三个工具已接入并行规划器的路径重叠检测（写同一文件排队、读写同路径顺序）
 13. **敏感文本脱敏**：`redact.py` 对齐 Hermes `agent/redact.py`——sk-/ghp_/glpat- 等
     前缀密钥、`KEY=value`、JSON/YAML 配置、Authorization 头、JWT、私钥块、URL
-    userinfo 全部打码；`read_file` 读敏感文件改为"打码后读取"（不可复用哨兵
+    userinfo、DB 连接串、手机号、URL 查询参数全部打码；`read_file` 读敏感文件改为"打码后读取"（不可复用哨兵
     `«redacted:sk-…»`，防模型把打码值写回文件），审批面板与工具参数展示同样打码
 14. **patch 工具**：`file_tools.py` 的 replace 模式（对齐 Hermes patch_tool）——
     在文件里找 `old_string` 换 `new_string`，比整文件重写省 token；old_string
@@ -206,6 +206,23 @@
       每轮模型调用前做预算预检，触顶即收尾
     - 收尾对齐 Hermes `handle_max_iterations`：不带工具再调一次模型，请求"基于已有信息给出
       最终回答、不要再调工具"，失败时退回占位消息；回复照常写回 messages 供前端展示
+28. **脱敏专项**（2026-08-07，对齐 Hermes `agent/redact.py`）：
+    - DB 连接串：`postgres://user:密码@host` 等只打码密码（支持空用户名 `redis://:pass@`，
+      为骨架扩展，Hermes 原正则要求 user: 前缀）
+    - 手机号：大陆 11 位（`138****5678`）与 E.164（`+86****5678`），前后数字边界防误伤日期/长串
+    - URL 查询参数：`token`/`api_key`/`code`/`access_token`/`x-amz-signature` 等敏感键值打码
+      （精确匹配，`token_count`/`session_id` 不误伤）；Hermes 对 Web URL 默认关闭此规则，
+      骨架为展示安全默认开启（无 OAuth 回跳链路）
+    - 全部接入同一 `redact_sensitive_text` 管线：read_file 打码、审批面板、工具参数/结果展示自动生效
+29. **并行执行中断语义**（2026-08-07，对齐 Hermes `agent/tool_executor.py`）：
+    - `execute_tool_calls_segmented(..., interrupt_event)`：预置中断 → 全部跳过并回填
+      `{"status": "cancelled"}`；并行段等待期间 0.2s 轮询事件 → 取消 pending future、
+      给运行中工具 3s 优雅退出（对齐 Hermes grace）、未完成回填 cancelled、顺序回填不破坏
+    - `run_agent_turn(..., interrupt_event)`：每轮模型调用前检查，中断即"已中断"收尾
+    - `terminal` 支持中断：事件置位立即杀进程树（Windows `taskkill /T`，修 shell=True 孙进程
+      占管道导致 communicate 卡死的问题），返回 cancelled
+    - 服务端 SSE：客户端断开（写帧失败）→ 置位中断事件，停止本轮（/chat/stream 生效；
+      一次性 /chat 无法感知客户端断开，保持现状）
 
 ## 你需要准备的
 
@@ -649,6 +666,8 @@ python minimal_agent.py
 | 会话 fork `POST /sessions/<id>/fork` | `gateway/platforms/api_server.py` 的 `_handle_fork_session`（简化：无 parent 血缘列） |
 | 联网 `web_search` / `web_fetch` | `plugins/web/`（tavily/searxng 等思路简化：必应 RSS 优先 + DuckDuckGo 兜底，urllib 零依赖无 key） |
 | 时间工具 `get_current_time` + `stdin=DEVNULL` | Hermes 无直接对应（骨架修复 Windows cmd 交互式 date/time 卡死问题） |
+| 脱敏专项（DB 连接串/手机号/URL 查询参数） | `agent/redact.py` 的 `_DB_CONNSTR_RE` / `_SIGNAL_PHONE_RE` / `_redact_url_query_params` |
+| 并行执行中断语义 | `agent/tool_executor.py`（interrupt 预检 + 等待轮询 + cancel + 3s grace + 进程树终止） |
 | turn 级预算 `MAX_AGENT_TURNS` / `TURN_TOKEN_BUDGET` | `agent/agent_init.py` 的 `max_iterations` / `agent/iteration_budget.py` + `chat_completion_helpers.py` 的 `handle_max_iterations` |
 | 危险命令审批 `approval.py` | `tools/approval.py`（DANGEROUS_PATTERNS、HARDLINE_PATTERNS、prompt_dangerous_approval） |
 | `terminal` 工具（先审批再执行） | `tools/terminal_tool.py`（check_all_command_guards + subprocess） |
@@ -679,7 +698,7 @@ prune/reinject、文件工具的跨 profile/陈旧检测/文档抽取、patch �
 - 联网能力已完成（web_search / web_fetch，零依赖 + SSRF 防护）
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
 - 文件工具增强：V4A patch 头/模糊匹配/语法检查、陈旧检测/文件锁、文档抽取
-- 并行执行的中断语义与 turn 级 budget 收尾（Hermes executor 有，骨架简化掉了）
+- 并行执行的中断语义已完成（见 29），turn 级 budget 已完成（见 27）
 - Skills 增强：前置条件检查、技能 hub 同步
-- 脱敏专项：URL 查询参数、手机号、DB 连接串
+- 脱敏专项已完成（URL 查询参数、手机号、DB 连接串，见 28）
 - 运维：服务化下的日志、进程守护

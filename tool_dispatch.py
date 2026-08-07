@@ -27,7 +27,7 @@
 import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -280,17 +280,61 @@ def _append_tool_result(tc: Any, messages: list[dict], content: str) -> None:
     })
 
 
+def _cancelled_result() -> str:
+    """中断时未执行工具的结果（对齐 Hermes executor 的 _cancelled_tool_result）。"""
+    return json.dumps(
+        {
+            "success": False,
+            "error": "Tool execution cancelled by user interrupt",
+            "status": "cancelled",
+        },
+        ensure_ascii=False,
+    )
+
+
 def _execute_parallel(
     calls: list[Any],
     messages: list[dict],
     run_one: Callable[[Any], str],
+    interrupt_event: Any = None,
 ) -> None:
-    """并发执行一段 parallel-safe 工具：线程池 + 结果按原顺序回填。"""
+    """并发执行一段 parallel-safe 工具：线程池 + 结果按原顺序回填；支持中断。
+
+    中断语义（对齐 Hermes executor）：
+    - 等待期间轮询 interrupt_event（0.2s 间隔）
+    - 置位后取消未启动的 future，给运行中的工具最多 3s 优雅退出
+    - 未完成/已取消的工具回填 {"status": "cancelled"}，不阻塞主流程
+    """
     max_workers = min(len(calls), MAX_TOOL_WORKERS)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        results = list(executor.map(lambda tc: _safe_run(tc, run_one), calls))
-    for tc, content in zip(calls, results):
-        _append_tool_result(tc, messages, content)
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    futures = {executor.submit(_safe_run, tc, run_one): tc for tc in calls}
+    pending = set(futures)
+    interrupted = False
+    while pending:
+        if interrupt_event is not None and interrupt_event.is_set():
+            interrupted = True
+            break
+        done, pending = wait(pending, timeout=0.2)
+    if interrupted:
+        for future in pending:
+            future.cancel()
+        # 给运行中的工具一个优雅退出窗口（对齐 Hermes 的 3s grace）
+        wait(pending, timeout=3.0)
+        # 放弃卡住的线程：不 join（wait=False），避免整个回合被拖死
+        executor.shutdown(wait=False)
+    else:
+        executor.shutdown(wait=True)
+    results: dict[int, str] = {}
+    for future, tc in futures.items():
+        if future.cancelled() or not future.done():
+            results[id(tc)] = _cancelled_result()
+        else:
+            try:
+                results[id(tc)] = future.result()
+            except Exception:
+                results[id(tc)] = "执行失败"
+    for tc in calls:
+        _append_tool_result(tc, messages, results.get(id(tc), _cancelled_result()))
 
 
 def execute_tool_calls_segmented(
@@ -299,16 +343,30 @@ def execute_tool_calls_segmented(
     run_one: Callable[[Any], str],
     *,
     on_segment: Optional[Callable[[str, list[Any]], None]] = None,
+    interrupt_event: Any = None,
 ) -> None:
     """按计划分段执行：parallel 并发、sequential 串行，结果按原始顺序回填。
 
     on_segment(kind, calls) 在每段执行前回调（用于 UI 提示，如"并行执行 N 个工具"）。
+    interrupt_event 置位时：未执行的调用跳过并回填 cancelled 结果，进行中的并行段
+    取消 pending future（对齐 Hermes 的 pre-flight 检查 + 等待轮询 + 3s 优雅退出）。
     """
+    if interrupt_event is not None and interrupt_event.is_set():
+        for tc in tool_calls:
+            _append_tool_result(tc, messages, _cancelled_result())
+        return
     for kind, calls in _plan_tool_batch_segments(tool_calls):
+        if interrupt_event is not None and interrupt_event.is_set():
+            for tc in calls:
+                _append_tool_result(tc, messages, _cancelled_result())
+            continue
         if on_segment is not None:
             on_segment(kind, calls)
         if kind == "parallel":
-            _execute_parallel(calls, messages, run_one)
+            _execute_parallel(calls, messages, run_one, interrupt_event)
         else:
             for tc in calls:
+                if interrupt_event is not None and interrupt_event.is_set():
+                    _append_tool_result(tc, messages, _cancelled_result())
+                    continue
                 _append_tool_result(tc, messages, _safe_run(tc, run_one))
