@@ -182,46 +182,163 @@ function appendMessage(role, text) {
   return div;
 }
 
-const ACTIVITY_ICONS = { think: "🤔", tool: "🛠️", skill: "📘", source: "🌐" };
-const ACTIVITY_LABELS = { think: "思考", tool: "调用工具", skill: "加载技能", source: "来源" };
 const activityById = {};
+// 当前助手轮的过程托盘：Codex 式——过程展开显示 + 已耗时计时，回答出来后收拢
+let currentTray = null;
+// 回合令牌：切换会话/新对话时自增，使在途旧轮次全部失效（防止跨会话泄漏）
+let turnToken = 0;
 
-function buildActivityDetail(ev) {
+function fmtElapsed(ms) {
+  return "已耗时 " + (ms / 1000).toFixed(1) + "s";
+}
+
+function trayDoneText(durationMs) {
+  const time = durationMs ? " · 耗时 " + (durationMs / 1000).toFixed(1) + "s" : "";
+  return "已处理" + time;
+}
+
+function beginActivityTray() {
+  const token = turnToken;
+  // 事件 id 每轮从 0 重新编号：清掉上一轮的映射，避免新活动更新到旧条目上
+  Object.keys(activityById).forEach((k) => delete activityById[k]);
+  const events = [];
+  const tray = document.createElement("div");
+  tray.className = "activity-tray";
+  const head = document.createElement("button");
+  head.type = "button";
+  head.className = "activity-tray-head";
+  const body = document.createElement("div");
+  body.className = "activity-tray-body";
+  tray.append(head, body);
+  const started = performance.now();
+  const renderHead = () => {
+    head.textContent = fmtElapsed(performance.now() - started);
+  };
+  head.addEventListener("click", () => {
+    tray.classList.toggle("collapsed");
+    renderHead();
+  });
+  const timer = setInterval(() => {
+    if (!tray.classList.contains("collapsed")) renderHead();
+  }, 500);
+  chatEl.appendChild(tray);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  const handle = { tray, body, events, head, timer, started, token };
+  currentTray = handle;
+  renderHead();
+  return handle;
+}
+
+function finalizeTray(tray) {
+  if (!tray) return;
+  clearInterval(tray.timer);
+  if (tray.events.length === 0) {
+    tray.tray.remove();  // 本轮没有活动，不显示空盒子
+  } else {
+    tray.tray.classList.add("collapsed");  // 最终回答出来后收拢成一行时间
+    tray.head.textContent = trayDoneText(performance.now() - tray.started);
+  }
+  if (currentTray === tray) currentTray = null;
+}
+
+function buildActivityText(ev) {
+  const type = ev.type || "tool";
+  if (type === "note") {
+    return ev.result || "";
+  }
+  if (type === "think") {
+    return ev.result || "思考";
+  }
+  // tool / skill / source：参数 + 结果（名称由条目头展示）
   const lines = [];
   if (ev.args) lines.push("参数：" + ev.args);
   if (ev.result) lines.push("结果：" + ev.result);
   return lines.join("\n");
 }
 
-function renderActivity(ev) {
-  const existing = ev.id !== undefined ? activityById[ev.id] : null;
-  if (existing) {
-    existing.detail.textContent = buildActivityDetail(ev);
-    return;
-  }
+function buildActivityItem(ev) {
   const type = ev.type || "tool";
-  const item = document.createElement("div");
-  item.className = "activity";
-
+  // 没有推理内容的思考不展示（空占位无意义）
+  if (type === "think" && !(ev.result || "").trim()) return null;
+  if (type === "think" || type === "note") {
+    const item = document.createElement("div");
+    item.className = "activity";
+    item.textContent = buildActivityText(ev);
+    return { item };
+  }
+  // tool / skill / source：各自独立展开/收起参数与结果
+  const wrap = document.createElement("div");
+  wrap.className = "activity activity-tool";
   const head = document.createElement("button");
   head.type = "button";
-  head.className = "activity-head";
-  head.textContent =
-    (ACTIVITY_ICONS[type] || "•") +
-    " " +
-    (ACTIVITY_LABELS[type] || type) +
-    "：" +
-    (ev.name || "");
-
+  head.className = "activity-tool-head";
   const detail = document.createElement("div");
-  detail.className = "activity-detail hidden";
-  detail.textContent = buildActivityDetail(ev);
-  head.addEventListener("click", () => detail.classList.toggle("hidden"));
+  detail.className = "activity-tool-detail hidden";  // 默认收拢
+  detail.textContent = buildActivityText(ev);
+  const render = () => {
+    const open = !detail.classList.contains("hidden");
+    head.textContent = (open ? "▾ " : "▸ ") + (ev.name || type);
+  };
+  head.addEventListener("click", () => {
+    detail.classList.toggle("hidden");
+    render();
+  });
+  wrap.append(head, detail);
+  render();
+  return { item: wrap, detail };
+}
 
-  item.append(head, detail);
-  chatEl.appendChild(item);
+function renderActivity(ev, tray) {
+  // 过期/跨会话事件直接丢弃：托盘令牌必须等于当前回合令牌
+  if (!tray || tray.token !== turnToken) return;
+  const existing = ev.id !== undefined ? activityById[ev.id] : null;
+  if (existing) {
+    if (existing.detail) {
+      existing.detail.textContent = buildActivityText(ev);
+    } else {
+      existing.item.textContent = buildActivityText(ev);
+    }
+    return;
+  }
+  const built = buildActivityItem(ev);
+  if (!built) return;  // 空思考等无内容事件不展示
+  tray.body.appendChild(built.item);
+  tray.events.push(ev);
   chatEl.scrollTop = chatEl.scrollHeight;
-  if (ev.id !== undefined) activityById[ev.id] = { head, detail };
+  if (ev.id !== undefined) {
+    activityById[ev.id] = { item: built.item, detail: built.detail || null };
+  }
+}
+
+function renderReplayTray(events) {
+  // 历史重放：还原成收拢状态的过程托盘（已耗时 Xs，点击展开）
+  if (!events || !events.length) return null;
+  const tray = document.createElement("div");
+  tray.className = "activity-tray collapsed";
+  const head = document.createElement("button");
+  head.type = "button";
+  head.className = "activity-tray-head";
+  const body = document.createElement("div");
+  body.className = "activity-tray-body";
+  tray.append(head, body);
+  const refresh = () => {
+    const collapsed = tray.classList.contains("collapsed");
+    const duration = events[0] && events[0].duration_ms;
+    head.textContent = collapsed
+      ? trayDoneText(duration)
+      : (duration ? fmtElapsed(duration) : "已处理");
+  };
+  head.addEventListener("click", () => {
+    tray.classList.toggle("collapsed");
+    refresh();
+  });
+  events.forEach((ev) => {
+    const built = buildActivityItem(ev);
+    if (built) body.appendChild(built.item);
+  });
+  refresh();
+  chatEl.appendChild(tray);
+  return tray;
 }
 
 function setThinking(on) {
@@ -769,6 +886,7 @@ async function refreshToolsList() {
 }
 
 async function switchSession(id, title) {
+  turnToken += 1;  // 在途旧轮次全部失效，防止跨会话泄漏
   if (state.inFlight && state.abort) {
     state.abort.abort();
   }
@@ -779,8 +897,9 @@ async function switchSession(id, title) {
   state.sessionId = id;
   state.sessionTitle = title || "会话";
   saveSession(id);
-  chatEl.querySelectorAll(".msg").forEach((el) => el.remove());
+  chatEl.querySelectorAll(".msg, .activity, .activity-tray").forEach((el) => el.remove());
   Object.keys(activityById).forEach((k) => delete activityById[k]);
+  currentTray = null;
 
   try {
     const data = await httpJson("GET", API.sessionsMessages(id));
@@ -789,9 +908,27 @@ async function switchSession(id, title) {
       showHome();
     } else {
       showThread();
+      // 过程事件按用户消息 id 分组：还原每轮的活动托盘（收拢态，可展开）
+      const eventsByMsg = {};
+      (data.events || []).forEach((ev) => {
+        if (ev.user_message_id === undefined || ev.user_message_id === null) return;
+        const k = ev.user_message_id;
+        (eventsByMsg[k] = eventsByMsg[k] || []).push(ev);
+      });
       messages.forEach((m) => {
+        // 旧数据里被误存的"轮次上限收尾"内部指令：不渲染成用户提问
+        if (
+          m.role === "user" &&
+          typeof m.content === "string" &&
+          m.content.startsWith("已经达到本轮执行上限")
+        ) {
+          return;
+        }
         if (m.role === "assistant" || m.role === "user") {
           appendMessage(m.role, m.content);
+        }
+        if (m.role === "user" && m.id !== undefined) {
+          renderReplayTray(eventsByMsg[m.id]);
         }
       });
     }
@@ -950,6 +1087,8 @@ async function sendStreaming(body, retried) {
   }
   if (!resp.ok || !resp.body) return false;
 
+  // 活动托盘先于消息创建：思考和工具调用显示在消息上方
+  const tray = beginActivityTray();
   const bubble = createAssistantBubble();
   setThinking(false);
   let replyText = "";
@@ -958,11 +1097,12 @@ async function sendStreaming(body, retried) {
     if (finalized) return;
     finalized = true;
     bubble.innerHTML = renderMarkdown(replyText || "(空回复)");
+    finalizeTray(tray);  // 思考完成 → 活动收拢成一行摘要
     chatEl.scrollTop = chatEl.scrollHeight;
   };
 
   await readSse(resp, {
-    activity: (ev) => renderActivity(ev),
+    activity: (ev) => renderActivity(ev, tray),
     token: (d) => {
       replyText += d.text || "";
       bubble.textContent = replyText;
@@ -989,6 +1129,7 @@ async function sendMessage() {
   const text = inputEl.value.trim();
   if (!text || state.inFlight) return;
 
+  const token = turnToken;  // 本轮令牌：切换会话后失效，过期结果直接丢弃
   inputEl.value = "";
   autoResize();
   state.sessionTitle = text;
@@ -1006,18 +1147,23 @@ async function sendMessage() {
 
   try {
     const streamed = await sendStreaming(body);
+    if (token !== turnToken) return;  // 会话已切换：丢弃旧轮结果
     if (!streamed) {
       // 旧服务器或流式不可用：回退到一次性 /chat
       const data = await httpJson("POST", API.chat, body);
+      if (token !== turnToken) return;
       if (data.session_id) {
         state.sessionId = data.session_id;
         saveSession(data.session_id);
       }
       setThinking(false);
-      (data.events || []).forEach(renderActivity);
+      const tray = beginActivityTray();  // 活动在消息上方，一次性返回后立即收拢
+      (data.events || []).forEach((ev) => renderActivity(ev, tray));
+      finalizeTray(tray);
       appendMessage("assistant", data.reply || "(空回复)");
     }
   } catch (e) {
+    if (token !== turnToken) return;  // 过期错误不展示
     if (!(state.abort && state.abort.signal.aborted)) {
       setThinking(false);
       appendMessage("error", "请求失败：" + e.message);
@@ -1038,6 +1184,7 @@ async function sendMessage() {
 }
 
 function newSession() {
+  turnToken += 1;  // 同上：新对话使在途旧轮次失效
   if (state.inFlight && state.abort) {
     state.abort.abort();
   }
@@ -1046,8 +1193,9 @@ function newSession() {
   state.queueCount = 0;
   state.pendingItem = null;
   saveSession("");
-  chatEl.querySelectorAll(".msg").forEach((el) => el.remove());
+  chatEl.querySelectorAll(".msg, .activity, .activity-tray").forEach((el) => el.remove());
   Object.keys(activityById).forEach((k) => delete activityById[k]);
+  currentTray = null;
   stopPolling();
   $("approval-overlay").classList.add("hidden");
   showHome();

@@ -35,6 +35,10 @@ skills/                     示例技能包：release-check（发版清单），
 file_tools.py               文件工具：read_file/write_file/search_files + patch（replace + V4A 双模式，
                             模糊匹配/陈旧检测/语法提示）+ 敏感路径保护（对齐 file_tools.py + patch_parser.py
                             + fuzzy_match.py）
+read_extract.py             文档抽取：.docx/.xlsx/.ipynb → 文本（zipfile+XML+JSON，零依赖，对齐
+                            tools/read_extract.py；read_file 自动接入）
+todo_tool.py                todo 工具：会话级内存任务清单 + 压缩重注入 + 历史水合
+                            （对齐 tools/todo_tool.py；含 TODO_SCHEMA / get_todo_store）
 redact.py                   敏感文本脱敏：前缀密钥/赋值/JSON/YAML/请求头/JWT/私钥/URL userinfo（对齐 redact.py）
 tirith.py                   内容级安全扫描：终端注入/隐形字符/同形字域名/管道到解释器（tirith 的 Python 简化版）
 demo_file_tools.py          文件工具可视化演示（离线，python demo_file_tools.py 直接跑）
@@ -44,6 +48,8 @@ tests/test_skills.py        Skills 回归测试（零依赖，python tests/test_
 tests/test_skills_preconditions.py Skills 前置条件回归测试（零依赖，直接跑）
 tests/test_file_tools.py    文件工具回归测试（零依赖，python tests/test_file_tools.py 直接跑）
 tests/test_redact.py        脱敏回归测试（零依赖，python tests/test_redact.py 直接跑）
+tests/test_read_extract.py  文档抽取回归测试（零依赖，python tests/test_read_extract.py 直接跑）
+tests/test_todo_tool.py     todo 工具回归测试（零依赖，python tests/test_todo_tool.py 直接跑）
 tests/test_approval_smart.py 审批增强回归测试（零依赖，python tests/test_approval_smart.py 直接跑）
 tests/test_memory_sync.py   记忆异步同步回归测试（零依赖，python tests/test_memory_sync.py 直接跑）
 tests/test_session_prompt.py 系统提示词持久化回归测试（零依赖，python tests/test_session_prompt.py 直接跑）
@@ -195,7 +201,29 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
       会话 ID 落 localStorage、可粘贴旧 ID 恢复、新对话按钮（侧栏 + 顶栏双入口）
     - 过程活动展示：run_agent_turn/process_turn 新增 events 参数，/chat 响应带
       events（tool/skill/source 三类，参数经 redact 脱敏、结果截断 300 字符），
-      前端在消息间渲染活动条目、点击展开详情；外部记忆召回也作为 source 事件
+      前端渲染成"活动托盘"放在助手消息上方（实时展开），回复完成后自动收拢成
+      一行摘要（▸ 🧠 思考 1 · 工具 2），点击展开/收起明细（2026-08-10 调整）；
+      外部记忆召回也作为 source 事件
+    - 事件持久化 + 重放还原（2026-08-10）：新增 events 表（session_id +
+      user_message_id + type/name/args/result），process_turn 每轮落库（REPL 也内部
+      收集）；persist_messages 返回本轮用户消息 rowid 供事件挂靠；
+      GET /sessions/<id>/messages 返回 events，前端重放历史时按 user_message_id
+      还原收拢态活动托盘；load_session_messages 补充 id 字段
+    - 旁白进托盘（方案 B，2026-08-10，对齐 Codex 交互）：中间轮（带 tool_calls）
+      的 assistant 旁白改为 **note 事件**（"过程说明"）进活动托盘并落库，
+      不再通过 on_token 流进消息气泡；只有最终回答（不带 tool_calls）才一次性
+      交给气泡——气泡只留最终回答，过程（思考/旁白/工具）全在可收拢的托盘里
+    - Codex 式托盘样式（2026-08-10）：过程中显示"已耗时 X.Xs"计时（500ms 刷新）、
+      过程条目直接展开（纯文本、无图标/无卡片、左侧细竖线分隔），最终回答出来后
+      自动收拢成一行"已处理 · 耗时 Xs"（无计数），点击展开/收起；**每个工具调用
+      条目独立展开/收起**参数与结果（▾/▸）；events 表补 duration_ms 列
+      （ALTER 迁移，process_turn 计时落库），重放托盘也能显示耗时
+      （2026-08-10 微调：工具条目默认收拢 ▸；无推理内容的思考不展示、不落库）
+    - 旁白去重（2026-08-10）：persist_messages 跳过带 tool_calls 的中间轮
+      assistant 消息——旁白只以 note 事件进托盘，不再落库成消息，历史回显
+      不再"托盘 + 消息"重复出现
+    - 轮次收尾内部指令（"已经达到本轮执行上限"）带 _finalize 标记：不落库、
+      前端跳过旧数据，避免伪装成用户提问（2026-08-10；已清理历史污染行 2 条）
     - 思考过程回显：每轮模型调用前发 think 事件（"第 N 轮思考"），若模型暴露
       reasoning_content（如 deepseek-reasoner）则附推理文本（截断 + 脱敏）；
       deepseek-chat 不返回推理内容，只显示轮次标签
@@ -368,6 +396,34 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     process_turn/run_agent_turn；Ctrl+C 打断本轮（回到输入提示继续对话）而非杀进程；
     中断后补"（已中断，本轮停止）"消息保持历史连贯；一次性模式中断即退出
     （对齐 Hermes interrupt 语义；服务端 SSE 早已接好，这是 REPL 收尾）
+37. **文档抽取**（2026-08-10，对齐 Hermes `tools/read_extract.py`）：
+    - 新模块 read_extract.py：.docx/.xlsx/.ipynb 转纯文本，全部标准库
+      （zipfile + XML + JSON），零第三方依赖；损坏文档抛 ExtractionError
+    - docx 按段落输出、w:tab→制表符、w:br/w:cr→换行；xlsx 按可见工作表输出
+      表格行（共享字符串/内联串/布尔/错误值，隐藏表跳过，5000 行 × 256 列上限）；
+      ipynb 按 markdown/code/raw 分节（raw 无编号），兼容 nbformat 3
+    - read_file_tool 自动接入：可抽取文档先抽取再分页（extracted_document=True，
+      offset/limit/READ_MAX_CHARS 照常生效）；抽取失败返回明确错误
+      （Hermes 回退到普通路径+二进制保护，骨架无二进制扩展名保护，直接给错误更安全）；
+      TOOLS 的 read_file 描述注明支持文档格式
+    - 测试：新增 tests/test_read_extract.py（5 组：扩展名/docx/xlsx/ipynb/read_file 集成），
+      全套 19 套通过
+38. **todo 工具（任务规划）**（2026-08-10，对齐 Hermes `tools/todo_tool.py`）：
+    - todo_tool.py：TodoStore（写入/读取/合并/校验/去重/内容截断/总数 256 封顶）、
+      todo_tool 入口（todos 字符串自动解析、非法输入报错、返回完整列表+状态统计）、
+      TODO_SCHEMA（行为引导写在 schema 描述里）；每会话一个 store（get_todo_store 注册表）
+    - 压缩重注入：context_compressor.compress_context 新增 todo_block 参数，
+      run_agent_turn 压缩时把未完成任务清单（format_for_injection，稳定头
+      TODO_INJECTION_HEADER，只含 pending/in_progress）追加进摘要块，任务跨压缩不丢
+    - 历史水合：hydrate_todo_store 倒序找最近 todo 工具结果，要求 tool_call_id 与
+      assistant 的 todo 调用配对（防伪造注入），结果 >512KB 跳过；main() --resume 与
+      server.get_session 恢复时调用
+    - 接入：TOOLS 注册 + run_tool 分发（session_key 定位 store）；tool_dispatch 的
+      _NEVER_PARALLEL_TOOLS 加入 todo（有状态写入不与只读工具并发）
+    - REPL 可视化：render_todo_lines 渲染清单行；模型每轮动过 todo 就打印
+      「📋 当前任务清单」面板，启动/恢复会话时也先展示已有清单（对齐"人工可盯进度"）
+    - 测试：新增 tests/test_todo_tool.py（7 组：store 基础/merge/注入格式/入口/注册表/
+      水合/接入含压缩重注入），全套 20 套通过
 
 ## 运行方式
 
@@ -399,7 +455,7 @@ python demo_file_tools.py
 ## 已验证的测试
 
 > 注：下面各测试文件记录的"条数"是当时统计，可能随用例增改漂移；
-> 以直接运行 `python tests/test_xxx.py` 的输出为准（当前共 18 套）。
+> 以直接运行 `python tests/test_xxx.py` 的输出为准（当前共 20 套）。
 
 - 多轮对话跨轮次回答、`--resume` 恢复
 - Qwen embedding 真调成功（1024 维）、向量召回 → 模型引用召回回答
@@ -498,6 +554,19 @@ python demo_file_tools.py
   （多操作/Move 自动建目录/校验失败零写入/纯上下文报错/多 hunk 已应用跳过）、
   安全（.. 穿越/敏感路径/Move 两端/绝对路径允许）、陈旧检测（外部修改拦截且不覆盖）；
   `tests/test_tool_dispatch.py` 新增 V4A 路径重叠组（patch+写同路径顺序、不同路径并行）
+- 回归测试脚本 `tests/test_read_extract.py`（新增，2026-08-10）：扩展名判定、docx
+  （段落/tab/br/空文档/损坏）、xlsx（共享字符串/内联串/布尔/隐藏表跳过/空表/损坏）、
+  ipynb（分节/nbformat3/无单元/坏 JSON）、read_file 集成（自动抽取标记/分页/损坏回退/
+  普通二进制仍拒绝）
+- 回归测试脚本 `tests/test_todo_tool.py`（新增，2026-08-10）：TodoStore 基础
+  （校验/去重/截断/封顶）、merge 模式、注入格式（稳定头/只含未完成）、工具入口
+  （字符串解析/非法输入/统计）、会话注册表、历史水合（配对/超限/伪造忽略）、
+  接入（TOOLS/run_tool/顺序屏障/压缩重注入）
+- 回归测试脚本 `tests/test_server.py` 新增事件持久化组（2026-08-10）：历史接口返回
+  events（think/tool 齐全、带 user_message_id、挂靠在用户消息 id 上）；
+  轮次收尾内部指令不落库（test_turn_budget 组）；新增旁白组
+  （test_chat_narration_as_note：中间轮旁白 → note 事件、最终回复不含旁白、
+  note 已落库、旁白不进历史消息——只在托盘）
 
 ## 已知限制 / 下一步候选
 
@@ -512,8 +581,8 @@ python demo_file_tools.py
   __pycache__/ 但对已跟踪文件无效），建议 `git rm --cached` 一次
 - ⚠️ `build/1.txt`（用户测试写文件工具的产物，内容"hello python / 肯德基疯狂星期四"）
   已被 git 跟踪，如不需要可 `git rm`（新会话先确认是否保留）
-- 文件工具简化：V4A 补丁/模糊匹配/语法提示/简化陈旧检测已完成（见 35），
-  仍无文件锁、跨 profile 检查、文档抽取；
+- 文件工具简化：V4A 补丁/模糊匹配/语法提示/简化陈旧检测（35）与文档抽取（37）已完成，
+  仍无文件锁、跨 profile 检查；
   搜索仍跳过敏感文件（Hermes 也过滤敏感路径的搜索结果）
 - 并行执行中断语义已完成（见 33）；turn 级 budget 已完成（见 31）
 - 外部协议接入（候补，暂不做）：MCP（连外部工具/数据源，Hermes 有
@@ -530,9 +599,11 @@ python demo_file_tools.py
 - 服务增强线全部完成：请求鉴权、操作审计、用户名密码登录、会话删除/标题/fork（见 25~28，
   对齐 Hermes api_server 的 auth / DELETE / PATCH / fork）；联网（29）、时间工具（30）、
   turn budget（31）、脱敏专项（32）、并行中断语义（33）、技能前置条件（34）、
-  V4A patch + 模糊匹配（35）、REPL 中断接线（36）均已完成
+  V4A patch + 模糊匹配（35）、REPL 中断接线（36）、文档抽取（37）、todo 工具（38）
+  均已完成
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
-- 文件工具剩余：文件锁、跨 profile 检查、文档抽取（V4A/模糊/语法提示/简化陈旧检测已完成）
+- 文件工具剩余：文件锁、跨 profile 检查（V4A/模糊/语法提示/简化陈旧检测/文档抽取已完成）
+- todo 已做；working_diff（工作区改动查看，130 行小件）可顺手补
 - Skills 剩余：技能 hub 同步
 - 运维：服务化下的日志、进程守护（Hermes 用 systemd/gateway daemon）
 - 中断接线：REPL Ctrl+C 已完成（36）；一次性 /chat 无法感知断连（保持现状）
@@ -543,10 +614,28 @@ python demo_file_tools.py
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里（2026-08-07）：服务增强线全部完成（鉴权/审计/登录/会话删除/标题/fork，
+> 我们上次停在这里（2026-08-10）：服务增强线全部完成（鉴权/审计/登录/会话删除/标题/fork，
   见 25~28）+ 联网（29）+ 时间工具（30）+ turn budget（31）+ 脱敏专项（32）+
   并行执行中断语义（33）+ Skills 前置条件检查（34）+ V4A patch/模糊匹配（35）+
-  REPL 中断接线（36）；全套 18 套回归通过；提交由用户手动进行（工作树含
+  REPL 中断接线（36）+ 文档抽取（37）+ todo 工具（38）；全套 20 套回归通过；
+  提交由用户手动进行（工作树含
   HANDOFF/README 与本次改动，待用户提交）。
-> 下一步候选：cron 审批 / 文件工具剩余（文件锁/文档抽取）/ Skills hub 同步 /
-  运维日志与进程守护。
+> 下一步候选：working_diff（130 行小件）/ cron 审批 / 文件工具剩余
+  （文件锁/跨 profile）/ 运维日志与进程守护。Skills hub 已明确暂不做。
+
+## 发版检查记录（2026-08-10，release-check 技能）
+
+按 `skills/release-check` 清单逐项核对，结果：
+1. DEEPSEEK_API_KEY 走环境变量/.env 注入（gitignore），未硬编码 ✓
+2. AGENTS.md 代码规范未改动（与 HEAD 一致）✓
+3. 回归：`tests/test_approval.py` + `tests/test_tool_dispatch.py` 全部通过 ✓
+4. `approval_allowlist.json` 已 gitignore，未误提交 ✓
+5. 冒烟：`python minimal_agent.py <问题>` 完整问答通过 ✓
+
+发版前发现并修复一个阻塞性 bug：**Windows 中文控制台（GBK/cp936）下 rich 渲染
+emoji（如「📖 已记住的信息」）抛 `UnicodeEncodeError`，`python minimal_agent.py`
+首屏直接崩溃**。修复：minimal_agent.py 在 `console = Console()` 前对 win32 的
+stdout/stderr 做 `reconfigure(encoding="utf-8")` 兜底（配套回归已重跑通过）。
+
+注：终端若仍显示乱码属控制台代码页显示问题（非程序异常）；如需可视化 emoji 输出，
+可在系统里 `chcp 65001` 切到 UTF-8 代码页。本记录供后续发版核对时参考。

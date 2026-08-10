@@ -37,7 +37,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -54,6 +54,13 @@ from tool_dispatch import (
 )
 from skills import build_skills_index, skills_list, skill_view
 import web_tools
+from todo_tool import (
+    TODO_SCHEMA,
+    get_todo_store,
+    hydrate_todo_store,
+    render_todo_lines,
+    todo_tool,
+)
 from file_tools import (
     patch_file_tool,
     read_file_tool,
@@ -97,6 +104,17 @@ def _env_int(name: str, default: int, min_value: int = 0) -> int:
 # - TURN_TOKEN_BUDGET：单次提问累计 prompt token 预算（0 = 不限制）
 MAX_AGENT_TURNS = _env_int("MAX_AGENT_TURNS", 5, 1)
 TURN_TOKEN_BUDGET = _env_int("TURN_TOKEN_BUDGET", 0, 0)
+
+# Windows 下控制台默认 GBK/cp936，rich 渲染 emoji 等 UTF-8 字符会抛
+# UnicodeEncodeError（'gbk' codec can't encode）崩溃；启动早期强制 stdout/stderr
+# 走 UTF-8，避免发版冒烟与日常 REPL 在中文控制台直接炸。
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        # 非文本流或旧版本 Python 无 reconfigure，交给 rich 的 legacy 渲染兜底
+        pass
 
 console = Console()
 
@@ -305,7 +323,7 @@ def load_context_files() -> str:
 
 
 def _db_conn() -> sqlite3.Connection:
-    """打开会话数据库并建表（messages + FTS5 全文索引 + sessions 系统提示词）。"""
+    """打开会话数据库并建表（messages + FTS5 全文索引 + sessions 系统提示词 + events）。"""
     conn = sqlite3.connect(SESSION_DB)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS messages ("
@@ -324,6 +342,27 @@ def _db_conn() -> sqlite3.Connection:
         "system_prompt TEXT NOT NULL,"
         "updated_at TEXT DEFAULT (datetime('now')))"
     )
+    # 过程事件表（思考/工具/技能/来源）：对话进行时实时展示 + 落库，切换会话后
+    # 按 user_message_id 分组还原活动托盘（挂在对应用户消息之后）
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "session_id TEXT NOT NULL,"
+        "user_message_id INTEGER NOT NULL,"
+        "type TEXT NOT NULL,"
+        "name TEXT NOT NULL DEFAULT '',"
+        "args TEXT NOT NULL DEFAULT '',"
+        "result TEXT NOT NULL DEFAULT '',"
+        "created_at TEXT DEFAULT (datetime('now')))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_session ON events (session_id, user_message_id)"
+    )
+    # 每轮耗时（毫秒）：events 表迁移补列，供前端"已耗时 Xs"展示
+    ev_cols = [r[1] for r in conn.execute("PRAGMA table_info(events)")]
+    if "duration_ms" not in ev_cols:
+        conn.execute("ALTER TABLE events ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
     # 归档标记（对齐 Hermes sessions.archived）：软标记，不删数据；
     # 旧库首次访问时补列迁移
     cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
@@ -543,19 +582,28 @@ def _search_tokens(text: str) -> list[str]:
 
 def persist_messages(
     session_id: str, messages: list[dict[str, Any]], start: int = 0
-) -> None:
+) -> Optional[int]:
     """把（新增的）消息写入会话库。
 
     对齐 Hermes：只索引 user/assistant 角色（默认 role 过滤），
     搜索文本用 bigram 预分词后进 FTS5；start 用于多轮对话增量落库，
     避免每一轮都把整段历史重复写入。
+    返回本轮最后一条用户消息的 rowid（供过程事件挂靠）；无则返回 None。
     """
     conn = _db_conn()
+    last_user_id: Optional[int] = None
     try:
         for msg in messages[start:]:
             role = msg.get("role")
             content = msg.get("content")
+            # 内部指令（如轮次收尾的"已达上限"）不落库，避免重放时伪装成用户提问
+            if msg.get("_finalize"):
+                continue
             if role not in ("user", "assistant") or not content:
+                continue
+            # 中间轮旁白（带 tool_calls 的 assistant 消息）属于"过程"：落库跳过，
+            # 重放时只通过 events 托盘展示，避免在消息区重复出现
+            if role == "assistant" and msg.get("tool_calls"):
                 continue
             if isinstance(content, list):  # 多模态 content 只取文本块
                 content = " ".join(
@@ -575,6 +623,8 @@ def persist_messages(
                 "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
                 (session_id, role, content),
             )
+            if role == "user":
+                last_user_id = int(cur.lastrowid)
             conn.execute(
                 "INSERT INTO messages_fts (rowid, search_text) VALUES (?, ?)",
                 (cur.lastrowid, " ".join(_search_tokens(content))),
@@ -592,6 +642,7 @@ def persist_messages(
                             (auto_title, session_id),
                         )
         conn.commit()
+        return last_user_id
     finally:
         conn.close()
 
@@ -682,16 +733,78 @@ def load_session_messages(session_id: str) -> list[dict[str, Any]]:
     conn = _db_conn()
     try:
         rows = conn.execute(
-            "SELECT role, content, created_at FROM messages "
+            "SELECT id, role, content, created_at FROM messages "
             "WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
         return [
-            {"role": r[0], "content": r[1], "created_at": r[2] or ""}
+            {"id": r[0], "role": r[1], "content": r[2], "created_at": r[3] or ""}
             for r in rows
         ]
     finally:
         conn.close()
+
+
+def persist_events(
+    session_id: str,
+    user_message_id: Optional[int],
+    events: list[dict[str, Any]],
+    duration_ms: int = 0,
+) -> None:
+    """把一轮的过程事件（思考/工具/技能/来源）写入 events 表。
+
+    实时事件只在对话进行时展示，落库后切换会话可按 user_message_id 分组还原活动托盘；
+    只存展示所需字段（type/name/args/result + duration_ms 本轮耗时），单字段截断防膨胀。
+    """
+    if not events or not user_message_id:
+        return
+    conn = _db_conn()
+    try:
+        for ev in events:
+            # 无推理内容的思考事件不落库（前端同样不展示）
+            if ev.get("type") == "think" and not str(ev.get("result") or "").strip():
+                continue
+            conn.execute(
+                "INSERT INTO events "
+                "(session_id, user_message_id, type, name, args, result, duration_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    int(user_message_id),
+                    str(ev.get("type") or "tool")[:32],
+                    str(ev.get("name") or "")[:200],
+                    str(ev.get("args") or "")[:2000],
+                    str(ev.get("result") or "")[:2000],
+                    int(duration_ms),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_session_events(session_id: str) -> list[dict[str, Any]]:
+    """读取会话的过程事件（按 user_message_id, id 排序），供前端还原活动托盘。"""
+    conn = _db_conn()
+    try:
+        rows = conn.execute(
+            "SELECT user_message_id, type, name, args, result, duration_ms FROM events "
+            "WHERE session_id=? ORDER BY user_message_id, id",
+            (session_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "user_message_id": r[0],
+            "type": r[1],
+            "name": r[2],
+            "args": r[3],
+            "result": r[4],
+            "duration_ms": r[5],
+        }
+        for r in rows
+    ]
 
 
 def search_messages_db(query: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -1053,6 +1166,7 @@ TOOLS = [
             "name": "read_file",
             "description": (
                 "分页读取文本文件（带行号）。敏感文件（.env、密钥、系统配置等）会拒绝读取。"
+                ".docx / .xlsx / .ipynb 文档会自动抽取成文本再分页返回。"
                 "参数 path 是文件路径，offset 起始行（默认 1），limit 每页行数（默认 200）。"
             ),
             "parameters": {
@@ -1161,6 +1275,10 @@ TOOLS = [
                 "required": ["url"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": TODO_SCHEMA,
     },
 ]
 
@@ -1428,6 +1546,13 @@ def run_tool(
             url=args.get("url", ""),
             max_chars=int(args.get("max_chars", 4000) or 4000),
         )
+    if name == "todo":
+        # 会话级内存任务清单（对齐 Hermes：每个会话一个 TodoStore）
+        return todo_tool(
+            todos=args.get("todos"),
+            merge=bool(args.get("merge", False)),
+            store=get_todo_store(session_key),
+        )
     if manager is not None and manager.has_tool(name):
         # 外部 provider 自带工具（如 keyword 的 memory_search）
         return manager.handle_tool_call(name, args)
@@ -1511,10 +1636,13 @@ def _finalize_turn_summary(
     handle_max_iterations 的"Requesting summary"行为）。
 
     不带工具再调一次模型（工具被禁用，防止无限递归）；失败时退回占位消息。
+    内部指令消息带 `_finalize` 标记：落库时跳过、前端重放时跳过，避免被当成
+    用户提问展示（Hermes 同样用 user 角色追加，但骨架补了持久化/展示隔离）。
     """
     messages.append(
         {
             "role": "user",
+            "_finalize": True,
             "content": (
                 "已经达到本轮执行上限（轮数或 token 预算）。"
                 "请基于已有信息直接给出最终回答，不要再调用任何工具。"
@@ -1577,7 +1705,9 @@ def run_agent_turn(
             # 同步提取落库——原文马上要被摘要掉，先抢救信息
             if manager:
                 manager.commit_memory_session(messages, client=client)
-            compressed = compress_context(client, messages)
+            # 对齐 Hermes：压缩时把未完成的任务清单随摘要一起保留（todo 重注入）
+            todo_block = get_todo_store(session_key).format_for_injection() or ""
+            compressed = compress_context(client, messages, todo_block=todo_block)
             if compressed is not messages:
                 messages[:] = compressed
                 console.print("[dim]🗜️ 上下文已压缩：中间轮次 → 摘要[/dim]")
@@ -1601,9 +1731,9 @@ def run_agent_turn(
             },
         )
         if on_token is not None:
-            msg, prompt_tokens = call_llm_stream(
-                client, messages, tools, on_token=on_token
-            )
+            # 方案 B（对齐 Codex 交互）：流式也先不把 token 推给气泡——中间轮的
+            # 旁白属于"过程"，走 note 事件进活动托盘；只有最终回答才一次性交给气泡
+            msg, prompt_tokens = call_llm_stream(client, messages, tools)
         else:
             msg, prompt_tokens = call_llm(client, messages, tools)
         api_call_count += 1
@@ -1616,7 +1746,20 @@ def run_agent_turn(
             if sink is not None:
                 sink(dict(think_event))
 
+        content = msg.content or ""
         if msg.tool_calls:
+            # 中间轮：旁白作为"过程说明"（note）事件进托盘，不展示成消息气泡
+            if content.strip():
+                _record_event(
+                    events,
+                    sink,
+                    {
+                        "type": "note",
+                        "name": "过程说明",
+                        "args": "",
+                        "result": redact_sensitive_text(content[:1000], force=True),
+                    },
+                )
             # 模型要求调用工具：先把 assistant 消息（含 tool_calls）放回历史
             messages.append(msg.model_dump(exclude_none=True))
             tool_calls = list(msg.tool_calls)
@@ -1682,6 +1825,18 @@ def run_agent_turn(
             for tool_msg in messages[tool_start:]:
                 console.print(f"  [green]📦 工具返回：[/green]{tool_msg['content']}")
 
+            # todo 可视化：本轮动过任务清单就打印当前面板，方便人工跟踪进度
+            if any(tool_name(tc) == "todo" for tc in tool_calls):
+                todo_lines = render_todo_lines(get_todo_store(session_key))
+                if todo_lines:
+                    console.print(
+                        Panel(
+                            "\n".join(todo_lines),
+                            title="📋 当前任务清单",
+                            border_style="cyan",
+                        )
+                    )
+
             # 按原始顺序把工具结果回填进事件（结果截断 + 脱敏），并实时回调 sink
             for ev, tool_msg in zip(call_events, messages[tool_start:]):
                 result = tool_msg.get("content", "") or ""
@@ -1691,10 +1846,12 @@ def run_agent_turn(
 
             continue  # 回到循环开头，把结果再发给大模型
 
-        # 模型直接给了文字回答 → 写回历史并输出
-        messages.append({"role": "assistant", "content": msg.content or ""})
+        # 模型直接给了文字回答 → 流式下一次性把内容交给气泡，写回历史并输出
+        if on_token is not None and content:
+            on_token(content)
+        messages.append({"role": "assistant", "content": content})
         console.print()
-        console.print(Panel(msg.content or "", title="🤖 助手", border_style="green"))
+        console.print(Panel(content, title="🤖 助手", border_style="green"))
         return
 
     console.print(f"\n[yellow]（达到最大轮数 {max_turns}，请求模型收尾）[/yellow]")
@@ -1764,6 +1921,10 @@ def process_turn(
     返回 (turn_count, turns_since_memory, persisted_count) 供调用方续接状态。
     """
     turn_count += 1
+    turn_started = time.monotonic()
+    # REPL 不传 events：内部收集一份，供本轮活动事件落库（前端重放还原托盘）
+    if events is None:
+        events = []
 
     # 每轮 prefetch：外部 provider 按当前问题召回（对齐 Hermes 每轮 prefetch_all）
     user_content = user_input
@@ -1800,8 +1961,11 @@ def process_turn(
     )
 
     # 增量落库（对齐 Hermes：消息逐轮写入 SessionDB，中途退出也不丢）
-    persist_messages(session_id, messages, start=persisted_count)
+    user_message_id = persist_messages(session_id, messages, start=persisted_count)
     persisted_count = len(messages)
+    # 过程事件落库：挂在本轮用户消息 id 下，切换会话后可还原活动托盘
+    duration_ms = int((time.monotonic() - turn_started) * 1000)
+    persist_events(session_id, user_message_id, events, duration_ms)
 
     # 同步本轮对话给外部 provider（对齐 Hermes 的 sync_all）
     if manager:
@@ -1877,6 +2041,8 @@ def main():
         if history:
             console.print(f"[dim]↩️ 已恢复会话 {session_id}（{len(history)} 条历史消息）[/dim]")
             messages = history
+            # 恢复会话时水合 todo 清单（对齐 Hermes _hydrate_todo_store）
+            hydrate_todo_store(messages, session_id)
         else:
             console.print(f"[yellow]⚠️ 未找到会话 {session_id}，将创建新会话[/yellow]")
 
@@ -1901,6 +2067,13 @@ def main():
         if resume_id
         else 0
     )
+
+    # 启动展示：会话已有未完成任务清单（恢复会话水合后）就打印，方便人工接手
+    todo_lines = render_todo_lines(get_todo_store(session_id))
+    if todo_lines:
+        console.print(
+            Panel("\n".join(todo_lines), title="📋 当前任务清单", border_style="cyan")
+        )
 
     turn_count = 0
     while True:

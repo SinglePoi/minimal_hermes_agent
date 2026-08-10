@@ -566,6 +566,68 @@ def test_chat_events_tool_call() -> None:
         ev = next(e for e in tool_evs if e.get("name") == "terminal")
         check("工具事件含参数", "echo hello" in ev.get("args", ""))
         check("工具事件含结果", "hello" in ev.get("result", ""))
+
+        # 过程事件落库：历史接口按 user_message_id 返回，可还原活动托盘
+        history = http_json("GET", f"{fx.base}/sessions/sess-ev/messages")
+        hist_msgs = history.get("messages", [])
+        hist_evs = history.get("events", [])
+        check("历史消息带 id（供事件挂靠）",
+              any(m.get("role") == "user" and m.get("id") for m in hist_msgs))
+        check("历史接口返回过程事件", len(hist_evs) >= 2)
+        check("事件带 user_message_id",
+              all("user_message_id" in e for e in hist_evs))
+        check("事件带 duration_ms（已耗时展示）",
+              all("duration_ms" in e for e in hist_evs))
+        user_ids = {m["id"] for m in hist_msgs if m.get("role") == "user"}
+        check("事件挂靠在用户消息 id 上",
+              all(e["user_message_id"] in user_ids for e in hist_evs))
+        check("历史事件含思考与工具",
+              any(e["type"] == "think" for e in hist_evs)
+              and any(e["type"] == "tool" and e.get("name") == "terminal" for e in hist_evs))
+    finally:
+        fx.close()
+
+
+def test_chat_narration_as_note() -> None:
+    """方案 B：中间轮旁白作为 note 事件进托盘，不进入最终回复/消息气泡。"""
+    tc = SimpleNamespace(
+        id="call_note",
+        type="function",
+        function=SimpleNamespace(
+            name="read_file", arguments='{"path":"README.md"}'
+        ),
+    )
+    seq = SequenceClient(
+        [
+            ToolFakeMessage("让我查看一下目录结构来了解布局", [tc]),
+            ToolFakeMessage("目录结构如下：……", None),
+        ]
+    )
+    fx = ServerFixture(client=seq)
+    try:
+        data = http_json(
+            "POST", f"{fx.base}/chat",
+            {"message": "看看仓库结构", "session_id": "sess-note"},
+        )
+        check("旁白轮后返回最终回答", data.get("reply") == "目录结构如下：……")
+        check("最终回复不含旁白", "让我查看一下目录结构" not in (data.get("reply") or ""))
+        events = data.get("events", [])
+        note_evs = [e for e in events if e.get("type") == "note"]
+        check("包含 note 事件", len(note_evs) >= 1)
+        check("note 事件内容为旁白",
+              any("让我查看一下目录结构" in e.get("result", "") for e in note_evs))
+        check("note 事件在工具事件之前",
+              events.index(note_evs[0])
+              < events.index(next(e for e in events if e.get("type") == "tool")))
+
+        history = http_json("GET", f"{fx.base}/sessions/sess-note/messages")
+        hist_evs = history.get("events", [])
+        check("note 事件已落库",
+              any(e["type"] == "note" and "让我查看一下目录结构" in e["result"] for e in hist_evs))
+        hist_msgs = history.get("messages", [])
+        check("旁白不进历史消息（只在托盘）",
+              all("让我查看一下目录结构" not in (m.get("content") or "")
+                  for m in hist_msgs))
     finally:
         fx.close()
 
@@ -963,6 +1025,14 @@ def test_turn_budget() -> None:
             )
             check("轮数上限收尾回复", reply.get("reply") == "收尾完成")
             check("轮数上限调用次数=4", fx.app.client.calls == 4)
+            history = http_json(
+                "GET", f"{fx.base}/sessions/sess-budget-turns/messages"
+            )
+            leaked = any(
+                m.get("role") == "user" and "已经达到本轮执行上限" in (m.get("content") or "")
+                for m in (history.get("messages") or [])
+            )
+            check("收尾内部指令不落库（不伪装成用户提问）", not leaked)
         finally:
             fx.close()
 
@@ -996,6 +1066,7 @@ def main() -> None:
         test_skills_and_plugins_endpoints,
         test_tools_endpoint,
         test_chat_events_tool_call,
+        test_chat_narration_as_note,
         test_chat_stream_sse,
         test_auth_and_audit,
         test_delete_session_endpoint,

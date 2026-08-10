@@ -34,8 +34,9 @@ from typing import Any, Callable, Optional
 # 对齐 Hermes run_agent._MAX_TOOL_WORKERS
 MAX_TOOL_WORKERS = 8
 
-# 永远不并行的工具（Hermes 有 {"clarify"}；骨架暂无交互工具，保留空集占位）
-_NEVER_PARALLEL_TOOLS = frozenset()
+# 永远不并行的工具（对齐 Hermes：todo 是会话级有状态写入，与其他工具并行
+# 会竞争同一份清单；Hermes 的 {"clarify"} 等交互工具同理）
+_NEVER_PARALLEL_TOOLS = frozenset({"todo"})
 
 # 只读、无共享可变状态的工具 → 可并行
 _PARALLEL_SAFE_TOOLS = frozenset({

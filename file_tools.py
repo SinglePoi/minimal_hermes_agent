@@ -6,6 +6,8 @@
     - read_file(path, offset, limit)   分页 + 行号 + 字符预算截断
     - write_file(path, content)        先过敏感路径检查再写入
     - search_files(path, pattern)      递归搜索文件名/内容（跳过敏感文件）
+    - patch(path, ...)                 局部替换 / V4A 批量补丁
+    - read_file 对 .docx/.xlsx/.ipynb 自动走 read_extract 抽取成文本
 
 安全设计（对齐 Hermes 的"配对门"思路）：
     - 终端侧写文件由 approval.py 拦（rm/tee/重定向到 .env 等）
@@ -33,6 +35,7 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from redact import redact_sensitive_text
+from read_extract import ExtractionError, extract_document_text, is_extractable_document
 
 # 读取字符预算（对齐 Hermes 的默认读取上限）
 READ_MAX_CHARS = 20_000
@@ -130,12 +133,62 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 200) -> str:
     offset/limit 与 Hermes 一致（从第 1 行开始，每页默认 200 行）；
     内容超过 READ_MAX_CHARS 时截断并返回 hint。敏感内容（密钥/令牌）读取时
     自动打码（file_read 哨兵，防模型把打码值写回文件，对齐 Hermes）。
+    .docx / .xlsx / .ipynb 文档自动经 read_extract 抽取成文本后再分页
+    （返回带 extracted_document=True；抽取失败给明确错误，不回退成乱码）。
     """
     offset = max(1, int(offset or 1))
     limit = max(1, min(int(limit or 200), 2000))
     resolved = _normalize_path(path)
     if not resolved.is_file():
         return _error(f"文件不存在：{path}")
+
+    # 结构化文档抽取：先于二进制判定，.docx/.xlsx/.ipynb 渲染成文本
+    # （对齐 Hermes read_file_tool：is_extractable_document → extract_document_text）
+    if is_extractable_document(str(resolved)):
+        try:
+            content = extract_document_text(str(resolved))
+        except ExtractionError as exc:
+            return _error(f"文档抽取失败：{exc}")
+        content = redact_sensitive_text(content, file_read=True) or ""
+        lines = content.splitlines()
+        total_lines = len(lines)
+        end_line = offset + limit - 1
+        page_lines = lines[offset - 1:end_line]
+        numbered = [
+            f"{offset + i:>6} │ {line}"
+            for i, line in enumerate(page_lines)
+        ]
+        page_text = "\n".join(numbered)
+        truncated = total_lines > end_line
+
+        hint = ""
+        if len(page_text) > READ_MAX_CHARS:
+            trimmed = page_text[:READ_MAX_CHARS]
+            cut = trimmed.rfind("\n")
+            if cut > 0:
+                page_text = trimmed[:cut]
+            truncated = True
+            hint = (
+                f"输出超出 {READ_MAX_CHARS:,} 字符读取预算，已截断。"
+                "可用 offset 继续分段读取。"
+            )
+        elif truncated:
+            hint = (
+                f"文件共 {total_lines} 行，当前显示 {offset}-{min(end_line, total_lines)} 行。"
+                f"用 offset={end_line + 1} 继续读取。"
+            )
+
+        result: dict[str, Any] = {
+            "success": True,
+            "path": str(resolved),
+            "content": page_text,
+            "total_lines": total_lines,
+            "truncated": truncated,
+            "extracted_document": True,
+        }
+        if hint:
+            result["hint"] = hint
+        return json.dumps(result, ensure_ascii=False)
 
     content, err = _read_text(resolved)
     if err:

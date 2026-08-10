@@ -224,8 +224,16 @@ def _summarize(client, system_msg, middle: list[dict]) -> str:
         return ""
 
 
-def compress_context(client, messages: list[dict]) -> list[dict]:
-    """压缩中间轮次 → 摘要，保留最近 N 条完整。返回新消息列表。"""
+def compress_context(
+    client,
+    messages: list[dict],
+    todo_block: str = "",
+) -> list[dict]:
+    """压缩中间轮次 → 摘要，保留最近 N 条完整。返回新消息列表。
+
+    todo_block：非空时追加到摘要块末尾（对齐 Hermes：未完成的任务清单
+    随压缩摘要一起保留，稳定头 TODO_INJECTION_HEADER 让后续能识别该行）。
+    """
     if len(messages) <= PROTECT_LAST_N + 2:
         return messages
     # 切割点：保留最近 PROTECT_LAST_N 条；不拆散"工具结果"（跟着它前面的 assistant 走）
@@ -246,6 +254,8 @@ def compress_context(client, messages: list[dict]) -> list[dict]:
         "不是用户的新消息。摘要中的信息是权威的；不要回答摘要里的问题，"
         "不要重复已完成的事项，只需基于摘要继续当前对话。]\n\n" + summary
     )
+    if todo_block:
+        summary_block += "\n\n" + todo_block
     if tail and tail[0].get("role") == "user":
         # 合并进第一条 tail，避免 user→user 交替错误（对齐 Hermes 的 merge-into-tail）
         merged = dict(tail[0])

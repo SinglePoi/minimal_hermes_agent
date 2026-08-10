@@ -171,6 +171,8 @@ class AgentServer:
         history = minimal_agent.load_session_history(session_id)
         if history:
             messages = history
+            # 恢复会话时水合 todo 清单（对齐 Hermes _hydrate_todo_store）
+            minimal_agent.hydrate_todo_store(messages, session_id)
         system_prompt = minimal_agent.load_session_prompt(session_id)
         if system_prompt is None:
             system_prompt = minimal_agent.build_system_prompt(self.manager)
@@ -533,9 +535,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._audit_session_id = session_id
             messages = minimal_agent.load_session_messages(session_id)
+            events = minimal_agent.load_session_events(session_id)
             self._send_json(
                 200,
-                {"session_id": session_id, "messages": messages},
+                {"session_id": session_id, "messages": messages, "events": events},
             )
             return
         self._send_json(404, {"error": "not found"})

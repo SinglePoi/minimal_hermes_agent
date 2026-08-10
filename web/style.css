@@ -532,43 +532,77 @@ html, body {
   75% { content: "..."; }
 }
 
-/* 过程活动（工具调用 / 技能加载 / 第三方来源） */
-.activity {
+/* 过程托盘：Codex 式——过程展开显示 + 已耗时计时，回答出来后收拢成一行时间 */
+.activity-tray {
   align-self: flex-start;
   max-width: 90%;
-  margin: 2px 0;
+  margin: 2px 0 8px;
 }
 
-.activity-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.35);
+.activity-tray-head {
+  border: none;
+  background: none;
+  padding: 2px 0;
   color: var(--muted);
   font-size: 12px;
   font-family: inherit;
-  padding: 4px 10px;
   cursor: pointer;
+  text-align: left;
 }
 
-.activity-head:hover {
+.activity-tray-head:hover {
   color: var(--text);
-  border-color: var(--line);
+  text-decoration: underline;
 }
 
-.activity-detail {
-  margin-top: 4px;
-  padding: 8px 10px;
-  border-left: 2px solid var(--line);
-  background: rgba(255, 255, 255, 0.25);
-  border-radius: 0 8px 8px 0;
-  font-size: 12px;
+.activity-tray-body {
+  margin: 4px 0;
+}
+
+.activity-tray.collapsed .activity-tray-body {
+  display: none;
+}
+
+/* 单条过程：纯文本展开，无图标、无卡片 */
+.activity {
+  margin: 3px 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--line-soft);
   color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-all;
-  font-family: Consolas, "Courier New", monospace;
+}
+
+/* 工具调用条目：各自独立展开/收起 */
+.activity-tool-head {
+  border: none;
+  background: none;
+  padding: 1px 0;
+  color: var(--text);
+  font-size: 12.5px;
+  font-family: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.activity-tool-head:hover {
+  text-decoration: underline;
+}
+
+.activity-tool-detail {
+  margin: 2px 0 4px;
+  padding-left: 8px;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.activity-tool-detail.hidden {
+  display: none;
 }
 
 /* 输入区（毛玻璃） */

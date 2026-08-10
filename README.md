@@ -116,8 +116,15 @@
       斜体/列表，先转义再包标签防 XSS）、建议卡片一键发送、会话 ID 自动生成并
       持久化到 localStorage、可粘贴旧会话 ID 恢复、新对话按钮
     - 过程活动展示：`POST /chat` 响应带 `events`（工具调用/技能加载/外部记忆召回，
-      参数脱敏、结果截断），会话界面在用户消息与助手回复之间渲染活动条目，
-      点击可展开参数与结果
+      参数脱敏、结果截断），会话界面把思考/工具调用渲染成"活动托盘"放在助手
+      消息**上方**：Codex 式交互——过程中显示"已耗时 X.Xs"计时、过程条目
+      直接展开（纯文本，无图标/无卡片；**每个工具调用可独立展开/收起**参数与结果），
+      最终回答出来后自动**收拢**成一行"已处理 · 耗时 X.Xs"，点击可展开/收起；
+      工具调用条目默认收拢（▸），无推理内容的思考不显示；
+      过程事件会**落库**（events 表，挂在本轮用户消息 id 下），切换会话重放历史时
+      按轮次还原成收拢状态的活动托盘（含 duration_ms 耗时）；**中间轮的旁白也作为
+      note 事件进托盘**且不再落库为 assistant 消息——气泡与历史消息都只保留
+      最终回答，过程全在托盘（对齐 Codex 交互）
     - SSE 流式：`POST /chat/stream` 以 text/event-stream 实时推送
       activity（思考/工具/技能/来源）/ token（回复增量）/ message / error / done；
       前端优先走流式（思考与工具事件边发生边显示、回复逐 token 上屏），
@@ -262,6 +269,26 @@
     Ctrl+C 打断本轮（回到输入提示继续对话）而不是杀掉整个进程；
     中断后补一条"（已中断，本轮停止）"消息保持历史连贯（对齐 Hermes 的
     interrupt 语义；服务端 SSE 早已接好，这是 REPL 收尾）
+33. **文档抽取**（2026-08-10，对齐 Hermes `tools/read_extract.py`）：
+    - 新模块 `read_extract.py`：.docx / .xlsx / .ipynb 转纯文本，
+      全部标准库实现（zipfile + XML + JSON），零第三方依赖
+    - docx 按段落输出、tab/换行保留；xlsx 按可见工作表输出表格行
+      （共享字符串/内联串/布尔/错误值，隐藏表跳过，行/列数上限防撑爆）；
+      ipynb 按 markdown/code/raw 分节，兼容 nbformat 3
+    - `read_file` 自动接入：遇到可抽取文档先抽取再分页返回
+      （`extracted_document=True`，offset/limit 照常生效）；
+      损坏文档给明确错误，不回退成乱码；普通二进制仍拒绝
+34. **todo 工具（任务规划）**（2026-08-10，对齐 Hermes `tools/todo_tool.py`）：
+    - 每个会话一个内存任务清单：`todo` 工具传 `todos` 参数写入、省略即读取，
+      每次调用返回完整列表 + 状态统计（pending/in_progress/completed/cancelled）；
+      `merge=true` 按 id 更新、默认整体替换；清单顺序即优先级
+    - 上下文压缩时把未完成任务清单随摘要一起保留（稳定头
+      `TODO_INJECTION_HEADER`，只注入 pending/in_progress），任务跨压缩不丢、
+      压缩后模型不会重复做已完成的事
+    - `--resume` 与服务端恢复会话时从历史消息水合最近的 todo 列表
+      （要求 tool 结果与之前的 assistant todo 调用配对，防伪造注入；
+      超大结果跳过）；条目内容/总数有上限防膨胀
+    - 已接入并行规划器顺序屏障（有状态写入不与只读工具并发）
 
 ## 你需要准备的
 
@@ -570,6 +597,8 @@ python tests/test_tirith.py
 python tests/test_gateway_approval.py
 python tests/test_server.py
 python tests/test_skills_preconditions.py
+python tests/test_read_extract.py
+python tests/test_todo_tool.py
 ```
 
 覆盖危险/硬性模式检测、deny/session/always 审批分支、允许列表落盘重载、
@@ -583,6 +612,10 @@ UPSERT 覆盖与压缩后重建；会话清理的旧会话删除/FTS 清理/保�
 技能压缩的标记往返、幽灵技能收集与摘要后补回。
 技能前置条件的嵌套 frontmatter 解析、条件激活过滤（requires/fallback）与
 env/command readiness 检查。
+文档抽取的扩展名判定、docx/xlsx/ipynb 抽取（共享字符串/隐藏表/分节）、
+read_file 自动抽取集成与损坏回退。
+todo 清单的写入/合并/校验/封顶、压缩重注入格式、历史水合配对校验、
+run_tool 分发与并行顺序屏障。
 用户 deny 规则的 glob 匹配、先于 allowlist/off 的优先级与返回结构。
 tirith 的终端注入/隐形字符/同形字/管道检测与审批集成。
 网关审批队列的阻塞/唤醒/FIFO/超时；HTTP 端点的 health/pending/resolve/chat。
@@ -641,6 +674,8 @@ Agent cannot read or modify security-sensitive files.
 
 说明：相对路径按启动目录解析；`read_file` 带行号与分页（offset/limit），
 二进制文件拒绝读取；`write_file` 自动建父目录并返回实际写入的绝对路径。
+`read_file` 遇到 `.docx` / `.xlsx` / `.ipynb` 会自动抽取成文本再分页
+（返回 `extracted_document=true`），模型可以直接"读一下这份文档/表格"。
 
 patch 工具支持两种模式：
 
@@ -676,6 +711,22 @@ python demo_file_tools.py
 
 会依次演示写文件、带行号读取、分页、搜索、以及写 `.env` 被拒绝，
 临时目录自动清理。
+
+## 体验任务规划（todo）
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+python minimal_agent.py
+
+# 问：我要做一个发版，帮我列个执行计划并逐步推进
+# 模型会调用 todo 工具写入任务清单（in_progress / pending），
+# 每完成一步调用 todo 更新状态，你随时可以问"现在进行到哪了"
+```
+
+说明：任务清单按会话隔离（不同会话互不影响）；复杂任务拆解后模型会用它
+跟踪进度；上下文压缩后未完成清单会自动保留（稳定头标记），不会丢失；
+`--resume` 恢复会话时清单也会从历史里水合回来。REPL 里模型每次动清单都会
+打印一个「📋 当前任务清单」面板，启动时也会先展示已有清单，方便你盯着进度。
 
 ## 体验智能审批（Smart Approval）
 
@@ -748,9 +799,11 @@ python minimal_agent.py
 | `terminal` 工具（先审批再执行） | `tools/terminal_tool.py`（check_all_command_guards + subprocess） |
 | 永久允许列表 `approval_allowlist.json` | `config.yaml` 的 `command_allowlist`（JSON 免去 YAML 依赖） |
 | 工具并行执行 `tool_dispatch.py` | `agent/tool_dispatch_helpers.py`（_plan_tool_batch_segments）+ `agent/tool_executor.py`（execute_tool_calls_segmented） |
+| todo 工具 `todo_tool.py` | `tools/todo_tool.py`（TodoStore / todo_tool / TODO_SCHEMA / format_for_injection / _hydrate_todo_store） |
 | Skills `skills.py` + `skills/` 目录 | `agent/skill_utils.py`（发现/frontmatter）+ `tools/skills_tool.py`（skills_list/skill_view）+ `agent/prompt_builder.py`（技能索引） |
 | Skills 前置条件检查 | `agent/skill_utils.py` 的 `extract_skill_conditions` + `agent/prompt_builder.py` 的 `_skill_should_show` + `tools/skills_tool.py` 的 `_get_required_environment_variables`（env 缺失 → setup_needed；commands 仅 advisory） |
 | 文件工具 `file_tools.py` | `tools/file_tools.py`（read_file_tool / write_file_tool / _check_sensitive_path） |
+| 文档抽取 `read_extract.py` | `tools/read_extract.py`（EXTRACTABLE_EXTENSIONS / extract_document_text，docx+xlsx 用 zipfile+XML、ipynb 用 JSON，零依赖） |
 | 敏感脱敏 `redact.py` | `agent/redact.py`（redact_sensitive_text / mask_secret / file_read 哨兵） |
 | patch 工具（replace + V4A 双模式） | `tools/file_tools.py` 的 patch_tool（mode=replace\|patch）+ `tools/patch_parser.py`（parse_v4a_patch / apply_v4a_operations）+ `tools/fuzzy_match.py`（fuzzy_find_and_replace） |
 | 审批增强（smart/熔断/混淆检测） | `tools/approval.py`（_smart_approve / _record_denial / DANGEROUS_PATTERNS） |
@@ -760,8 +813,8 @@ python minimal_agent.py
 会话压缩后的 lineage 去重（压缩黑洞处理）、记忆主动 nudge、审批的 cron/gateway 上下文、
 Smart Approval（辅助 LLM 审批）与连续拒绝熔断、命令混淆检测、工具并行里的中断语义与
 turn 级 budget 收尾、Skills 的 hub/组织同步/插件命名空间、压缩时的技能
-prune/reinject、文件工具的跨 profile/文件锁/文档抽取（陈旧检测已做简化版、
-V4A 补丁与模糊匹配已完成）、脱敏的 URL 查询参数/手机号/DB 连接串专项——
+prune/reinject、文件工具的跨 profile/文件锁（陈旧检测已做简化版、V4A 补丁与
+模糊匹配已完成、文档抽取已完成见 33）、脱敏的 URL 查询参数/手机号/DB 连接串专项——
 这些是后续深入源码时值得关注的点。
 
 ## 加新工具
@@ -775,7 +828,8 @@ V4A 补丁与模糊匹配已完成）、脱敏的 URL 查询参数/手机号/DB 
 - 联网能力已完成（web_search / web_fetch，零依赖 + SSRF 防护）
 - 审批剩余：cron 审批上下文（`approvals.cron_mode`）
 - 文件工具增强：V4A patch / 模糊匹配 / 语法提示 / 简化陈旧检测已完成（见 31）；
-  剩余文件锁、文档抽取
+  文档抽取已完成（见 33）；剩余文件锁、跨 profile 检查
+- todo 工具已完成（见 34）；working_diff（工作区改动查看，130 行小件）待做
 - 并行执行的中断语义已完成（见 29），turn 级 budget 已完成（见 27）
 - Skills 前置条件检查已完成（见 30）；剩余：技能 hub 同步
 - 脱敏专项已完成（URL 查询参数、手机号、DB 连接串，见 28）
