@@ -30,6 +30,7 @@
         <button id="btn-plugins" class="btn side-nav-btn" type="button">插件</button>
         <button id="btn-skills" class="btn side-nav-btn" type="button">技能</button>
         <button id="btn-tools" class="btn side-nav-btn" type="button">工具</button>
+        <button id="btn-working-diff" class="btn side-nav-btn" type="button">工作区</button>
       </div>
 
       <div class="side-section">
@@ -115,6 +116,26 @@
             <button id="btn-tools-back" class="btn ghost" type="button">← 返回对话</button>
           </div>
           <div class="workspace-list" id="tools-list"></div>
+        </section>
+        <section class="workspace-view hidden" id="working-diff-view">
+          <div class="workspace-view-head">
+            <span class="view-title">工作区改动</span>
+            <div class="wdiff-modes">
+              <button id="btn-wdiff-working" class="btn mode-btn active" type="button">未暂存</button>
+              <button id="btn-wdiff-staged" class="btn mode-btn" type="button">已暂存</button>
+              <button id="btn-wdiff-all" class="btn mode-btn" type="button">全部</button>
+            </div>
+            <button id="btn-working-diff-refresh" class="btn ghost" type="button">刷新</button>
+            <button id="btn-working-diff-back" class="btn ghost" type="button">← 返回对话</button>
+          </div>
+          <!-- 左：具体 diff（红绿标注）；右：改动文件目录 -->
+          <div class="wdiff-panes">
+            <div class="wdiff-left">
+              <div class="wdiff-stat" id="wdiff-stat"></div>
+              <div class="wdiff-diff-wrap" id="wdiff-diff"></div>
+            </div>
+            <div class="wdiff-right" id="wdiff-files"></div>
+          </div>
         </section>
       </main>
 

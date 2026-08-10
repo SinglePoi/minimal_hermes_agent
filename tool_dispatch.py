@@ -46,6 +46,7 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "skills_list",
     "skill_view",
     "get_current_time",
+    "working_diff",
     "web_search",
     "web_fetch",
 })

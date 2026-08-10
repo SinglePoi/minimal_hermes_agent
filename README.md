@@ -178,8 +178,11 @@
     - 交互限制：删除按钮只出现在"已归档"列表（先归档、再删除）；服务端同时强制校验，
       绕过前端直接调 DELETE 也删不掉未归档会话
     - 删除走统一鉴权门卫 + 审计（action=sessions:delete，含 session_id）
-24. **会话标题 + fork**（2026-08-07，对齐 Hermes api_server 的 PATCH /api/sessions 与 /fork）：
-    - sessions 表新增 title 列（首次访问自动迁移）；首条用户消息自动生成标题（截断 40 字），
+24. **会话标题 + fork**（对齐 Hermes api_server 的 PATCH /api/sessions 与 /fork；
+    LLM 自动标题对齐 Hermes agent/title_generator.py）：
+    - sessions 表新增 title 列（首次访问自动迁移）；**首轮交换后后台线程用 LLM 生成
+      3-7 词标题**（对齐 Hermes：不增加回复延迟、失败静默、低温度/小 token 请求；
+      LLM 失败回退首条用户消息截断 40 字），`TITLE_GENERATION_ENABLED` 可整体关闭；
       列表显示优先级：title → 最后一条用户消息预览 → 会话 ID
     - `PATCH /sessions/<id>`：`{"title": "..."}` 手动改名（空串清除，回退自动标题）；
       缺 title 400、超长（>100）400、未知 404
@@ -295,6 +298,28 @@
 35. **Windows 控制台 UTF-8 兜底**（2026-08-10，发版检查发现并修复）：minimal_agent.py
     在 `console = Console()` 前对 win32 stdout/stderr 做 `reconfigure(encoding="utf-8")`，
     修复 GBK 控制台下 rich 渲染 emoji 崩溃；日常运行无需手动设 PYTHONIOENCODING
+36. **LLM 自动生成会话标题**（2026-08-10，对齐 Hermes `agent/title_generator.py`）：
+    首轮用户→助手交换后**后台线程**用 LLM 生成 3-7 词标题（不增加回复延迟；
+    各截 500 字、temperature=0.3、max_tokens=500、失败静默），
+    `set_auto_title_if_empty` 原子写入，人工改名不被覆盖；LLM 失败回退首条
+    用户消息截断 40 字；`TITLE_GENERATION_ENABLED` 可整体关闭
+37. **终端输出清洗**（2026-08-10，对齐 Hermes `tools/ansi_strip.py` +
+    `tools/tool_output_limits.py` + `terminal_tool.py`）：terminal 工具返回前
+    对输出依次做**截断**（上限 50000 字符，头 40% + 尾 60% + 省略标记）→
+    **剥 ANSI**（完整 ECMA-48，防模型把转义序列抄进文件写入）→ **脱敏**
+    （env/printenv/set 类命令的 KEY=value 走赋值规则打码，普通命令按代码文件
+    处理避免源码常量误伤）
+38. **working_diff 工具**（2026-08-10，对齐 Hermes `tools/working_diff.py`）：
+    查看工作区 git 改动——working（未暂存+未跟踪）/ staged（已 add）/ all
+    （相对 HEAD 全部），未跟踪文件用 `git diff --no-index` 折入；已注册
+    TOOLS + run_tool 分发 + 并行只读白名单；**网页侧栏新增【工作区】视图**
+    （`GET /working_diff` 端点返回按文件拆分的 files 数组 + summary 汇总 +
+    working/staged/all 切换；**右侧为带层级的可折叠目录树**（按目录分组，
+    Codex 风格），**左侧顶部只显示一行汇总**（共 N 个文件 · 新增 +X · 删除 -Y），
+    下方是选中文件的 diff——红绿标注增删行、@@ hunk 高亮，
+    git diff 文件头元信息行（diff --git/index/---/+++/mode）不显示
+    （路径与状态目录树已给出），二进制文件保留一行提示；
+    对齐 Hermes gateway 的 /diff 入口），不再依赖模型调用即可直接看改动
 
 ## 你需要准备的
 
@@ -398,6 +423,7 @@ Web 页面已内置该流程：请求期间每 800ms 轮询，弹出审批框点
 | `MEMORY_NUDGE_INTERVAL` | 记忆 nudge 间隔（用户轮次）：每 N 轮后台审查一次（0 = 禁用） | `10` |
 | `MAX_AGENT_TURNS` | 单次提问内"调模型"最大轮数（防无限调工具） | `5` |
 | `TURN_TOKEN_BUDGET` | 单次提问累计 prompt token 预算（0 = 不限制；触顶请求模型收尾） | `0` |
+| `TITLE_GENERATION_ENABLED` | LLM 自动生成会话标题开关（首轮交换后后台生成；false 关闭后不自动命名） | `true` |
 | `APPROVAL_DENY` | 用户自定义拒绝规则（; 分隔的 fnmatch glob，命中即无条件拦截） | 空 |
 | `TIRITH_ENABLED` | 内容级安全扫描开关（false 关闭） | `true` |
 | `TIRITH_FAIL_OPEN` | 扫描器异常时放行（true）还是拦截（false） | `true` |
@@ -815,6 +841,10 @@ python minimal_agent.py
 | patch 工具（replace + V4A 双模式） | `tools/file_tools.py` 的 patch_tool（mode=replace\|patch）+ `tools/patch_parser.py`（parse_v4a_patch / apply_v4a_operations）+ `tools/fuzzy_match.py`（fuzzy_find_and_replace） |
 | 审批增强（smart/熔断/混淆检测） | `tools/approval.py`（_smart_approve / _record_denial / DANGEROUS_PATTERNS） |
 | 记忆异步同步 `memory_manager.py` | `agent/memory_manager.py`（sync_all 后台 worker + flush_pending） |
+| LLM 自动标题 `title_generator.py` | `agent/title_generator.py`（maybe_auto_title / generate_title / set_auto_title_if_empty） |
+| 终端输出清洗 `ansi_strip.py` + `tool_output_limits.py` | `tools/ansi_strip.py`（strip_ansi）+ `tools/tool_output_limits.py`（get_max_bytes）+ `tools/terminal_tool.py`（截断→剥 ANSI→脱敏） |
+| working_diff `working_diff.py` | `tools/working_diff.py`（collect_working_diff，/diff 三模式） |
+| 网页工作区改动视图 `GET /working_diff` + 侧栏【工作区】 | Hermes gateway 的 `/diff` 入口（CLI 与 gateway 共用同一收集逻辑） |
 
 骨架简化掉了的工业级细节：文件锁、注入威胁扫描、外部漂移检测、可插拔 MemoryProvider、
 会话压缩后的 lineage 去重（压缩黑洞处理）、记忆主动 nudge、审批的 cron/gateway 上下文、

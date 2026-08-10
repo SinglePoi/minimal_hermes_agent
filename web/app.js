@@ -13,6 +13,7 @@ const API = {
   plugins: "/plugins",
   skills: "/skills",
   tools: "/tools",
+  workingDiff: "/working_diff",
   authConfig: "/api/auth/config",
   authMe: "/api/auth/me",
   authLogout: "/api/auth/logout",
@@ -68,12 +69,18 @@ const VIEWS = {
     label: "工具",
     load: refreshToolsList,
   },
+  wdiff: {
+    viewId: "working-diff-view",
+    label: "工作区改动",
+    load: refreshWorkingDiff,
+  },
 };
 const NAV_BUTTONS = {
   archived: "btn-archived",
   plugins: "btn-plugins",
   skills: "btn-skills",
   tools: "btn-tools",
+  wdiff: "btn-working-diff",
 };
 
 /* ---------- 工具函数 ---------- */
@@ -929,6 +936,212 @@ async function refreshToolsList() {
   }
 }
 
+/* ---------- 工作区改动视图 ---------- */
+
+let wdiffMode = "working";
+let wdiffSelectedPath = "";
+let wdiffCache = null;
+const wdiffClosedDirs = new Set();
+
+function renderDiffLines(diffText) {
+  const box = document.createElement("div");
+  box.className = "wdiff-diff";
+  // 二进制文件没有行级 diff（chunk 只有 "Binary files ... differ" 元信息）
+  if (/^Binary files .* differ$/m.test(diffText)) {
+    const row = document.createElement("div");
+    row.className = "diff-line diff-meta";
+    row.textContent = "（二进制文件，不显示 diff）";
+    box.appendChild(row);
+    return box;
+  }
+  diffText.split("\n").forEach((line) => {
+    // 跳过 git diff 文件头元信息：diff --git / index / new file / deleted file /
+    // old mode / new mode / --- a / +++ b（路径与新增/修改/删除状态目录树已展示）
+    if (
+      line.startsWith("diff --git") ||
+      line.startsWith("index ") ||
+      line.startsWith("new file") ||
+      line.startsWith("deleted file") ||
+      line.startsWith("old mode") ||
+      line.startsWith("new mode") ||
+      line.startsWith("--- ") ||
+      line.startsWith("+++ ")
+    ) {
+      return;
+    }
+    const row = document.createElement("div");
+    row.className = "diff-line";
+    if (line.startsWith("@@")) {
+      row.className += " diff-hunk";
+    } else if (line.startsWith("+")) {
+      row.className += " diff-add";
+    } else if (line.startsWith("-")) {
+      row.className += " diff-del";
+    } else {
+      row.className += " diff-ctx";
+    }
+    row.textContent = line || "\u00A0";
+    box.appendChild(row);
+  });
+  return box;
+}
+
+function buildFileTree(files) {
+  const root = { children: {}, files: [] };
+  files.forEach((f) => {
+    const parts = f.path.split("/");
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!node.children[parts[i]]) node.children[parts[i]] = { children: {}, files: [] };
+      node = node.children[parts[i]];
+    }
+    node.files.push(f);
+  });
+  return root;
+}
+
+function buildFileRow(f, depth) {
+  const item = document.createElement("div");
+  item.className = "wdiff-file" + (f.path === wdiffSelectedPath ? " active" : "");
+  item.style.paddingLeft = 8 + depth * 14 + "px";
+  const head = document.createElement("div");
+  head.className = "wdiff-file-head";
+  const name = document.createElement("span");
+  name.className = "wdiff-file-name";
+  name.textContent = f.path.split("/").pop();
+  name.title = f.path;
+  head.appendChild(name);
+  const badge = document.createElement("span");
+  badge.className = "wdiff-file-status " + f.status;
+  badge.textContent =
+    f.status === "added" ? "新增" : f.status === "deleted" ? "删除" : "修改";
+  head.appendChild(badge);
+  const counts = document.createElement("div");
+  counts.className = "wdiff-file-counts";
+  if (f.additions) {
+    const a = document.createElement("span");
+    a.className = "diff-add-count";
+    a.textContent = "+" + f.additions;
+    counts.appendChild(a);
+  }
+  if (f.deletions) {
+    const d = document.createElement("span");
+    d.className = "diff-del-count";
+    d.textContent = "-" + f.deletions;
+    counts.appendChild(d);
+  }
+  item.append(head, counts);
+  item.addEventListener("click", () => selectWorkingDiffFile(f.path));
+  return item;
+}
+
+function renderTreeNode(node, path, depth, container) {
+  Object.keys(node.children)
+    .sort((a, b) => a.localeCompare(b))
+    .forEach((name) => {
+      const child = node.children[name];
+      const childPath = path ? path + "/" + name : name;
+      const closed = wdiffClosedDirs.has(childPath);
+      const row = document.createElement("div");
+      row.className = "wdiff-folder";
+      row.style.paddingLeft = 6 + depth * 14 + "px";
+      const arrow = document.createElement("span");
+      arrow.className = "wdiff-folder-arrow";
+      arrow.textContent = closed ? "▸" : "▾";
+      const label = document.createElement("span");
+      label.className = "wdiff-folder-name";
+      label.textContent = name;
+      row.append(arrow, label);
+      row.addEventListener("click", () => {
+        if (closed) wdiffClosedDirs.delete(childPath);
+        else wdiffClosedDirs.add(childPath);
+        if (wdiffCache) renderWorkingDiff(wdiffCache);
+      });
+      container.appendChild(row);
+      if (!closed) {
+        const childContainer = document.createElement("div");
+        childContainer.className = "wdiff-tree-children";
+        renderTreeNode(child, childPath, depth + 1, childContainer);
+        container.appendChild(childContainer);
+      }
+    });
+  node.files
+    .slice()
+    .sort((a, b) => a.path.localeCompare(b.path))
+    .forEach((f) => container.appendChild(buildFileRow(f, depth)));
+}
+
+function renderFileTree(files) {
+  const box = $("wdiff-files");
+  box.textContent = "";
+  const root = buildFileTree(files);
+  const frag = document.createDocumentFragment();
+  renderTreeNode(root, "", 0, frag);
+  box.appendChild(frag);
+}
+
+function renderWorkingDiff(data) {
+  const files = $("wdiff-files");
+  const diffBox = $("wdiff-diff");
+  const statBox = $("wdiff-stat");
+  files.textContent = "";
+  diffBox.textContent = "";
+  statBox.textContent = "";
+  if (!data || !data.success) {
+    const empty = document.createElement("div");
+    empty.className = "session-empty";
+    empty.textContent = (data && data.error) || "无法读取工作区改动";
+    files.appendChild(empty);
+    return;
+  }
+  const fileList = data.files || [];
+  if (data.empty || !fileList.length) {
+    const empty = document.createElement("div");
+    empty.className = "session-empty";
+    empty.textContent = "工作区干净，没有改动";
+    files.appendChild(empty);
+    return;
+  }
+  const summary = data.summary || {};
+  statBox.textContent = summary.files
+    ? "共 " + summary.files + " 个文件 · 新增 +" + summary.additions +
+      " · 删除 -" + summary.deletions
+    : "";
+  const names = fileList.map((f) => f.path);
+  if (!names.includes(wdiffSelectedPath)) wdiffSelectedPath = names[0];
+  renderFileTree(fileList);
+  const current = fileList.find((f) => f.path === wdiffSelectedPath) || fileList[0];
+  diffBox.appendChild(renderDiffLines(current.diff));
+}
+
+async function refreshWorkingDiff() {
+  try {
+    const data = await httpJson(
+      "GET",
+      API.workingDiff + "?mode=" + encodeURIComponent(wdiffMode)
+    );
+    wdiffCache = data;
+    renderWorkingDiff(data);
+  } catch (e) {
+    wdiffCache = null;
+    renderWorkingDiff({ success: false, error: e.message });
+  }
+}
+
+function selectWorkingDiffFile(path) {
+  if (!wdiffCache) return;
+  wdiffSelectedPath = path;
+  renderWorkingDiff(wdiffCache);
+}
+
+function setWorkingDiffMode(mode) {
+  wdiffMode = mode;
+  ["working", "staged", "all"].forEach((m) => {
+    $("btn-wdiff-" + m).classList.toggle("active", m === mode);
+  });
+  refreshWorkingDiff();
+}
+
 async function switchSession(id, title) {
   turnToken += 1;  // 在途旧轮次全部失效，防止跨会话泄漏
   if (state.inFlight && state.abort) {
@@ -1282,10 +1495,16 @@ function bindEvents() {
   $("btn-plugins").addEventListener("click", () => toggleView("plugins"));
   $("btn-skills").addEventListener("click", () => toggleView("skills"));
   $("btn-tools").addEventListener("click", () => toggleView("tools"));
+  $("btn-working-diff").addEventListener("click", () => toggleView("wdiff"));
   $("btn-archived-back").addEventListener("click", closeView);
   $("btn-plugins-back").addEventListener("click", closeView);
   $("btn-skills-back").addEventListener("click", closeView);
   $("btn-tools-back").addEventListener("click", closeView);
+  $("btn-working-diff-back").addEventListener("click", closeView);
+  $("btn-working-diff-refresh").addEventListener("click", refreshWorkingDiff);
+  $("btn-wdiff-working").addEventListener("click", () => setWorkingDiffMode("working"));
+  $("btn-wdiff-staged").addEventListener("click", () => setWorkingDiffMode("staged"));
+  $("btn-wdiff-all").addEventListener("click", () => setWorkingDiffMode("all"));
 
   // 审批按钮
   $("btn-once").addEventListener("click", () => resolveApproval("once"));

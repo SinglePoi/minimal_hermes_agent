@@ -54,6 +54,10 @@ from tool_dispatch import (
 )
 from skills import build_skills_index, skills_list, skill_view
 import web_tools
+from title_generator import auto_title_session, maybe_auto_title
+from ansi_strip import strip_ansi
+from tool_output_limits import truncate_output
+from working_diff import working_diff_tool
 from todo_tool import (
     TODO_SCHEMA,
     get_todo_store,
@@ -520,6 +524,38 @@ def set_session_title(session_id: str, title: str) -> bool:
         conn.close()
 
 
+def get_session_title(session_id: str) -> str:
+    """读取会话当前标题（无标题或会话不存在返回空串）。"""
+    conn = _db_conn()
+    try:
+        row = conn.execute(
+            "SELECT title FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return (row[0] or "") if row else ""
+    finally:
+        conn.close()
+
+
+def set_auto_title_if_empty(session_id: str, title: str) -> bool:
+    """仅当会话当前没有标题时写入（LLM 后台生成 vs 人工改名的竞态保护）。
+
+    对齐 Hermes 的 set_auto_title_if_empty：谓词 + 写入在同一个 UPDATE 里完成，
+    人工改名（PATCH）与后台自动生成并发时，先落库的赢，自动生成绝不覆盖。
+    返回是否真的写入。
+    """
+    conn = _db_conn()
+    try:
+        cur = conn.execute(
+            "UPDATE sessions SET title = ?, updated_at = datetime('now') "
+            "WHERE session_id = ? AND (title IS NULL OR trim(title) = '')",
+            (title, session_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def fork_session(source_id: str, new_id: str, title: str = "") -> bool:
     """复制会话历史开新会话（对齐 Hermes api_server 的 POST /api/sessions/<id>/fork）。
 
@@ -629,18 +665,9 @@ def persist_messages(
                 "INSERT INTO messages_fts (rowid, search_text) VALUES (?, ?)",
                 (cur.lastrowid, " ".join(_search_tokens(content))),
             )
-            # 首条用户消息自动生成标题（对齐 Hermes 自动标题，简化：取首条用户消息截断 40 字）
-            if role == "user":
-                row = conn.execute(
-                    "SELECT title FROM sessions WHERE session_id = ?", (session_id,)
-                ).fetchone()
-                if row is not None and not (row[0] or "").strip():
-                    auto_title = re.sub(r"\s+", " ", content).strip()[:40]
-                    if auto_title:
-                        conn.execute(
-                            "UPDATE sessions SET title = ? WHERE session_id = ?",
-                            (auto_title, session_id),
-                        )
+            # 标题不在落库时生成：首轮交换完成后由 title_generator 后台线程用
+            # LLM 生成（对齐 Hermes agent/title_generator.py），失败回退截断，
+            # 通过 set_auto_title_if_empty 原子写入，避免覆盖人工改名
         conn.commit()
         return last_user_id
     finally:
@@ -1134,6 +1161,32 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "working_diff",
+            "description": (
+                "查看当前工作区的 git 改动：mode=working（默认）返回未暂存改动+未跟踪文件，"
+                "staged 返回已 git add 的改动，all 返回相对 HEAD 的全部改动+未跟踪文件。"
+                "当需要回答'工作区改了什么/这个项目最近改了哪些文件'时使用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["working", "staged", "all"],
+                        "description": "diff 模式，默认 working",
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "只查看这些路径的改动（可选）",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "skills_list",
             "description": (
                 "列出所有可用技能（名称 + 一句话描述，最小元数据）。"
@@ -1307,6 +1360,41 @@ def _kill_process_tree(proc) -> None:
             pass
 
 
+_ENV_DUMP_COMMANDS = frozenset({"env", "printenv", "set", "export", "declare"})
+
+
+def _is_env_dump_command(command: str) -> bool:
+    """判断命令是否是环境变量倾倒（env/printenv/set/export/declare 开头）。
+
+    对齐 Hermes redact.is_env_dump_command：按管道/分号/&& 拆段后看每段首词，
+    命中说明输出大概率是 KEY=value，脱敏时走赋值规则（code_file=False）。
+    """
+    if not command:
+        return False
+    for seg in re.split(r"[|;&]+", command):
+        seg = seg.strip()
+        if not seg:
+            continue
+        tokens = seg.split(maxsplit=1)
+        first = tokens[0] if tokens else seg
+        if first in _ENV_DUMP_COMMANDS:
+            return True
+    return False
+
+
+def _clean_terminal_output(raw: str, command: str = "") -> str:
+    """清洗终端输出：截断 → 剥 ANSI → 脱敏（对齐 Hermes terminal_tool）。
+
+    顺序与 Hermes 一致：先截断（头 40% + 尾 60% + 省略标记，上限 50000 字符），
+    再 strip_ansi（防模型把转义序列抄进文件写入），最后 redact 脱敏。env 类
+    命令输出就是 KEY=value，走赋值规则（code_file=False）；其他输出按代码/
+    数据文件处理（code_file=True），避免源码/配置常量误伤。
+    """
+    text = truncate_output(raw or "")
+    text = strip_ansi(text)
+    return redact_sensitive_text(text, code_file=not _is_env_dump_command(command)) or ""
+
+
 def _run_terminal_interruptible(
     command: str,
     timeout: int,
@@ -1349,7 +1437,7 @@ def _run_terminal_interruptible(
                 {
                     "success": False,
                     "exit_code": -1,
-                    "output": (out or "").strip(),
+                    "output": _clean_terminal_output(out, command).strip(),
                     "error": "命令被用户中断",
                     "status": "cancelled",
                 },
@@ -1378,8 +1466,8 @@ def _run_terminal_interruptible(
         {
             "success": proc.returncode == 0,
             "exit_code": proc.returncode,
-            "output": (out or "").strip(),
-            "stderr": (err or "").strip(),
+            "output": _clean_terminal_output(out, command).strip(),
+            "stderr": _clean_terminal_output(err, command).strip(),
         },
         ensure_ascii=False,
     )
@@ -1437,8 +1525,8 @@ def run_terminal(
         payload: dict[str, Any] = {
             "success": result.returncode == 0,
             "exit_code": result.returncode,
-            "output": (result.stdout or "").strip(),
-            "stderr": (result.stderr or "").strip(),
+            "output": _clean_terminal_output(result.stdout, command).strip(),
+            "stderr": _clean_terminal_output(result.stderr, command).strip(),
         }
         if approval.get("user_approved"):
             payload["approval"] = (
@@ -1503,6 +1591,11 @@ def run_tool(
             timeout=int(args.get("timeout", 120) or 120),
             client=client,
             interrupt_event=interrupt_event,
+        )
+    if name == "working_diff":
+        return working_diff_tool(
+            mode=args.get("mode", "working"),
+            paths=args.get("paths") or None,
         )
     if name == "skills_list":
         return skills_list(available_tools=available_tools)
@@ -2133,6 +2226,22 @@ def main():
             if one_shot_mode:
                 break
             continue
+
+        # LLM 生成会话标题（对齐 Hermes title_generator）：一次性模式同步生成后
+        # 退出（进程即将结束，后台线程会被杀）；交互模式后台异步不阻塞对话
+        last_msg = messages[-1] if messages else {}
+        reply = last_msg.get("content", "") if last_msg.get("role") == "assistant" else ""
+        if reply:
+            if one_shot_mode:
+                auto_title_session(session_id, user_input, reply, client)
+            else:
+                maybe_auto_title(
+                    session_id,
+                    user_input,
+                    reply,
+                    client=client,
+                    conversation_history=messages,
+                )
 
         if one_shot_mode:
             break  # 一次性问题已答完，退出

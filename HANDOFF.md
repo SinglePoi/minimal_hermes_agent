@@ -433,6 +433,63 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     `reconfigure(encoding="utf-8")`——修复 GBK 控制台下 rich 渲染 emoji 抛
     UnicodeEncodeError 首屏崩溃的问题；日常 REPL/冒烟不再需要手动设
     PYTHONIOENCODING（终端显示乱码属代码页显示问题，可 `chcp 65001`）
+40. **LLM 自动生成会话标题**（2026-08-10，对齐 Hermes `agent/title_generator.py`）：
+    - 新模块 title_generator.py：首轮用户→助手交换后**后台线程**生成 3-7 词标题，
+      不增加回复延迟；请求小（各截 500 字）、temperature=0.3、max_tokens=500、
+      无工具清单、不进主循环 token 预算；输出清洗（去引号/"Title:"前缀/只取
+      第一行/80 字截断），失败静默返回 None（对齐 Hermes）
+    - 落库用新 set_auto_title_if_empty（谓词+写入同一 UPDATE）：人工改名与后台
+      生成并发时先落库的赢，自动生成绝不覆盖；persist_messages 不再同步写
+      截断标题，REPL 一次性模式同步生成、交互模式后台异步，server 两个 /chat
+      通道（一次性 + SSE）都接线并在 shutdown 时 join 排空
+    - 骨架差异：LLM 失败回退"首条用户消息截断 40 字"（保留离线体验），
+      Hermes 不回退；环境变量 `TITLE_GENERATION_ENABLED`（默认 true）三同步
+    - 测试：新增 tests/test_title_generator.py（27 条断言：参数/清洗/开关/失败
+      静默/原子写入/失败回退/首轮触发与多轮跳过）；test_server.py 标题组改为
+      LLM 后台生成 + 人工改名不被后续对话覆盖；ServerFixture 默认关标题生成
+      （防污染 BudgetFakeClient 精确调用计数与 seq 顺序假 client）
+41. **终端输出清洗**（2026-08-10，对齐 Hermes `tools/ansi_strip.py` +
+    `tools/tool_output_limits.py` + `terminal_tool.py`）：
+    - 新模块 ansi_strip.py（完整 ECMA-48：CSI/OSC/DCS/SOS/PM/APC/nF/Fp/Fe/Fs/
+      8-bit C1 + strip_ansi + sanitize_display_text 控制字符清洗）与
+      tool_output_limits.py（truncate_output：上限 50000 字符、头 40% + 尾 60%
+      + 省略标记；骨架无 config.yaml，硬编码 Hermes 默认值）
+    - minimal_agent.py 新增 _clean_terminal_output：截断 → 剥 ANSI → 脱敏，
+      三条终端返回路径（普通 subprocess.run + 可中断 Popen 正常/中断）全部接线；
+      env/printenv/set/export/declare 类命令（_is_env_dump_command 按管道/分号
+      拆段判定）走赋值规则打码，普通命令按 code_file=True 避免源码常量误伤
+      （对齐 Hermes redact_terminal_output 语义）
+    - 测试：新增 tests/test_terminal_output.py（33 条断言：截断/ANSI/C1/显示
+      清洗/env 判定/清洗管线/run_terminal 接线）
+42. **working_diff 工具**（2026-08-10，对齐 Hermes `tools/working_diff.py`）：
+    - 新模块 working_diff.py：collect_working_diff 三模式（working=未暂存+未跟踪 /
+      staged=git diff --cached / all=git diff HEAD+未跟踪），未跟踪文件用
+      git diff --no-index /dev/null 折入（上限 50 个），返回
+      {success, stat, diff, untracked, empty}；非 git 目录/非法模式/git 缺失
+      均返回可读错误
+    - 工具入口 working_diff_tool 返回 JSON；已注册 TOOLS（mode/paths 参数）+
+      run_tool 分发 + 并行只读白名单（_PARALLEL_SAFE_TOOLS）
+    - 测试：新增 tests/test_working_diff.py（23 条断言：三模式/路径过滤/空仓库/
+      非 git/非法模式/工具入口/run_tool 分发/白名单）
+43. **网页工作区改动视图**（2026-08-10，对齐 Hermes gateway 的 /diff 入口）：
+    - server.py 新增 `GET /working_diff`（mode/paths 查询参数，复用
+      collect_working_diff，非法模式 400；走统一鉴权门卫 + 审计 action=working_diff）；
+      working_diff.py 新增 parse_diff_files 把合并 diff 按文件拆成
+      {path/status(added|modified|deleted)/additions/deletions/diff}，端点
+      files 字段附带返回；新增 summarize_files 输出
+      {files/additions/deletions/added/modified/deleted} 供左侧一行汇总
+    - web/ 侧栏新增【工作区】按钮与 working-diff-view（复用 VIEWS 注册表 +
+      showView/toggleView）：**右侧为带层级的可折叠目录树**（按目录分组、
+      目录先于文件排序、▸/▾ 折叠、折叠状态跨刷新保留；文件行 = 文件名 +
+      新增/修改/删除徽标 + 增删行数，点击切换），**左侧顶部只显示一行汇总**
+      （共 N 个文件 · 新增 +X · 删除 -Y，替代原 git diff --stat 长表），
+      下方是选中文件的逐行 diff（红绿标注增删行、@@ hunk 高亮；
+      diff --git/index/---/+++/mode 等文件头元信息不显示，二进制文件留一行提示）；
+      working/staged/all 三档切换 + 刷新按钮；textContent 写入防 XSS；
+      干净工作区/错误均有空态
+    - 测试：test_server.py 新增端点组（success/字段含 files+summary/paths
+      过滤/非法模式 400/鉴权 401/审计）+ 静态断言；test_working_diff.py 新增
+      parse_diff_files + summarize_files 组（拆分/状态/增删行数/汇总/路径）
 
 ## 运行方式
 
@@ -585,8 +642,8 @@ python demo_file_tools.py
 
 ## 已知限制 / 下一步候选
 
-- 审批增强已完成（smart/熔断/混淆/deny/tirith）；剩余仅 cron 审批上下文
-  （`approvals.cron_mode`，对齐 `tools/approval.py` 剩余部分）
+- 审批增强已完成（smart/熔断/混淆/deny/tirith）；cron 审批上下文
+  （`approvals.cron_mode`）已按用户要求取消（2026-08-10），不再实施
 - 前端 + 流式已完成（对话/审批/会话列表/归档/插件技能工具视图/过程活动/思考回显/SSE）；
   请求鉴权、操作审计、用户名密码登录、会话删除/标题/fork 全部完成（见 25~28）
   （Hermes web/ 有完整 dashboard，骨架只做最小聊天页）
@@ -617,9 +674,9 @@ python demo_file_tools.py
   turn budget（31）、脱敏专项（32）、并行中断语义（33）、技能前置条件（34）、
   V4A patch + 模糊匹配（35）、REPL 中断接线（36）、文档抽取（37）、todo 工具（38）
   均已完成
-- 审批剩余：cron 审批上下文（`approvals.cron_mode`）
+- 审批线已完成（cron 审批按用户要求取消，见上）
 - 文件工具剩余：文件锁、跨 profile 检查（V4A/模糊/语法提示/简化陈旧检测/文档抽取已完成）
-- todo 已做；working_diff（工作区改动查看，130 行小件）可顺手补
+- working_diff 已完成（42，2026-08-10）；终端输出清洗已完成（41）
 - Skills 剩余：技能 hub 同步
 - 运维：服务化下的日志、进程守护（Hermes 用 systemd/gateway daemon）
 - 中断接线：REPL Ctrl+C 已完成（36）；一次性 /chat 无法感知断连（保持现状）
@@ -638,8 +695,9 @@ python demo_file_tools.py
   全套 20 套回归通过；
   HEAD `049b4c9`（用户已提交主体）；工作树剩最近收尾（旁白进托盘/todo 网页卡片/
   耗时/空思考等）与 HANDOFF/README 本次查漏补缺，提交由用户手动进行。
-> 下一步候选：working_diff（130 行小件）/ cron 审批 / 文件工具剩余
-  （文件锁/跨 profile）/ 运维日志与进程守护。Skills hub 已明确暂不做。
+> 下一步候选：文件工具剩余（文件锁/跨 profile）/ 运维日志与进程守护。
+> working_diff（42）、终端输出清洗（41）、LLM 自动标题（40）已完成；
+> cron 审批已按用户要求取消；Skills hub 已明确暂不做。
 
 ## 发版检查记录（2026-08-10，release-check 技能）
 

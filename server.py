@@ -19,6 +19,7 @@ HTTP 服务化 + gateway 审批通知（为前端铺路，对齐 Hermes dashboar
     GET  /skills                 技能列表（name + description）
     GET  /plugins                记忆 provider 插件列表（name + description + active）
     GET  /tools                  可用工具列表（核心 TOOLS + provider 自带工具）
+    GET  /working_diff           工作区 git 改动（stat + diff + untracked；mode/paths 查询参数）
 
 审批流程（对齐 Hermes 的网关队列）：
     - /chat 请求里的 agent 线程在危险命令处通过 approval.py 的网关队列阻塞等待
@@ -52,6 +53,8 @@ load_dotenv(override=True)
 import minimal_agent  # noqa: E402
 import dashboard_auth  # noqa: E402
 import skills  # noqa: E402
+import title_generator  # noqa: E402
+import working_diff  # noqa: E402
 from approval import (  # noqa: E402
     list_pending_approvals,
     register_gateway_notify,
@@ -140,6 +143,8 @@ def _audit_action(path: str, method: str = "GET") -> str:
         return "plugins"
     if path.startswith("/tools"):
         return "tools"
+    if path.startswith("/working_diff"):
+        return "working_diff"
     if path.startswith("/health"):
         return "health"
     if path.startswith("/web/") or path in ("/", "/index.html"):
@@ -157,6 +162,8 @@ class AgentServer:
         self.tools = minimal_agent.get_tools(self.manager)
         self.sessions: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        # LLM 标题生成的后台线程（首轮交换后异步），shutdown 时 join 排空
+        self._title_threads: list[threading.Thread] = []
         # 网关通知回调：数据本身已进 approval.py 的队列，回调只需"发出消息"；
         # 我们的"消息"就是轮询端点可读的 pending 列表
         self._notify = lambda data: None
@@ -223,11 +230,24 @@ class AgentServer:
             state["persisted_count"] = persisted_count
             last = state["messages"][-1] if state["messages"] else {}
             reply = last.get("content", "") if last.get("role") == "assistant" else ""
+            if reply:
+                thread = title_generator.maybe_auto_title(
+                    session_id,
+                    message,
+                    reply,
+                    client=self.client,
+                    conversation_history=state["messages"],
+                )
+                if thread is not None:
+                    self._title_threads.append(thread)
             todos = minimal_agent.get_todo_store(session_id).read()
             return reply, events, todos
 
     def shutdown(self) -> None:
         """排空后台任务、注销所有网关回调。"""
+        for thread in self._title_threads:
+            thread.join(timeout=5)
+        self._title_threads.clear()
         for session_id in list(self.sessions):
             unregister_gateway_notify(session_id)
         self.review_worker.flush(timeout=10)
@@ -280,7 +300,18 @@ class AgentServer:
             state["turns_since_memory"] = turns_since_memory
             state["persisted_count"] = persisted_count
             last = state["messages"][-1] if state["messages"] else {}
-            return last.get("content", "") if last.get("role") == "assistant" else ""
+            reply = last.get("content", "") if last.get("role") == "assistant" else ""
+            if reply:
+                thread = title_generator.maybe_auto_title(
+                    session_id,
+                    message,
+                    reply,
+                    client=self.client,
+                    conversation_history=state["messages"],
+                )
+                if thread is not None:
+                    self._title_threads.append(thread)
+            return reply
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -528,6 +559,22 @@ class _Handler(BaseHTTPRequestHandler):
                         }
                     )
             self._send_json(200, {"tools": tool_rows})
+            return
+        if parsed.path == "/working_diff":
+            query = parse_qs(parsed.query)
+            mode = (query.get("mode") or ["working"])[0]
+            paths_raw = query.get("paths")
+            paths = [p for p in paths_raw if p] if paths_raw else None
+            result = working_diff.collect_working_diff(os.getcwd(), mode=mode, paths=paths)
+            if not result.get("success") and str(result.get("error", "")).startswith(
+                "Unknown mode"
+            ):
+                self._send_json(400, result)
+            else:
+                # 附带按文件拆分的记录，供前端"右侧目录 + 左侧逐文件 diff"渲染
+                result["files"] = working_diff.parse_diff_files(result.get("diff", ""))
+                result["summary"] = working_diff.summarize_files(result["files"])
+                self._send_json(200, result)
             return
         if parsed.path.startswith("/sessions/") and parsed.path.endswith("/messages"):
             session_id = unquote(parsed.path[len("/sessions/"):-len("/messages")])

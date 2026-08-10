@@ -172,6 +172,7 @@ class ServerFixture:
                 "DASHBOARD_AUTH_SECRET",
                 "DASHBOARD_SESSION_TTL_SECONDS",
                 "DASHBOARD_COOKIE_SECURE",
+                "TITLE_GENERATION_ENABLED",
             )
         }
         os.environ.pop("SERVER_AUTH_TOKEN", None)
@@ -184,6 +185,9 @@ class ServerFixture:
             "DASHBOARD_COOKIE_SECURE",
         ):
             os.environ.pop(key, None)
+        # 标题生成默认关闭：后台 LLM 线程会污染精确调用计数（BudgetFakeClient）与
+        # 顺序假 client（seq）断言；专门的标题测试单独开启
+        os.environ["TITLE_GENERATION_ENABLED"] = "0"
         self.tmp = tempfile.TemporaryDirectory()
         # 审计默认落到临时目录，避免测试污染项目根目录的 audit.log
         os.environ["AUDIT_LOG_PATH"] = str(Path(self.tmp.name) / "audit.log")
@@ -294,12 +298,16 @@ def test_static_frontend() -> None:
         status, ctype, body = http_get(f"{fx.base}/")
         check("GET / 返回 200", status == 200)
         check("GET / 是 text/html", ctype.startswith("text/html"))
-        check("首页包含页面标题", "今天想构建什么" in body.decode("utf-8", errors="replace"))
+        index_body = body.decode("utf-8", errors="replace")
+        check("首页包含页面标题", "今天想构建什么" in index_body)
+        check("首页含工作区按钮", "btn-working-diff" in index_body)
 
         status, ctype, body = http_get(f"{fx.base}/web/app.js")
         check("GET /web/app.js 返回 200", status == 200)
         check("app.js 是 javascript", ctype.startswith("text/javascript"))
-        check("app.js 含审批轮询逻辑", "approvals/pending" in body.decode("utf-8"))
+        app_body = body.decode("utf-8", errors="replace")
+        check("app.js 含审批轮询逻辑", "approvals/pending" in app_body)
+        check("app.js 含工作区改动视图", "working-diff-view" in app_body)
 
         status, _, _ = http_get(f"{fx.base}/web/style.css")
         check("GET /web/style.css 返回 200", status == 200)
@@ -962,12 +970,13 @@ def test_delete_session_endpoint() -> None:
 
 
 def test_session_title_and_fork() -> None:
-    """会话标题 + fork：自动标题、手动改名与校验、fork 复制历史、删除源不影响分支。"""
+    """会话标题 + fork：LLM 自动标题、手动改名与校验、fork 复制历史、删除源不影响分支。"""
     import urllib.error
 
     fx = ServerFixture()
     try:
-        # 建两个消息的会话 → 自动标题取首条用户消息
+        # 开启 LLM 标题生成：首轮交换后后台线程用 FakeClient 生成"你好，我是助手"
+        os.environ["TITLE_GENERATION_ENABLED"] = "1"
         http_json(
             "POST", f"{fx.base}/chat",
             {"message": "帮我规划北京行程", "session_id": "sess-tt"},
@@ -976,9 +985,19 @@ def test_session_title_and_fork() -> None:
             "POST", f"{fx.base}/chat",
             {"message": "再加一天故宫", "session_id": "sess-tt"},
         )
-        sessions = http_json("GET", f"{fx.base}/sessions")
-        cur = next(s for s in sessions["sessions"] if s["session_id"] == "sess-tt")
-        check("自动标题取首条用户消息", cur["title"].startswith("帮我规划北京行程"))
+        # 后台线程异步落库，轮询等待标题出现
+        deadline = time.time() + 6
+        title = ""
+        while time.time() < deadline:
+            sessions = http_json("GET", f"{fx.base}/sessions")
+            cur = next(
+                (s for s in sessions["sessions"] if s["session_id"] == "sess-tt"), None
+            )
+            if cur and cur.get("title"):
+                title = cur["title"]
+                break
+            time.sleep(0.1)
+        check("LLM 自动标题（后台生成）", title == "你好，我是助手")
 
         # PATCH 改名
         patched = http_json(
@@ -988,6 +1007,15 @@ def test_session_title_and_fork() -> None:
         sessions = http_json("GET", f"{fx.base}/sessions")
         cur = next(s for s in sessions["sessions"] if s["session_id"] == "sess-tt")
         check("列表显示新标题", cur["title"] == "北京五天行程")
+
+        # 后续对话不覆盖人工改名（标题只在首轮触发 + set-if-empty 原子保护）
+        http_json(
+            "POST", f"{fx.base}/chat",
+            {"message": "帮我查一下天气", "session_id": "sess-tt"},
+        )
+        sessions = http_json("GET", f"{fx.base}/sessions")
+        cur = next(s for s in sessions["sessions"] if s["session_id"] == "sess-tt")
+        check("人工改名不被后续对话覆盖", cur["title"] == "北京五天行程")
 
         # PATCH 校验：缺 title 400、未知 404、超长 400
         try:
@@ -1096,6 +1124,89 @@ def test_turn_budget() -> None:
         minimal_agent.TURN_TOKEN_BUDGET = original_budget
 
 
+def test_working_diff_endpoint() -> None:
+    """工作区改动端点：返回 stat/diff/untracked；非法模式 400；鉴权与审计。"""
+    import urllib.error
+
+    fx = ServerFixture()
+    try:
+        data = http_json("GET", f"{fx.base}/working_diff")
+        check("working_diff 返回 success", data.get("success") is True)
+        check("working_diff 含 stat", "stat" in data)
+        check("working_diff 含 diff", "diff" in data)
+        check("working_diff 含 untracked", "untracked" in data)
+        check("working_diff 含 files", isinstance(data.get("files"), list))
+        check(
+            "files 记录字段齐全",
+            all(
+                {"path", "status", "additions", "deletions", "diff"}
+                <= set(f)
+                for f in data["files"]
+            ),
+        )
+        summary = data.get("summary", {})
+        check("summary 含文件总数", summary.get("files") == len(data["files"]))
+        check(
+            "summary 增删行数为非负整数",
+            isinstance(summary.get("additions"), int)
+            and isinstance(summary.get("deletions"), int)
+            and summary["additions"] >= 0
+            and summary["deletions"] >= 0,
+        )
+
+        # paths 过滤（tests/test_server.py 在当前仓库内，URL 编码斜杠）
+        filtered = http_json(
+            "GET", f"{fx.base}/working_diff?paths=tests%2Ftest_server.py"
+        )
+        check("paths 过滤仍 success", filtered.get("success") is True)
+        check(
+            "paths 过滤 files 只含该文件",
+            all(f["path"] == "tests/test_server.py" for f in filtered.get("files", [])),
+        )
+
+        # 非法模式 → 400 + 可读错误
+        try:
+            http_json("GET", f"{fx.base}/working_diff?mode=bogus")
+            check("非法模式 -> 400", False)
+        except urllib.error.HTTPError as exc:
+            check("非法模式 -> 400", exc.code == 400)
+            body = json.loads(exc.read().decode("utf-8", errors="replace"))
+            check("非法模式错误信息", "Unknown mode" in body.get("error", ""))
+
+        # 鉴权：配置 token 后未带 → 401；带正确 token → 200
+        os.environ["SERVER_AUTH_TOKEN"] = "wdiff-secret"
+        try:
+            try:
+                http_json("GET", f"{fx.base}/working_diff")
+                check("未带 token -> 401", False)
+            except urllib.error.HTTPError as exc:
+                check("未带 token -> 401", exc.code == 401)
+            authed = http_json(
+                "GET",
+                f"{fx.base}/working_diff",
+                headers={"Authorization": "Bearer wdiff-secret"},
+            )
+            check("带 token 正常", authed.get("success") is True)
+        finally:
+            os.environ.pop("SERVER_AUTH_TOKEN", None)
+
+        # 审计：动作名 working_diff + 200
+        log_file = Path(fx.tmp.name) / "audit.log"
+        entries = [
+            json.loads(line)
+            for line in log_file.read_text(encoding="utf-8").strip().splitlines()
+        ]
+        check(
+            "审计记录 working_diff",
+            any(
+                e.get("action") == "working_diff" and e.get("status") == 200
+                for e in entries
+            ),
+        )
+    finally:
+        fx.close()
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== HTTP 服务化回归测试 ==")
@@ -1115,6 +1226,7 @@ def main() -> None:
         test_delete_session_endpoint,
         test_session_title_and_fork,
         test_turn_budget,
+        test_working_diff_endpoint,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()
