@@ -17,6 +17,8 @@ import json
 
 from typing import Any
 
+from retry_utils import call_with_retry
+
 CONTEXT_WINDOW = int(os.environ.get("CONTEXT_WINDOW", "128000"))
 COMPRESS_THRESHOLD = 0.5  # 默认 50%（Hermes 默认）
 PROTECT_LAST_N = int(os.environ.get("PROTECT_LAST_N", "20"))
@@ -218,7 +220,12 @@ def _summarize(client, system_msg, middle: list[dict]) -> str:
         msgs.append({"role": "system", "content": system_msg["content"]})
     msgs.append({"role": "user", "content": prompt})
     try:
-        resp = client.chat.completions.create(model=model, messages=msgs, temperature=0)
+        resp = call_with_retry(
+            lambda: client.chat.completions.create(
+                model=model, messages=msgs, temperature=0
+            ),
+            what="上下文压缩",
+        )
         return (resp.choices[0].message.content or "").strip()
     except Exception:
         return ""

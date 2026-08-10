@@ -58,6 +58,7 @@ from title_generator import auto_title_session, maybe_auto_title
 from ansi_strip import strip_ansi
 from tool_output_limits import truncate_output
 from working_diff import working_diff_tool
+from retry_utils import call_with_retry
 from todo_tool import (
     TODO_SCHEMA,
     get_todo_store,
@@ -936,10 +937,14 @@ def review_memories(client: OpenAI, messages: list[dict[str, Any]]) -> dict[str,
         "没有则对应为空数组。"
     )
     try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=messages + [{"role": "user", "content": review_prompt}],
-            temperature=0,
+        resp = call_with_retry(
+            lambda: client.chat.completions.create(
+                model=MODEL,
+                messages=messages + [{"role": "user", "content": review_prompt}],
+                temperature=0,
+            ),
+            what="记忆审查",
+            on_retry=_on_llm_retry,
         )
         text = resp.choices[0].message.content or ""
         match = re.search(r"\{.*\}", text, re.S)
@@ -959,15 +964,26 @@ def create_client() -> OpenAI:
     return OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 
+def _on_llm_retry(what: str, attempt: int, delay: float, exc: Exception) -> None:
+    """调模型失败后的可见提示：告诉用户"线路忙，等一下再试"。"""
+    console.print(
+        f"[dim]（{what}失败，{delay:.1f}s 后重试第 {attempt} 次：{exc}）[/dim]"
+    )
+
+
 def call_llm(client: OpenAI, messages: list[dict[str, Any]], tools: list[dict[str, Any]]):
     """把对话消息 + 工具清单发给大模型，返回 (message, prompt_tokens)。
 
     prompt_tokens 供 turn 级 token 预算统计真实用量（对齐 Hermes 优先用 API 真实值）。
     """
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        tools=tools,
+    response = call_with_retry(
+        lambda: client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=tools,
+        ),
+        what="模型调用",
+        on_retry=_on_llm_retry,
     )
     try:
         prompt_tokens = int(response.usage.prompt_tokens or 0)
@@ -1019,11 +1035,15 @@ def call_llm_stream(
     tool_calls 按 index 累积出完整参数。返回 _StreamMessage
     （接口与非流式 message 一致）+ 流内累积的 prompt_tokens（供 turn budget 统计）。
     """
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        tools=tools,
-        stream=True,
+    response = call_with_retry(
+        lambda: client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=tools,
+            stream=True,
+        ),
+        what="流式模型调用",
+        on_retry=_on_llm_retry,
     )
     msg = _StreamMessage()
     calls: dict[int, dict[str, str]] = {}
@@ -1743,7 +1763,11 @@ def _finalize_turn_summary(
         }
     )
     try:
-        response = client.chat.completions.create(model=MODEL, messages=messages)
+        response = call_with_retry(
+            lambda: client.chat.completions.create(model=MODEL, messages=messages),
+            what="收尾调用",
+            on_retry=_on_llm_retry,
+        )
         reply = response.choices[0].message.content or ""
     except Exception as exc:
         reply = ""

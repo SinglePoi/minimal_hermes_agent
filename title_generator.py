@@ -19,6 +19,8 @@ import re
 import threading
 from typing import Any, Optional
 
+from retry_utils import call_with_retry
+
 _TITLE_PROMPT = (
     "为以下对话生成一个简短、贴切的标题（3-7 个词）。"
     "标题应抓住对话的主要话题或意图，用与用户相同的语言书写。"
@@ -78,12 +80,15 @@ def generate_title(
         {"role": "user", "content": f"用户：{user_snippet}\n\n助手：{assistant_snippet}"},
     ]
     try:
-        response = llm_client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            temperature=0.3,
-            max_tokens=500,
-            timeout=timeout if timeout is not None else _TITLE_TIMEOUT,
+        response = call_with_retry(
+            lambda: llm_client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=500,
+                timeout=timeout if timeout is not None else _TITLE_TIMEOUT,
+            ),
+            what="标题生成",
         )
         content = response.choices[0].message.content or ""
         title = _clean_title(content)

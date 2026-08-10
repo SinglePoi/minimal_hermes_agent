@@ -320,6 +320,13 @@
     git diff 文件头元信息行（diff --git/index/---/+++/mode）不显示
     （路径与状态目录树已给出），二进制文件保留一行提示；
     对齐 Hermes gateway 的 /diff 入口），不再依赖模型调用即可直接看改动
+39. **LLM 调用健壮性（重试）**（2026-08-10，对齐 Hermes `agent/retry_utils.py`
+    的 jittered_backoff 思路，简化版）：调大模型失败时按"指数退避 + 随机抖动"
+    重试——429 限流 / 5xx / 网络超时 / 断连会等 1s/2s/4s（封顶 8s，叠加随机量
+    防同步重试风暴）再试，最多 `LLM_MAX_RETRIES` 次（默认 3，0 = 不重试）；
+    400/401/403/404 等"重试也没用"的错误立即放弃；8 处调用全部接线（主循环、
+    流式、记忆审查/提取、收尾、标题生成、智能审批、上下文压缩），重试失败后
+    行为与原来一致（静默回退/报错）；流式只重试"接通"阶段，已出字不重试
 
 ## 你需要准备的
 
@@ -424,6 +431,7 @@ Web 页面已内置该流程：请求期间每 800ms 轮询，弹出审批框点
 | `MAX_AGENT_TURNS` | 单次提问内"调模型"最大轮数（防无限调工具） | `5` |
 | `TURN_TOKEN_BUDGET` | 单次提问累计 prompt token 预算（0 = 不限制；触顶请求模型收尾） | `0` |
 | `TITLE_GENERATION_ENABLED` | LLM 自动生成会话标题开关（首轮交换后后台生成；false 关闭后不自动命名） | `true` |
+| `LLM_MAX_RETRIES` | 调大模型失败时最多重试次数（429/5xx/超时/断连；0 = 不重试） | `3` |
 | `APPROVAL_DENY` | 用户自定义拒绝规则（; 分隔的 fnmatch glob，命中即无条件拦截） | 空 |
 | `TIRITH_ENABLED` | 内容级安全扫描开关（false 关闭） | `true` |
 | `TIRITH_FAIL_OPEN` | 扫描器异常时放行（true）还是拦截（false） | `true` |
@@ -845,6 +853,7 @@ python minimal_agent.py
 | 终端输出清洗 `ansi_strip.py` + `tool_output_limits.py` | `tools/ansi_strip.py`（strip_ansi）+ `tools/tool_output_limits.py`（get_max_bytes）+ `tools/terminal_tool.py`（截断→剥 ANSI→脱敏） |
 | working_diff `working_diff.py` | `tools/working_diff.py`（collect_working_diff，/diff 三模式） |
 | 网页工作区改动视图 `GET /working_diff` + 侧栏【工作区】 | Hermes gateway 的 `/diff` 入口（CLI 与 gateway 共用同一收集逻辑） |
+| LLM 调用重试 `retry_utils.py` | `agent/retry_utils.py`（jittered_backoff）+ `chat_completion_helpers.py` 的重试循环（简化版） |
 
 骨架简化掉了的工业级细节：文件锁、注入威胁扫描、外部漂移检测、可插拔 MemoryProvider、
 会话压缩后的 lineage 去重（压缩黑洞处理）、记忆主动 nudge、审批的 cron/gateway 上下文、

@@ -490,6 +490,22 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     - 测试：test_server.py 新增端点组（success/字段含 files+summary/paths
       过滤/非法模式 400/鉴权 401/审计）+ 静态断言；test_working_diff.py 新增
       parse_diff_files + summarize_files 组（拆分/状态/增删行数/汇总/路径）
+44. **LLM 调用健壮性（重试）**（2026-08-10，对齐 Hermes `agent/retry_utils.py`
+    的 jittered_backoff 思路，简化版）：
+    - 新模块 retry_utils.py：jittered_backoff（指数退避 + 随机抖动，
+      1s/2s/4s 封顶 8s，防多会话同步重试风暴）+ is_retryable_error
+      （429/5xx/超时/断连可重试；400/401/403/404 立即放弃，靠 status_code
+      或类型/关键词兜底）+ call_with_retry（首次 + LLM_MAX_RETRIES 次，
+      on_retry 回调做用户可见提示，耗尽后抛出最后一个异常）
+    - 8 处调用全部接线：call_llm / call_llm_stream（只重试 create"接通"阶段，
+      已出字不重试）/ review_memories / _finalize_turn_summary /
+      memory_provider.extract_facts_with_llm / approval 智能审批 /
+      context_compressor._summarize / title_generator.generate_title；
+      REPL 侧重试提示走 _on_llm_retry 打 dim 文案，其余静默重试；
+      重试失败后的回退行为与原来一致
+    - 环境变量 `LLM_MAX_RETRIES`（默认 3，0 = 不重试）三同步
+    - 测试：新增 tests/test_llm_retry.py（33 条断言：退避/分类/循环/上限/回调/
+      call_llm 与流式与标题接线/0 重试旁路），全套 24 套通过
 
 ## 运行方式
 

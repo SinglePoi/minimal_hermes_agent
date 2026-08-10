@@ -33,6 +33,7 @@ from rich.panel import Panel
 
 from redact import redact_sensitive_text
 from tirith import check_command_security
+from retry_utils import call_with_retry
 
 console = Console()
 BASE_DIR = Path(__file__).parent
@@ -776,14 +777,17 @@ def _smart_approve(command: str, description: str, client) -> str:
     )
     try:
         model = os.environ.get("MODEL", "deepseek-chat")
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0,
-            max_tokens=16,
+        response = call_with_retry(
+            lambda: client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0,
+                max_tokens=16,
+            ),
+            what="智能审批评估",
         )
         answer = (response.choices[0].message.content or "").strip().upper()
         # DeepSeek 常在判决后追加解释（如 "APPROVE\n\n该命令是安全的…"），

@@ -6,6 +6,8 @@ import os
 import re
 from abc import ABC, abstractmethod
 
+from retry_utils import call_with_retry
+
 _QUESTION_WORDS = (
     "什么", "怎么", "如何", "为什么", "哪里", "谁", "何时", "多少", "是否", "吗", "呢",
 )
@@ -61,10 +63,13 @@ def extract_facts_with_llm(
         f"对话：\n{convo}"
     )
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
+        resp = call_with_retry(
+            lambda: client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+            ),
+            what="记忆提取",
         )
         text = resp.choices[0].message.content or ""
         match = re.search(r"\[.*\]", text, re.S)
