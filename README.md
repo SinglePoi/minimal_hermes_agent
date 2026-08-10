@@ -336,6 +336,13 @@
     working/staged/all 摘要 + 文件清单，指定路径显示该文件完整 diff，
     未跟踪文件也可查）、`/exit` 保留原退出；未知命令提示 /help；
     REPL 状态收敛为 ReplState（/resume 的会话切换载体）
+41. **后台/常驻终端**（2026-08-10，对齐 Hermes `tools/process_registry.py`）：
+    `terminal(background=true)` 把长命令（构建/安装/起服务）转后台立即返回
+    session_id，不再阻塞对话；新 `process` 工具管理：poll（非阻塞查状态 +
+    已累积输出）/ wait（阻塞等到结束，带超时）/ kill（整棵树终止，
+    Windows taskkill /T）；stdout/stderr 由守护线程持续排空，滚动缓冲
+    200KB、返回前截断 50KB 防撑爆上下文；REPL 与 server 退出时 shutdown_all
+    兜底清理，防孤儿进程
 
 ## 你需要准备的
 
@@ -864,6 +871,7 @@ python minimal_agent.py
 | 网页工作区改动视图 `GET /working_diff` + 侧栏【工作区】 | Hermes gateway 的 `/diff` 入口（CLI 与 gateway 共用同一收集逻辑） |
 | LLM 调用重试 `retry_utils.py` | `agent/retry_utils.py`（jittered_backoff）+ `chat_completion_helpers.py` 的重试循环（简化版） |
 | REPL 斜杠命令 `/help` `/sessions` `/resume` `/diff` | Hermes CLI 的 slash 体系（`hermes_cli/commands.py`）+ `tools/working_diff.py` 的 `/diff`（骨架简化：仅 4+1 个命令） |
+| 后台进程 `process_registry.py` + `process` 工具 | `tools/process_registry.py`（spawn/poll/wait/kill，滚动 200KB 缓冲；骨架无检查点/TTL/notify） |
 
 骨架简化掉了的工业级细节：文件锁、注入威胁扫描、外部漂移检测、可插拔 MemoryProvider、
 会话压缩后的 lineage 去重（压缩黑洞处理）、记忆主动 nudge、审批的 cron/gateway 上下文、

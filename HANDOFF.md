@@ -526,6 +526,22 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     - 测试：新增 tests/test_repl_commands.py（26 条断言：help 文案/sessions
       列表与空库/diff 摘要路径与模式/resume 缺参未知与成功切换/未知命令），
       全套 25 套通过
+46. **后台/常驻终端**（2026-08-10，对齐 Hermes `tools/process_registry.py`）：
+    - 新模块 process_registry.py：spawn（Popen + 双守护线程排空 stdout/stderr，
+      滚动 200KB 缓冲防管道卡死/内存膨胀）/ poll（非阻塞状态+输出，返回前
+      截断 50KB 防撑爆上下文）/ wait（阻塞等结束带超时，超时返回部分输出）/
+      kill（Windows taskkill /T 整树终止）/ shutdown_all（REPL 与 server 退出
+      时兜底清理防孤儿进程）
+    - terminal 工具新增 background=true：过审批门卫后登记后台立即返回
+      session_id（不再阻塞对话）；新 `process` 工具（session_id + action=
+      poll|wait|kill + wait 超时）注册 TOOLS + run_tool 分发；并行白名单
+      不加（有状态/阻塞）
+    - 简化掉（Hermes 有）：JSON 检查点崩溃恢复、finished TTL 自动回收、
+      gateway 会话保护、notify_on_complete、桌面终端 tab（read_terminal/
+      close_terminal 是桌面 GUI 专用，骨架无 GUI 终端面板）
+    - 测试：新增 tests/test_process_registry.py（23 条断言：spawn/poll/wait
+      超时/kill/未知 id/process 工具入口/run_terminal background 端到端/
+      shutdown_all），全套 26 套通过
 
 ## 运行方式
 
@@ -694,14 +710,21 @@ python demo_file_tools.py
   仍无文件锁、跨 profile 检查；
   搜索仍跳过敏感文件（Hermes 也过滤敏感路径的搜索结果）
 - 并行执行中断语义已完成（见 33）；turn 级 budget 已完成（见 31）
-- 外部协议接入（候补，暂不做）：MCP（连外部工具/数据源，Hermes 有
-  `hermes_cli/mcp_config.py` + `mcp_picker.py` + `optional-mcps/`）与 ACP
-  （被 VS Code/Zed/JetBrains 等编辑器客户端调用，Hermes 有 `acp_adapter/` +
-  `hermes acp` 子命令）；2026-08-07 用户确认写入候补、暂不实施
+- 外部协议接入：MCP / ACP 已列入下方"待办模块"（2026-08-10 用户确认），未排期
 - Skills 增强：prune/reinject（20）与前置条件检查（34）已完成；剩余技能 hub 同步
   （Hermes 有，骨架简化掉了）
 - 脱敏专项已完成（DB 连接串/手机号/URL 查询参数，见 32）；多外部 memory provider 同时挂
   **有意不做**（2026-08-07 用户确认，与 Hermes 单外部 provider 设计一致）
+
+## 待办模块（Roadmap，未排期）
+
+- **MCP（Model Context Protocol）**：连外部工具/数据源。Hermes 参照：
+  `hermes_cli/mcp_config.py` + `mcp_picker.py` + `optional-mcps/` +
+  `tools/mcp_tool.py` + `mcp_serve.py`；骨架接入点：TOOLS 动态注册 + run_tool
+  分发 + 并行安全查询 + 工具搜索渐进披露（tool_search）
+- **ACP（Agent Client Protocol）**：被 VS Code / Zed / JetBrains 等编辑器
+  客户端调用。Hermes 参照：`acp_adapter/` + `hermes acp` 子命令；
+  骨架接入点：独立 adapter 模块 + CLI 子命令
 
 ## 下一阶段（前端 / 服务增强）
 
@@ -733,8 +756,9 @@ python demo_file_tools.py
   耗时/空思考等）与 HANDOFF/README 本次查漏补缺，提交由用户手动进行。
 > 下一步候选：文件工具剩余（文件锁/跨 profile）/ 运维日志与进程守护。
 > working_diff（42）、终端输出清洗（41）、LLM 自动标题（40）、LLM 重试（44）、
-> REPL 斜杠命令（45）已完成；
-> cron 审批已按用户要求取消；Skills hub 已明确暂不做。
+> REPL 斜杠命令（45）、后台/常驻终端（46）已完成；
+> MCP / ACP 已列入待办模块（未排期）；cron 审批已按用户要求取消；
+> Skills hub 已明确暂不做。
 
 ## 发版检查记录（2026-08-10，release-check 技能）
 

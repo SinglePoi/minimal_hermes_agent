@@ -63,6 +63,7 @@ from working_diff import (
     summarize_files,
     working_diff_tool,
 )
+import process_registry
 from retry_utils import call_with_retry
 from todo_tool import (
     TODO_SCHEMA,
@@ -1185,12 +1186,18 @@ TOOLS = [
                 "PowerShell 专属命令请写成 powershell -Command \"...\"）。"
                 "危险命令（删除、格式化、关机、SQL DROP 等）会先征求用户批准；"
                 "返回 JSON，含 exit_code 与 output。"
+                "长任务（构建/安装/起服务等）设 background=true 转后台立即返回 "
+                "session_id，再用 process 工具 poll/wait/kill 管理，不阻塞对话。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "要执行的完整命令"},
                     "timeout": {"type": "integer", "description": "最长等待秒数（默认 120）"},
+                    "background": {
+                        "type": "boolean",
+                        "description": "true 时后台运行（返回 session_id，配合 process 工具）",
+                    },
                 },
                 "required": ["command"],
             },
@@ -1219,6 +1226,34 @@ TOOLS = [
                         "description": "只查看这些路径的改动（可选）",
                     },
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "process",
+            "description": (
+                "管理后台进程（terminal background=true 启动的）。"
+                "action=poll 非阻塞查状态与已累积输出；action=wait 阻塞等到结束"
+                "（timeout 秒，默认 300）；action=kill 终止进程。"
+                "session_id 来自 terminal background=true 的返回值。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "后台进程的 session_id"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["poll", "wait", "kill"],
+                        "description": "poll（默认）/ wait / kill",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "wait 的最长等待秒数（默认 300）",
+                    },
+                },
+                "required": ["session_id"],
             },
         },
     },
@@ -1515,6 +1550,7 @@ def run_terminal(
     command: str,
     session_key: str,
     timeout: int = 120,
+    background: bool = False,
     client=None,
     interrupt_event: Any = None,
 ) -> str:
@@ -1545,6 +1581,11 @@ def run_terminal(
             },
             ensure_ascii=False,
         )
+
+    # 后台模式：登记到 process_registry 立即返回 session_id，
+    # 后续用 process 工具 poll/wait/kill 管理（对齐 Hermes terminal background=true）
+    if background:
+        return json.dumps(process_registry.spawn(command), ensure_ascii=False)
 
     try:
         if interrupt_event is not None:
@@ -1627,9 +1668,12 @@ def run_tool(
             command=args.get("command", ""),
             session_key=session_key,
             timeout=int(args.get("timeout", 120) or 120),
+            background=bool(args.get("background", False)),
             client=client,
             interrupt_event=interrupt_event,
         )
+    if name == "process":
+        return process_registry.process_tool(args)
     if name == "working_diff":
         return working_diff_tool(
             mode=args.get("mode", "working"),
@@ -2530,6 +2574,10 @@ def main():
     if repl_state.memory_manager:
         repl_state.memory_manager.flush_pending(timeout=10)
         repl_state.memory_manager.shutdown()
+    # 后台进程兜底清理：会话退出即终止登记的后台进程（防孤儿进程）
+    bg_killed = process_registry.shutdown_all()
+    if bg_killed:
+        console.print(f"[dim]🧹 已终止 {bg_killed} 个后台进程[/dim]")
     console.print(
         f"\n[dim]会话已保存。下次用 --resume {repl_state.session_id} 继续对话。[/dim]"
     )

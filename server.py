@@ -55,6 +55,7 @@ import dashboard_auth  # noqa: E402
 import skills  # noqa: E402
 import title_generator  # noqa: E402
 import working_diff  # noqa: E402
+import process_registry  # noqa: E402
 from approval import (  # noqa: E402
     list_pending_approvals,
     register_gateway_notify,
@@ -248,6 +249,8 @@ class AgentServer:
         for thread in self._title_threads:
             thread.join(timeout=5)
         self._title_threads.clear()
+        # 后台进程兜底清理：服务退出即终止会话内启动的后台进程（防孤儿）
+        process_registry.shutdown_all()
         for session_id in list(self.sessions):
             unregister_gateway_notify(session_id)
         self.review_worker.flush(timeout=10)
