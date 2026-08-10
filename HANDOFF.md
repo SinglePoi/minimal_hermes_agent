@@ -504,8 +504,28 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
       REPL 侧重试提示走 _on_llm_retry 打 dim 文案，其余静默重试；
       重试失败后的回退行为与原来一致
     - 环境变量 `LLM_MAX_RETRIES`（默认 3，0 = 不重试）三同步
+    - 兜底修复：重试耗尽 / 不可重试错误不再裸 Traceback——run_agent_turn 包住
+      call_llm / call_llm_stream，失败转成"（模型调用失败：...）"助手消息
+      （红色面板，REPL 与 Web 共用）；REPL 主循环再加一层防御性 except，
+      任何意外异常都提示后继续对话（一次性模式打印后退出）
     - 测试：新增 tests/test_llm_retry.py（33 条断言：退避/分类/循环/上限/回调/
-      call_llm 与流式与标题接线/0 重试旁路），全套 24 套通过
+      call_llm 与流式与标题接线/0 重试旁路/失败转助手消息），全套 25 套通过
+45. **REPL 斜杠命令**（2026-08-10，对齐 Hermes CLI 的 slash 体系）：
+    - minimal_agent.py 新增 ReplState（会话可变状态载体）与 run_slash_command：
+      /help（命令帮助）、/sessions（list_sessions 前 10 条，id+标题+消息数）、
+      /resume <id>（中途切换：load_session_history + 恢复/重建系统提示词 +
+      hydrate_todo_store + 重置 turn/persisted/nudge 计数，无需重启进程）、
+      /diff [模式|路径]（复用 collect_working_diff/parse_diff_files/summarize_files：
+      working/staged/all 摘要 + 文件清单；指定路径显示完整 diff，路径过滤不折入
+      未跟踪文件（Hermes 语义），已加"回退全量按路径找"的 REPL 补丁）
+    - 主循环接入：/exit 保留原退出；未知命令提示 /help；/resume 后刷新任务
+      清单面板；交互模式启动时打印斜杠命令提示；一次性模式遇斜杠命令处理完即退出
+    - 修复：提示符处按 Ctrl+C 不再裸 Traceback——读输入抽成 _read_user_input，
+      KeyboardInterrupt 在提示符处取消输入并回到提示（"（已取消输入，输入 /exit 退出）"），
+      EOF 照旧退出；test_repl_commands.py 补 3 条断言（interrupt/eof/正常输入）
+    - 测试：新增 tests/test_repl_commands.py（26 条断言：help 文案/sessions
+      列表与空库/diff 摘要路径与模式/resume 缺参未知与成功切换/未知命令），
+      全套 25 套通过
 
 ## 运行方式
 
@@ -712,7 +732,8 @@ python demo_file_tools.py
   HEAD `049b4c9`（用户已提交主体）；工作树剩最近收尾（旁白进托盘/todo 网页卡片/
   耗时/空思考等）与 HANDOFF/README 本次查漏补缺，提交由用户手动进行。
 > 下一步候选：文件工具剩余（文件锁/跨 profile）/ 运维日志与进程守护。
-> working_diff（42）、终端输出清洗（41）、LLM 自动标题（40）已完成；
+> working_diff（42）、终端输出清洗（41）、LLM 自动标题（40）、LLM 重试（44）、
+> REPL 斜杠命令（45）已完成；
 > cron 审批已按用户要求取消；Skills hub 已明确暂不做。
 
 ## 发版检查记录（2026-08-10，release-check 技能）

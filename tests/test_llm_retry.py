@@ -236,6 +236,41 @@ def test_generate_title_integration() -> None:
         restore()
 
 
+def test_run_agent_turn_graceful_failure() -> None:
+    """模型持续失败：重试耗尽后转成助手错误消息，不裸崩 REPL。"""
+    restore = _noop_sleep()
+    try:
+        client = FlakyClient(fails=99, status_code=502)
+        messages = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "你好"},
+        ]
+        minimal_agent.run_agent_turn(client, messages, [], None, "sess-fail")
+        last = messages[-1]
+        check(
+            "502 重试耗尽转助手消息",
+            last.get("role") == "assistant"
+            and "模型调用失败" in last.get("content", ""),
+        )
+        check("总尝试 4 次（首次+3 重试）", client.calls == 4)
+    finally:
+        restore()
+
+    # 不可重试错误（400）：一次即失败，同样转成助手消息
+    client = FlakyClient(fails=99, status_code=400)
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "你好"},
+    ]
+    minimal_agent.run_agent_turn(client, messages, [], None, "sess-fail2")
+    check(
+        "400 一次失败转助手消息",
+        client.calls == 1
+        and messages[-1].get("role") == "assistant"
+        and "模型调用失败" in messages[-1].get("content", ""),
+    )
+
+
 def main() -> None:
     """跑全部断言。"""
     test_jittered_backoff()
@@ -245,6 +280,7 @@ def main() -> None:
     test_call_llm_integration()
     test_call_llm_stream_integration()
     test_generate_title_integration()
+    test_run_agent_turn_graceful_failure()
     if _failures:
         print(f"\n{len(_failures)} 条断言失败：")
         for label in _failures:

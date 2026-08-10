@@ -57,7 +57,12 @@ import web_tools
 from title_generator import auto_title_session, maybe_auto_title
 from ansi_strip import strip_ansi
 from tool_output_limits import truncate_output
-from working_diff import working_diff_tool
+from working_diff import (
+    collect_working_diff,
+    parse_diff_files,
+    summarize_files,
+    working_diff_tool,
+)
 from retry_utils import call_with_retry
 from todo_tool import (
     TODO_SCHEMA,
@@ -971,6 +976,19 @@ def _on_llm_retry(what: str, attempt: int, delay: float, exc: Exception) -> None
     )
 
 
+def _handle_model_call_failure(exc: Exception, messages: list[dict[str, Any]]) -> None:
+    """模型调用重试耗尽 / 不可重试失败：转成助手错误消息，不裸崩。
+
+    大白话：重试 3 次还是失败（或参数错误这类重试也没用的错），就不再往上抛
+    Traceback——告诉用户"这次没调通"，本轮到此为止，下一条消息可以继续。
+    """
+    error_text = f"（模型调用失败：{exc}）"
+    console.print(
+        Panel(f"[red]{error_text}[/red]", title="🤖 助手", border_style="red")
+    )
+    messages.append({"role": "assistant", "content": error_text})
+
+
 def call_llm(client: OpenAI, messages: list[dict[str, Any]], tools: list[dict[str, Any]]):
     """把对话消息 + 工具清单发给大模型，返回 (message, prompt_tokens)。
 
@@ -1850,9 +1868,17 @@ def run_agent_turn(
         if on_token is not None:
             # 方案 B（对齐 Codex 交互）：流式也先不把 token 推给气泡——中间轮的
             # 旁白属于"过程"，走 note 事件进活动托盘；只有最终回答才一次性交给气泡
-            msg, prompt_tokens = call_llm_stream(client, messages, tools)
+            try:
+                msg, prompt_tokens = call_llm_stream(client, messages, tools)
+            except Exception as exc:
+                _handle_model_call_failure(exc, messages)
+                return
         else:
-            msg, prompt_tokens = call_llm(client, messages, tools)
+            try:
+                msg, prompt_tokens = call_llm(client, messages, tools)
+            except Exception as exc:
+                _handle_model_call_failure(exc, messages)
+                return
         api_call_count += 1
         token_used += prompt_tokens
         reasoning = getattr(msg, "reasoning_content", None) or ""
@@ -2118,6 +2144,168 @@ def process_turn(
     return turn_count, turns_since_memory, persisted_count
 
 
+class ReplState:
+    """REPL 可变状态（斜杠命令 /resume 需要中途切换会话）。"""
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        client: OpenAI,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        memory_manager: MemoryManager | None,
+        review_worker: SyncWorker,
+        turn_count: int = 0,
+        turns_since_memory: int = 0,
+        persisted_count: int = 0,
+    ) -> None:
+        self.session_id = session_id
+        self.client = client
+        self.messages = messages
+        self.tools = tools
+        self.memory_manager = memory_manager
+        self.review_worker = review_worker
+        self.turn_count = turn_count
+        self.turns_since_memory = turns_since_memory
+        self.persisted_count = persisted_count
+
+
+def _slash_help_text() -> str:
+    """生成 /help 文本：列出 REPL 可用的斜杠命令。"""
+    return (
+        "可用命令：\n"
+        "  /help            显示本帮助\n"
+        "  /sessions        列出最近的会话（含 id，供 /resume 使用）\n"
+        "  /resume <id>     切换到指定历史会话继续对话\n"
+        "  /diff [模式|路径] 查看工作区改动（模式：working/staged/all，默认 working）\n"
+        "  /exit            退出（或输入 退出 / exit / quit）"
+    )
+
+
+def _slash_sessions_text(limit: int = 10) -> str:
+    """生成 /sessions 文本：最近会话列表（id + 标题 + 消息数）。"""
+    rows = list_sessions(limit)
+    if not rows:
+        return "（暂无历史会话）"
+    lines = ["最近会话："]
+    for row in rows:
+        title = (row.get("title") or row.get("preview") or "").strip() or "（无标题）"
+        lines.append(
+            f"  {row['session_id']}  {title}  [{row.get('message_count', 0)} 条]"
+        )
+    return "\n".join(lines)
+
+
+def _slash_diff_text(arg: str = "") -> str:
+    """生成 /diff 文本：stat 摘要 + 文件清单；指定路径时附完整 diff。"""
+    mode = "working"
+    paths: list[str] | None = None
+    if arg:
+        if arg in ("working", "staged", "all"):
+            mode = arg
+        else:
+            paths = [arg]
+    result = collect_working_diff(os.getcwd(), mode=mode, paths=paths)
+    if not result.get("success"):
+        return f"无法查看工作区改动：{result.get('error', '未知错误')}"
+
+    # 指定路径：直接展示该文件 diff。注意路径过滤不折入未跟踪文件（Hermes 语义），
+    # 所以先看过滤结果，没有就回退全量 working diff 按路径找（未跟踪文件也能看）
+    if paths:
+        files = parse_diff_files(result.get("diff", ""))
+        if files:
+            return files[0]["diff"]
+        full = collect_working_diff(os.getcwd(), mode=mode)
+        hit = [
+            f
+            for f in parse_diff_files(full.get("diff", ""))
+            if f["path"] == paths[0]
+        ]
+        if hit:
+            return hit[0]["diff"]
+        return f"未找到路径 {paths[0]} 的改动（工作区 {mode} 模式）。"
+
+    if result.get("empty"):
+        return "工作区干净，没有改动。"
+    files = parse_diff_files(result.get("diff", ""))
+    summary = summarize_files(files)
+    lines = [
+        f"共 {summary['files']} 个文件 · 新增 +{summary['additions']} · "
+        f"删除 -{summary['deletions']}（{mode}）"
+    ]
+    for f in files:
+        label = {"added": "新增", "modified": "修改", "deleted": "删除"}.get(
+            f["status"], f["status"]
+        )
+        lines.append(f"  {f['path']}  [{label} +{f['additions']}/-{f['deletions']}]")
+    if paths and files:
+        lines.append("")
+        lines.append(files[0]["diff"])
+    else:
+        lines.append("（想看某个文件的完整 diff：/diff <路径>）")
+    return "\n".join(lines)
+
+
+def _slash_resume_text(arg: str, state: ReplState) -> str:
+    """执行 /resume <id>：把 REPL 切到指定会话（对齐 Hermes 的 /resume）。"""
+    target = arg.strip()
+    if not target:
+        return "用法：/resume <session_id>（先用 /sessions 查看可恢复的会话）"
+    history = load_session_history(target)
+    if not history:
+        return f"未找到会话 {target} 或它没有消息。"
+    system_prompt = load_session_prompt(target)
+    if system_prompt is None:
+        system_prompt = build_system_prompt(state.memory_manager)
+        save_session_prompt(target, system_prompt)
+    state.messages = [{"role": "system", "content": system_prompt}] + history
+    hydrate_todo_store(state.messages, target)
+    state.session_id = target
+    state.turn_count = 0
+    state.persisted_count = len(state.messages)
+    state.turns_since_memory = hydrate_nudge_counter(
+        sum(1 for m in state.messages if m.get("role") == "user"),
+        MEMORY_NUDGE_INTERVAL,
+    )
+    return f"已切换到会话 {target}（{len(history)} 条历史消息）"
+
+
+def run_slash_command(raw: str, state: ReplState) -> tuple[bool, str]:
+    """处理 REPL 斜杠命令；返回 (是否已处理, 要展示的文本)。
+
+    支持 /help /sessions /resume <id> /diff [模式|路径]；/exit 由主循环先拦截。
+    未识别的命令返回 (False, "")，由调用方提示 /help。
+    """
+    parts = (raw or "").strip().split(maxsplit=1)
+    cmd = parts[0].lower() if parts else ""
+    arg = (parts[1] if len(parts) > 1 else "").strip()
+    if cmd == "/help":
+        return True, _slash_help_text()
+    if cmd == "/sessions":
+        return True, _slash_sessions_text()
+    if cmd == "/diff":
+        return True, _slash_diff_text(arg)
+    if cmd == "/resume":
+        return True, _slash_resume_text(arg, state)
+    return False, ""
+
+
+def _read_user_input() -> tuple[str, str]:
+    """从终端读一行输入；返回 (输入内容, 状态)。
+
+    状态为 "ok"（正常输入）/ "eof"（stdin 结束，如管道输入完毕）/
+    "interrupt"（提示符处按了 Ctrl+C）。把 KeyboardInterrupt 在这里消化掉，
+    避免裸 Traceback 打断 REPL——用户误按 Ctrl+C 时回到提示继续，而不是崩掉。
+    """
+    try:
+        return console.input("\n[bold]你说（/help 查看命令）：[/bold] ").strip(), "ok"
+    except EOFError:
+        return "", "eof"
+    except KeyboardInterrupt:
+        return "", "interrupt"
+
+
 def main():
     if not API_KEY:
         console.print(
@@ -2207,21 +2395,61 @@ def main():
         console.print(
             Panel("\n".join(todo_lines), title="📋 当前任务清单", border_style="cyan")
         )
+    if not one_shot_mode:
+        console.print("[dim]提示：输入 /help 查看斜杠命令（/diff /sessions /resume /exit）[/dim]")
 
     turn_count = 0
+    repl_state = ReplState(
+        session_id=session_id,
+        client=client,
+        messages=messages,
+        tools=tools,
+        memory_manager=memory_manager,
+        review_worker=review_worker,
+        turn_count=turn_count,
+        turns_since_memory=turns_since_memory,
+        persisted_count=persisted_count,
+    )
     while True:
         if one_shot is not None:
             user_input = one_shot
             one_shot = None  # 一次性参数用完后进入交互模式
         else:
-            try:
-                user_input = console.input("\n[bold]你说（输入 退出 结束）：[/bold] ").strip()
-            except EOFError:  # stdin 结束（如管道输入完毕）
+            user_input, input_state = _read_user_input()
+            if input_state == "eof":  # stdin 结束（如管道输入完毕）
                 break
+            if input_state == "interrupt":
+                # 提示符处 Ctrl+C：取消本次输入，回到提示继续（不打印裸 Traceback）
+                console.print("\n[yellow]（已取消输入，输入 /exit 退出）[/yellow]")
+                continue
         if not user_input:
             continue
         if user_input in ("退出", "exit", "quit", "/exit"):
             break
+
+        # 斜杠命令：/help /sessions /resume <id> /diff [模式|路径]（对齐 Hermes CLI）
+        if user_input.startswith("/"):
+            handled, slash_text = run_slash_command(user_input, repl_state)
+            if handled:
+                if slash_text:
+                    console.print(slash_text)
+                # /resume 切换会话后刷新任务清单面板
+                todo_lines = render_todo_lines(get_todo_store(repl_state.session_id))
+                if todo_lines:
+                    console.print(
+                        Panel(
+                            "\n".join(todo_lines),
+                            title="📋 当前任务清单",
+                            border_style="cyan",
+                        )
+                    )
+                if one_shot_mode:
+                    break
+                continue
+            console.print("[yellow]未知命令，输入 /help 查看可用命令。[/yellow]")
+            if one_shot_mode:
+                break
+            continue
 
         # REPL 中断接线：每轮一个全新 interrupt_event，Ctrl+C 打断本轮而不是杀进程
         # （对齐 Hermes：interrupt 置位后 run_agent_turn 在轮次边界停止；模型调用
@@ -2229,59 +2457,82 @@ def main():
         turn_event = threading.Event()
         try:
             turn_count, turns_since_memory, persisted_count = process_turn(
-                client,
-                messages,
-                tools,
-                memory_manager,
-                session_id,
+                repl_state.client,
+                repl_state.messages,
+                repl_state.tools,
+                repl_state.memory_manager,
+                repl_state.session_id,
                 user_input,
-                turn_count,
-                turns_since_memory,
-                review_worker,
-                persisted_count,
+                repl_state.turn_count,
+                repl_state.turns_since_memory,
+                repl_state.review_worker,
+                repl_state.persisted_count,
                 interrupt_event=turn_event,
             )
+            repl_state.turn_count = turn_count
+            repl_state.turns_since_memory = turns_since_memory
+            repl_state.persisted_count = persisted_count
         except KeyboardInterrupt:
             turn_event.set()
             console.print("\n[yellow]（已中断本轮，输入新问题继续对话）[/yellow]")
             # 补一条中断标记，保持消息历史连贯（对齐 run_agent_turn 的"已中断"收尾）
-            if not messages or messages[-1].get("role") != "assistant":
-                messages.append({"role": "assistant", "content": "（已中断，本轮停止）"})
+            if not repl_state.messages or repl_state.messages[-1].get("role") != "assistant":
+                repl_state.messages.append(
+                    {"role": "assistant", "content": "（已中断，本轮停止）"}
+                )
+            if one_shot_mode:
+                break
+            continue
+        except Exception as exc:
+            # 防御兜底：任何意外异常都不让 REPL 裸崩，提示后继续对话
+            console.print(
+                Panel(
+                    f"[red]（本轮处理失败：{exc}）[/red]",
+                    title="🤖 助手",
+                    border_style="red",
+                )
+            )
             if one_shot_mode:
                 break
             continue
 
         # LLM 生成会话标题（对齐 Hermes title_generator）：一次性模式同步生成后
         # 退出（进程即将结束，后台线程会被杀）；交互模式后台异步不阻塞对话
-        last_msg = messages[-1] if messages else {}
+        last_msg = repl_state.messages[-1] if repl_state.messages else {}
         reply = last_msg.get("content", "") if last_msg.get("role") == "assistant" else ""
         if reply:
             if one_shot_mode:
-                auto_title_session(session_id, user_input, reply, client)
+                auto_title_session(
+                    repl_state.session_id, user_input, reply, repl_state.client
+                )
             else:
                 maybe_auto_title(
-                    session_id,
+                    repl_state.session_id,
                     user_input,
                     reply,
-                    client=client,
-                    conversation_history=messages,
+                    client=repl_state.client,
+                    conversation_history=repl_state.messages,
                 )
 
         if one_shot_mode:
             break  # 一次性问题已答完，退出
 
     # 会话结束：最后一次记忆审查（后台执行），排空后干净退出
-    if turn_count > 0:
-        review_worker.submit(
-            lambda msgs=list(messages), cli=client: review_memory_turn(cli, msgs)
+    if repl_state.turn_count > 0:
+        repl_state.review_worker.submit(
+            lambda msgs=list(repl_state.messages), cli=repl_state.client: review_memory_turn(
+                cli, msgs
+            )
         )
-    review_worker.flush(timeout=10)
-    review_worker.shutdown()
+    repl_state.review_worker.flush(timeout=10)
+    repl_state.review_worker.shutdown()
     # 排空后台记忆同步（有界等待，不阻塞退出；同步卡住则放弃）
-    if memory_manager:
-        memory_manager.flush_pending(timeout=10)
-        memory_manager.shutdown()
-    console.print(f"\n[dim]会话已保存。下次用 --resume {session_id} 继续对话。[/dim]")
+    if repl_state.memory_manager:
+        repl_state.memory_manager.flush_pending(timeout=10)
+        repl_state.memory_manager.shutdown()
+    console.print(
+        f"\n[dim]会话已保存。下次用 --resume {repl_state.session_id} 继续对话。[/dim]"
+    )
 
 
 if __name__ == "__main__":

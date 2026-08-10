@@ -326,7 +326,16 @@
     防同步重试风暴）再试，最多 `LLM_MAX_RETRIES` 次（默认 3，0 = 不重试）；
     400/401/403/404 等"重试也没用"的错误立即放弃；8 处调用全部接线（主循环、
     流式、记忆审查/提取、收尾、标题生成、智能审批、上下文压缩），重试失败后
-    行为与原来一致（静默回退/报错）；流式只重试"接通"阶段，已出字不重试
+    行为与原来一致（静默回退/报错）；**重试耗尽或不可重试错误会转成助手错误
+    消息（REPL 与 Web 都不再裸 Traceback），本轮结束、可继续对话**；
+    流式只重试"接通"阶段，已出字不重试
+40. **REPL 斜杠命令**（2026-08-10，对齐 Hermes CLI 的 slash 体系）：
+    `/help`（命令帮助）、`/sessions`（列出最近会话含 id/标题/消息数）、
+    `/resume <id>`（**中途切换会话**：重载系统提示词与历史、水合 todo 清单、
+    重置轮次/落库计数，无需重启）、`/diff [模式|路径]`（工作区改动：
+    working/staged/all 摘要 + 文件清单，指定路径显示该文件完整 diff，
+    未跟踪文件也可查）、`/exit` 保留原退出；未知命令提示 /help；
+    REPL 状态收敛为 ReplState（/resume 的会话切换载体）
 
 ## 你需要准备的
 
@@ -854,6 +863,7 @@ python minimal_agent.py
 | working_diff `working_diff.py` | `tools/working_diff.py`（collect_working_diff，/diff 三模式） |
 | 网页工作区改动视图 `GET /working_diff` + 侧栏【工作区】 | Hermes gateway 的 `/diff` 入口（CLI 与 gateway 共用同一收集逻辑） |
 | LLM 调用重试 `retry_utils.py` | `agent/retry_utils.py`（jittered_backoff）+ `chat_completion_helpers.py` 的重试循环（简化版） |
+| REPL 斜杠命令 `/help` `/sessions` `/resume` `/diff` | Hermes CLI 的 slash 体系（`hermes_cli/commands.py`）+ `tools/working_diff.py` 的 `/diff`（骨架简化：仅 4+1 个命令） |
 
 骨架简化掉了的工业级细节：文件锁、注入威胁扫描、外部漂移检测、可插拔 MemoryProvider、
 会话压缩后的 lineage 去重（压缩黑洞处理）、记忆主动 nudge、审批的 cron/gateway 上下文、
