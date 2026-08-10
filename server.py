@@ -20,6 +20,7 @@ HTTP 服务化 + gateway 审批通知（为前端铺路，对齐 Hermes dashboar
     GET  /plugins                记忆 provider 插件列表（name + description + active）
     GET  /tools                  可用工具列表（核心 TOOLS + provider 自带工具）
     GET  /working_diff           工作区 git 改动（stat + diff + untracked；mode/paths 查询参数）
+    GET  /sessions/<id>/export   导出会话（?format=md|html，默认 md，附件下载）
 
 审批流程（对齐 Hermes 的网关队列）：
     - /chat 请求里的 agent 线程在危险命令处通过 approval.py 的网关队列阻塞等待
@@ -56,6 +57,7 @@ import skills  # noqa: E402
 import title_generator  # noqa: E402
 import working_diff  # noqa: E402
 import process_registry  # noqa: E402
+import session_export  # noqa: E402
 from approval import (  # noqa: E402
     list_pending_approvals,
     register_gateway_notify,
@@ -132,6 +134,8 @@ def _audit_action(path: str, method: str = "GET") -> str:
         return "sessions:fork"
     if path.startswith("/sessions/") and path.endswith("/archive"):
         return "sessions:archive"
+    if path.startswith("/sessions/") and path.endswith("/export"):
+        return "sessions:export"
     if path.startswith("/sessions/") and path.endswith("/messages"):
         return "sessions:messages"
     if path.startswith("/sessions/"):
@@ -578,6 +582,38 @@ class _Handler(BaseHTTPRequestHandler):
                 result["files"] = working_diff.parse_diff_files(result.get("diff", ""))
                 result["summary"] = working_diff.summarize_files(result["files"])
                 self._send_json(200, result)
+            return
+        if parsed.path.startswith("/sessions/") and parsed.path.endswith("/export"):
+            session_id = unquote(parsed.path[len("/sessions/"):-len("/export")])
+            if not session_id or "/" in session_id:
+                self._send_json(404, {"error": "not found"})
+                return
+            self._audit_session_id = session_id
+            fmt = (parse_qs(parsed.query).get("format") or ["md"])[0].lower()
+            if fmt not in ("md", "html"):
+                self._send_json(400, {"error": "format must be md or html"})
+                return
+            if not minimal_agent.load_session_messages(session_id):
+                self._send_json(404, {"error": "session not found or empty"})
+                return
+            content = (
+                session_export.export_session_html(session_id)
+                if fmt == "html"
+                else session_export.export_session_md(session_id)
+            )
+            filename = f"session-{session_id}.{fmt}"
+            self._last_status = 200
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                "text/markdown; charset=utf-8" if fmt == "md" else "text/html; charset=utf-8",
+            )
+            self.send_header(
+                "Content-Disposition", f'attachment; filename="{filename}"'
+            )
+            self.send_header("Content-Length", str(len(content.encode("utf-8"))))
+            self.end_headers()
+            self.wfile.write(content.encode("utf-8"))
             return
         if parsed.path.startswith("/sessions/") and parsed.path.endswith("/messages"):
             session_id = unquote(parsed.path[len("/sessions/"):-len("/messages")])

@@ -343,6 +343,14 @@
     Windows taskkill /T）；stdout/stderr 由守护线程持续排空，滚动缓冲
     200KB、返回前截断 50KB 防撑爆上下文；REPL 与 server 退出时 shutdown_all
     兜底清理，防孤儿进程
+42. **会话导出**（2026-08-10，对齐 Hermes `hermes_cli/session_export_md.py`
+    + `session_export_html.py`，简化版）：新模块 session_export.py 把会话
+    渲染成 Markdown（frontmatter + 逐条消息头）或独立 HTML（内容转义防 XSS、
+    零依赖内联样式）；REPL 新增 `/export <id> [md|html]` 写到 `./exports/`；
+    Web 侧栏会话条目新增【导出】按钮（带鉴权下载 md）；服务端
+    `GET /sessions/<id>/export?format=md|html`（附件下载，走统一鉴权 +
+    审计 sessions:export）。简化掉：SHA256 导出校验、压缩分段、tool_calls
+    明细（Hermes 有）
 
 ## 你需要准备的
 
@@ -872,6 +880,7 @@ python minimal_agent.py
 | LLM 调用重试 `retry_utils.py` | `agent/retry_utils.py`（jittered_backoff）+ `chat_completion_helpers.py` 的重试循环（简化版） |
 | REPL 斜杠命令 `/help` `/sessions` `/resume` `/diff` | Hermes CLI 的 slash 体系（`hermes_cli/commands.py`）+ `tools/working_diff.py` 的 `/diff`（骨架简化：仅 4+1 个命令） |
 | 后台进程 `process_registry.py` + `process` 工具 | `tools/process_registry.py`（spawn/poll/wait/kill，滚动 200KB 缓冲；骨架无检查点/TTL/notify） |
+| 会话导出 `session_export.py` + `/export` | `hermes_cli/session_export_md.py` + `session_export_html.py`（骨架简化：无 SHA256 校验/分段/tool_calls） |
 
 骨架简化掉了的工业级细节：文件锁、注入威胁扫描、外部漂移检测、可插拔 MemoryProvider、
 会话压缩后的 lineage 去重（压缩黑洞处理）、记忆主动 nudge、审批的 cron/gateway 上下文、

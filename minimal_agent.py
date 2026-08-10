@@ -2222,6 +2222,7 @@ def _slash_help_text() -> str:
         "  /help            显示本帮助\n"
         "  /sessions        列出最近的会话（含 id，供 /resume 使用）\n"
         "  /resume <id>     切换到指定历史会话继续对话\n"
+        "  /export <id> [md|html]  导出会话到 ./exports/（默认 md）\n"
         "  /diff [模式|路径] 查看工作区改动（模式：working/staged/all，默认 working）\n"
         "  /exit            退出（或输入 退出 / exit / quit）"
     )
@@ -2315,6 +2316,21 @@ def _slash_resume_text(arg: str, state: ReplState) -> str:
     return f"已切换到会话 {target}（{len(history)} 条历史消息）"
 
 
+def _slash_export_text(arg: str) -> str:
+    """执行 /export <id> [md|html]：写文件并返回路径。"""
+    parts = arg.split(maxsplit=1)
+    target = parts[0] if parts else ""
+    fmt = parts[1] if len(parts) > 1 else "md"
+    if not target:
+        return "用法：/export <session_id> [md|html]（默认 md，写到 ./exports/ 下）"
+    from session_export import export_session_file  # noqa: PLC0415
+
+    result = export_session_file(target, fmt)
+    if result.get("success"):
+        return f"已导出到 {result['path']}"
+    return result.get("error", "导出失败")
+
+
 def run_slash_command(raw: str, state: ReplState) -> tuple[bool, str]:
     """处理 REPL 斜杠命令；返回 (是否已处理, 要展示的文本)。
 
@@ -2332,6 +2348,8 @@ def run_slash_command(raw: str, state: ReplState) -> tuple[bool, str]:
         return True, _slash_diff_text(arg)
     if cmd == "/resume":
         return True, _slash_resume_text(arg, state)
+    if cmd == "/export":
+        return True, _slash_export_text(arg)
     return False, ""
 
 

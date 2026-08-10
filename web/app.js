@@ -19,6 +19,7 @@ const API = {
   authLogout: "/api/auth/logout",
   sessionsMessages: (id) => "/sessions/" + encodeURIComponent(id) + "/messages",
   sessionsArchive: (id) => "/sessions/" + encodeURIComponent(id) + "/archive",
+  sessionExport: (id) => "/sessions/" + encodeURIComponent(id) + "/export?format=md",
   sessionDelete: (id) => "/sessions/" + encodeURIComponent(id),
   sessionFork: (id) => "/sessions/" + encodeURIComponent(id) + "/fork",
 };
@@ -625,7 +626,15 @@ function renderSessionList(list) {
       e.stopPropagation();
       forkSession(s.session_id);
     });
-    item.append(action, fork);
+    const exportBtn = document.createElement("button");
+    exportBtn.type = "button";
+    exportBtn.className = "session-item-action";
+    exportBtn.textContent = "导出";
+    exportBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      exportSession(s.session_id);
+    });
+    item.append(action, fork, exportBtn);
 
     item.addEventListener(
       "click",
@@ -638,6 +647,33 @@ function renderSessionList(list) {
     });
     box.appendChild(item);
   });
+}
+
+async function exportSession(sessionId) {
+  try {
+    let resp = await fetch(API.sessionExport(sessionId), { headers: authHeaders() });
+    if (resp.status === 401) {
+      if (state.loginAvailable) {
+        window.location.href = "/login";
+        return;
+      }
+      const ok = await requestToken();
+      if (!ok) return;
+      resp = await fetch(API.sessionExport(sessionId), { headers: authHeaders() });
+    }
+    if (!resp.ok) return;
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "session-" + sessionId + ".md";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    /* 静默：导出失败不影响主界面 */
+  }
 }
 
 async function loadSessionList() {

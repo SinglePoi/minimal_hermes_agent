@@ -542,6 +542,22 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     - 测试：新增 tests/test_process_registry.py（23 条断言：spawn/poll/wait
       超时/kill/未知 id/process 工具入口/run_terminal background 端到端/
       shutdown_all），全套 26 套通过
+47. **会话导出**（2026-08-10，对齐 Hermes `hermes_cli/session_export_md.py`
+    + `session_export_html.py`，简化版）：
+    - 新模块 session_export.py：export_session_md（frontmatter：session_id/
+      title/created_at/updated_at/message_count/format/exported_at/exporter +
+      `# 标题` + `### 角色 — 时间` 逐条消息）/ export_session_html（独立
+      HTML，内容全部转义防 XSS、内联样式区分用户/助手气泡）/ export_session_file
+      （写到 ./exports/，md|html）
+    - 接入：REPL `/export <id> [md|html]`（写文件返回路径，/help 更新）；
+      server `GET /sessions/<id>/export?format=md|html`（附件下载 + 统一鉴权 +
+      审计 action=sessions:export）；Web 侧栏会话条目新增【导出】按钮
+      （fetch 带鉴权头 → blob 下载 md）
+    - 简化掉（Hermes 有）：SHA256 导出校验、压缩分段、tool_calls 明细、
+      provider/model 等元信息
+    - 测试：新增 tests/test_session_export.py（22 条断言：md/html 内容与转义/
+      文件导出/格式与会话校验/REPL 命令）+ test_server.py 导出端点组
+      （md/html/400/404/401/审计/静态断言），全套 27 套通过
 
 ## 运行方式
 

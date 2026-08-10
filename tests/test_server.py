@@ -308,6 +308,7 @@ def test_static_frontend() -> None:
         app_body = body.decode("utf-8", errors="replace")
         check("app.js 含审批轮询逻辑", "approvals/pending" in app_body)
         check("app.js 含工作区改动视图", "working-diff-view" in app_body)
+        check("app.js 含会话导出逻辑", "sessionExport" in app_body)
 
         status, _, _ = http_get(f"{fx.base}/web/style.css")
         check("GET /web/style.css 返回 200", status == 200)
@@ -1207,6 +1208,75 @@ def test_working_diff_endpoint() -> None:
         fx.close()
 
 
+def test_session_export_endpoint() -> None:
+    """会话导出端点：md/html 内容、格式与未知会话校验、鉴权与审计。"""
+    fx = ServerFixture()
+    try:
+        # 直接造会话（不走 /chat，避免依赖 LLM 假 client 的回复内容）
+        conn = minimal_agent._db_conn()
+        conn.execute(
+            "INSERT INTO sessions (session_id, system_prompt, title) VALUES (?, ?, ?)",
+            ("sess-exp", "p", "导出测试会话"),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+            ("sess-exp", "user", "帮我写个总结"),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+            ("sess-exp", "assistant", "这是总结内容"),
+        )
+        conn.commit()
+        conn.close()
+
+        status, ctype, body = http_get(f"{fx.base}/sessions/sess-exp/export")
+        check("导出 md 200", status == 200)
+        check("导出 md 类型", ctype.startswith("text/markdown"))
+        md = body.decode("utf-8", errors="replace")
+        check("md 含标题", "导出测试会话" in md)
+        check("md 含消息", "帮我写个总结" in md and "这是总结内容" in md)
+
+        status, ctype, body = http_get(
+            f"{fx.base}/sessions/sess-exp/export?format=html"
+        )
+        check("导出 html 200", status == 200)
+        check("导出 html 类型", ctype.startswith("text/html"))
+        check(
+            "html 含 DOCTYPE",
+            body.decode("utf-8", errors="replace").startswith("<!DOCTYPE html>"),
+        )
+
+        # 格式校验 / 未知会话
+        status, _, _ = http_get(f"{fx.base}/sessions/sess-exp/export?format=pdf")
+        check("未知格式 -> 400", status == 400)
+        status, _, _ = http_get(f"{fx.base}/sessions/ghost-exp/export")
+        check("未知会话 -> 404", status == 404)
+
+        # 鉴权
+        os.environ["SERVER_AUTH_TOKEN"] = "exp-secret"
+        try:
+            status, _, _ = http_get(f"{fx.base}/sessions/sess-exp/export")
+            check("未带 token -> 401", status == 401)
+        finally:
+            os.environ.pop("SERVER_AUTH_TOKEN", None)
+
+        # 审计
+        log_file = Path(fx.tmp.name) / "audit.log"
+        entries = [
+            json.loads(line)
+            for line in log_file.read_text(encoding="utf-8").strip().splitlines()
+        ]
+        check(
+            "审计记录 sessions:export",
+            any(
+                e.get("action") == "sessions:export" and e.get("status") == 200
+                for e in entries
+            ),
+        )
+    finally:
+        fx.close()
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== HTTP 服务化回归测试 ==")
@@ -1227,6 +1297,7 @@ def main() -> None:
         test_session_title_and_fork,
         test_turn_budget,
         test_working_diff_endpoint,
+        test_session_export_endpoint,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()
