@@ -201,8 +201,8 @@ class AgentServer:
             self.sessions[session_id] = state
         return state
 
-    def handle_message(self, session_id: str, state: dict, message: str) -> tuple[str, list]:
-        """处理一条消息，返回助手最终回答文本。"""
+    def handle_message(self, session_id: str, state: dict, message: str) -> tuple[str, list, list]:
+        """处理一条消息，返回 (最终回答, 过程事件, 当前任务清单)。"""
         events: list[dict[str, Any]] = []
         with state["lock"]:
             turn_count, turns_since_memory, persisted_count = minimal_agent.process_turn(
@@ -223,7 +223,8 @@ class AgentServer:
             state["persisted_count"] = persisted_count
             last = state["messages"][-1] if state["messages"] else {}
             reply = last.get("content", "") if last.get("role") == "assistant" else ""
-            return reply, events
+            todos = minimal_agent.get_todo_store(session_id).read()
+            return reply, events, todos
 
     def shutdown(self) -> None:
         """排空后台任务、注销所有网关回调。"""
@@ -536,9 +537,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._audit_session_id = session_id
             messages = minimal_agent.load_session_messages(session_id)
             events = minimal_agent.load_session_events(session_id)
+            # 恢复会话时水合 todo 清单，随历史一并返回（网页常驻任务清单卡片）
+            minimal_agent.hydrate_todo_store(messages, session_id)
+            todos = minimal_agent.get_todo_store(session_id).read()
             self._send_json(
                 200,
-                {"session_id": session_id, "messages": messages, "events": events},
+                {
+                    "session_id": session_id,
+                    "messages": messages,
+                    "events": events,
+                    "todos": todos,
+                },
             )
             return
         self._send_json(404, {"error": "not found"})
@@ -594,7 +603,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._audit_session_id = session_id
             try:
                 state = self.server.app.get_session(session_id)
-                reply, events = self.server.app.handle_message(session_id, state, message)
+                reply, events, todos = self.server.app.handle_message(
+                    session_id, state, message
+                )
             except Exception as exc:
                 self._send_json(500, {"error": str(exc)})
                 return
@@ -604,6 +615,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "session_id": session_id,
                     "reply": reply,
                     "events": events,
+                    "todos": todos,
                 },
             )
             return

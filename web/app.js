@@ -333,6 +333,7 @@ function renderReplayTray(events) {
     refresh();
   });
   events.forEach((ev) => {
+    if (ev.type === "todo") return;  // todo 事件走常驻清单卡片，不进托盘
     const built = buildActivityItem(ev);
     if (built) body.appendChild(built.item);
   });
@@ -354,6 +355,49 @@ function setThinking(on) {
     const el = chatEl.querySelector(".msg.thinking");
     if (el) el.remove();
   }
+}
+
+const todoPanel = $("todo-panel");
+const TODO_MARKS = { pending: "[ ]", in_progress: "[>]", completed: "[x]", cancelled: "[~]" };
+
+function renderTodoPanel(todos) {
+  todoPanel.textContent = "";
+  if (!todos || !todos.length) {
+    todoPanel.classList.add("hidden");
+    return;
+  }
+  const head = document.createElement("div");
+  head.className = "todo-panel-head";
+  head.textContent = "📋 任务清单";
+  const body = document.createElement("div");
+  body.className = "todo-panel-body";
+  todos.forEach((t) => {
+    const row = document.createElement("div");
+    row.className = "todo-item";
+    const mark = document.createElement("span");
+    mark.className = "todo-mark";
+    mark.textContent = TODO_MARKS[t.status] || "[?]";
+    const label = document.createElement("span");
+    label.textContent = t.content;
+    row.append(mark, label);
+    body.appendChild(row);
+  });
+  todoPanel.append(head, body);
+  todoPanel.classList.remove("hidden");
+}
+
+function handleActivityEvent(ev, tray) {
+  // todo 事件：更新常驻任务清单卡片，不进活动托盘
+  if (ev.type === "todo") {
+    try {
+      const list = JSON.parse(ev.result || "[]");
+      renderTodoPanel(Array.isArray(list) ? list : []);
+    } catch (e) {
+      /* 解析失败忽略 */
+    }
+    return;
+  }
+  renderActivity(ev, tray);
 }
 
 async function httpJson(method, url, body, retried) {
@@ -932,9 +976,11 @@ async function switchSession(id, title) {
         }
       });
     }
+    renderTodoPanel(data.todos || []);
   } catch (e) {
     appendMessage("error", "加载会话历史失败：" + e.message);
     showThread();
+    renderTodoPanel([]);
   }
   loadSessionList();
   inputEl.focus();
@@ -1102,7 +1148,7 @@ async function sendStreaming(body, retried) {
   };
 
   await readSse(resp, {
-    activity: (ev) => renderActivity(ev, tray),
+    activity: (ev) => handleActivityEvent(ev, tray),
     token: (d) => {
       replyText += d.text || "";
       bubble.textContent = replyText;
@@ -1158,9 +1204,10 @@ async function sendMessage() {
       }
       setThinking(false);
       const tray = beginActivityTray();  // 活动在消息上方，一次性返回后立即收拢
-      (data.events || []).forEach((ev) => renderActivity(ev, tray));
+      (data.events || []).forEach((ev) => handleActivityEvent(ev, tray));
       finalizeTray(tray);
       appendMessage("assistant", data.reply || "(空回复)");
+      renderTodoPanel(data.todos || []);
     }
   } catch (e) {
     if (token !== turnToken) return;  // 过期错误不展示
@@ -1196,6 +1243,7 @@ function newSession() {
   chatEl.querySelectorAll(".msg, .activity, .activity-tray").forEach((el) => el.remove());
   Object.keys(activityById).forEach((k) => delete activityById[k]);
   currentTray = null;
+  renderTodoPanel([]);
   stopPolling();
   $("approval-overlay").classList.add("hidden");
   showHome();

@@ -289,6 +289,12 @@
       （要求 tool 结果与之前的 assistant todo 调用配对，防伪造注入；
       超大结果跳过）；条目内容/总数有上限防膨胀
     - 已接入并行规划器顺序屏障（有状态写入不与只读工具并发）
+    - 网页常驻任务清单卡片：模型动过 todo 后前端渲染「📋 任务清单」卡片
+      （[ ]/[>]/[x]/[~] 状态标记），/chat 响应与历史接口都返回 todos，
+      切换会话自动还原；不占用活动托盘
+35. **Windows 控制台 UTF-8 兜底**（2026-08-10，发版检查发现并修复）：minimal_agent.py
+    在 `console = Console()` 前对 win32 stdout/stderr 做 `reconfigure(encoding="utf-8")`，
+    修复 GBK 控制台下 rich 渲染 emoji 崩溃；日常运行无需手动设 PYTHONIOENCODING
 
 ## 你需要准备的
 
@@ -328,7 +334,8 @@ python minimal_agent.py "北京天气怎么样"
 python minimal_agent.py
 ```
 
-如果中文显示乱码，先执行：
+Windows 控制台 UTF-8 已内置兜底（minimal_agent.py 顶部 win32 reconfigure），
+正常情况下无需手动设置；终端若仍显示乱码（代码页显示问题），执行：
 
 ```powershell
 $env:PYTHONIOENCODING="utf-8"

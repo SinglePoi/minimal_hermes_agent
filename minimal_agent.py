@@ -1844,6 +1844,22 @@ def run_agent_turn(
                 if sink is not None:
                     sink(dict(ev))
 
+            # todo 可视化：模型动过任务清单就发一条 todo 事件（完整清单），
+            # 网页据此渲染常驻任务清单卡片（与 REPL 的 📋 面板对应）
+            if any(tool_name(tc) == "todo" for tc in tool_calls):
+                _record_event(
+                    events,
+                    sink,
+                    {
+                        "type": "todo",
+                        "name": "任务清单",
+                        "args": "",
+                        "result": json.dumps(
+                            get_todo_store(session_key).read(), ensure_ascii=False
+                        ),
+                    },
+                )
+
             continue  # 回到循环开头，把结果再发给大模型
 
         # 模型直接给了文字回答 → 流式下一次性把内容交给气泡，写回历史并输出

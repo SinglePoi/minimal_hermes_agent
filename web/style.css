@@ -605,6 +605,48 @@ html, body {
   display: none;
 }
 
+/* 任务清单卡片（todo 工具，常驻展示当前会话任务） */
+.todo-panel {
+  margin: 0 22px 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: rgba(250, 247, 240, 0.55);
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.todo-panel.hidden {
+  display: none;
+}
+
+.todo-panel-head {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.todo-panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.todo-item {
+  display: flex;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.todo-mark {
+  color: var(--muted);
+  font-family: Consolas, "Courier New", monospace;
+}
+
 /* 输入区（毛玻璃） */
 .composer {
   display: flex;

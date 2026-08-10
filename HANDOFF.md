@@ -422,8 +422,17 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
       _NEVER_PARALLEL_TOOLS 加入 todo（有状态写入不与只读工具并发）
     - REPL 可视化：render_todo_lines 渲染清单行；模型每轮动过 todo 就打印
       「📋 当前任务清单」面板，启动/恢复会话时也先展示已有清单（对齐"人工可盯进度"）
+    - 网页常驻任务清单卡片（2026-08-10）：run_agent_turn 在 todo 工具执行后发
+      type=todo 事件（完整清单 JSON）；/chat 响应与 GET /sessions/<id>/messages
+      均返回 todos（历史接口先水合 store）；前端 handleActivityEvent 把 todo
+      事件路由到常驻卡片（不进活动托盘），切换会话/新对话时按响应还原或隐藏
     - 测试：新增 tests/test_todo_tool.py（7 组：store 基础/merge/注入格式/入口/注册表/
       水合/接入含压缩重注入），全套 20 套通过
+39. **Windows 控制台 UTF-8 兜底**（2026-08-10，release-check 会话发现并修复）：
+    minimal_agent.py 在 `console = Console()` 前对 win32 的 stdout/stderr 做
+    `reconfigure(encoding="utf-8")`——修复 GBK 控制台下 rich 渲染 emoji 抛
+    UnicodeEncodeError 首屏崩溃的问题；日常 REPL/冒烟不再需要手动设
+    PYTHONIOENCODING（终端显示乱码属代码页显示问题，可 `chcp 65001`）
 
 ## 运行方式
 
@@ -444,10 +453,14 @@ python demo_file_tools.py
 - 环境变量在 `.env`（DeepSeek 用 `DEEPSEEK_API_KEY`；向量用 `EMBEDDING_*`，已配好）
 - 配置源：`.env` 优先于系统环境变量（`load_dotenv(override=True)`，2026-08-07 按用户要求调整）
 - 常用开关：`MEMORY_PROVIDER=vector`（语义召回）、`CONTEXT_WINDOW`、`PROTECT_LAST_N`
-- Windows 中文乱码先设 `$env:PYTHONIOENCODING="utf-8"`
+- Windows 控制台 UTF-8 已内置兜底（见 39）；终端仍乱码可 `chcp 65001`
 - 本机测试可用内置 Python：`C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`
-- 提交策略：由用户手动提交；当前 HEAD `01d8b72`（脱敏专项 + 并行执行中断语义，2026-08-07），
-  前序 `b9a0a7f`（turn budget）、`4e07047`（骨架核心 + 服务增强线）；工作树干净，新会话先看 `git status`
+- 提交策略：由用户手动提交；当前 HEAD `049b4c9`（文档抽取/todo 工具/事件托盘等，
+  2026-08-10），前序 `01d8b72`（脱敏专项 + 并行执行中断语义）、`b9a0a7f`（turn budget）
+- ⚠️ 工作树仍有未提交改动（提交由用户手动进行，新会话先看 `git status`）：
+  最近的 Codex 式过程展示收尾——旁白进托盘（note）、活动托盘耗时/工具默认收拢/
+  空思考不显示、todo 网页常驻卡片、duration_ms、轮次收尾内部指令不落库
+  （见 20/38/39）+ 本次 HANDOFF/README 查漏补缺
 - `.env` 当前激活：`DASHBOARD_USERNAME=admin` + `DASHBOARD_PASSWORD_HASH`（用户自配登录）、
   `MAX_AGENT_TURNS=5` / `TURN_TOKEN_BUDGET=0`、`AUDIT_LOG_PATH=audit.log`、
   `MEMORY_PROVIDER=vector` + `EMBEDDING_*`（密钥勿外泄、勿提交）
@@ -566,7 +579,9 @@ python demo_file_tools.py
   events（think/tool 齐全、带 user_message_id、挂靠在用户消息 id 上）；
   轮次收尾内部指令不落库（test_turn_budget 组）；新增旁白组
   （test_chat_narration_as_note：中间轮旁白 → note 事件、最终回复不含旁白、
-  note 已落库、旁白不进历史消息——只在托盘）
+  note 已落库、旁白不进历史消息——只在托盘）；新增 todo 网页组
+  （test_todo_event_and_panel_data：事件含 todo 类型且带完整清单、/chat 与
+  历史接口返回 todos）
 
 ## 已知限制 / 下一步候选
 
@@ -576,7 +591,8 @@ python demo_file_tools.py
   请求鉴权、操作审计、用户名密码登录、会话删除/标题/fork 全部完成（见 25~28）
   （Hermes web/ 有完整 dashboard，骨架只做最小聊天页）
 - 思考内容回显依赖模型暴露 reasoning_content（deepseek-chat 无）；SSE 响应必须
-  Connection: close（keep-alive 会导致 http.server 不关连接）
+  Connection: close（keep-alive 会导致 http.server 不关连接）；
+  无推理内容的思考事件不展示、不落库（2026-08-10）
 - ⚠️ `__pycache__/minimal_agent.cpython-312.pyc` 被 git 跟踪（.gitignore 已含
   __pycache__/ 但对已跟踪文件无效），建议 `git rm --cached` 一次
 - ⚠️ `build/1.txt`（用户测试写文件工具的产物，内容"hello python / 肯德基疯狂星期四"）
@@ -617,9 +633,11 @@ python demo_file_tools.py
 > 我们上次停在这里（2026-08-10）：服务增强线全部完成（鉴权/审计/登录/会话删除/标题/fork，
   见 25~28）+ 联网（29）+ 时间工具（30）+ turn budget（31）+ 脱敏专项（32）+
   并行执行中断语义（33）+ Skills 前置条件检查（34）+ V4A patch/模糊匹配（35）+
-  REPL 中断接线（36）+ 文档抽取（37）+ todo 工具（38）；全套 20 套回归通过；
-  提交由用户手动进行（工作树含
-  HANDOFF/README 与本次改动，待用户提交）。
+  REPL 中断接线（36）+ 文档抽取（37）+ todo 工具（38）+ Windows UTF-8 兜底（39）；
+  过程展示已 Codex 化（事件持久化、旁白进托盘、耗时收拢、todo 网页卡片，见 20/38）；
+  全套 20 套回归通过；
+  HEAD `049b4c9`（用户已提交主体）；工作树剩最近收尾（旁白进托盘/todo 网页卡片/
+  耗时/空思考等）与 HANDOFF/README 本次查漏补缺，提交由用户手动进行。
 > 下一步候选：working_diff（130 行小件）/ cron 审批 / 文件工具剩余
   （文件锁/跨 profile）/ 运维日志与进程守护。Skills hub 已明确暂不做。
 

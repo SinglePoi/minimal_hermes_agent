@@ -632,6 +632,48 @@ def test_chat_narration_as_note() -> None:
         fx.close()
 
 
+def test_todo_event_and_panel_data() -> None:
+    """todo 工具调用：事件含 todo 类型（完整清单），/chat 与历史接口都返回 todos。"""
+    tc = SimpleNamespace(
+        id="call_todo",
+        type="function",
+        function=SimpleNamespace(
+            name="todo",
+            arguments='{"todos":['
+                      '{"id":"t1","content":"跑回归测试","status":"in_progress"},'
+                      '{"id":"t2","content":"更新文档","status":"pending"}]}',
+        ),
+    )
+    seq = SequenceClient(
+        [
+            ToolFakeMessage("", [tc]),
+            ToolFakeMessage("清单已建好", None),
+        ]
+    )
+    fx = ServerFixture(client=seq)
+    try:
+        data = http_json(
+            "POST", f"{fx.base}/chat",
+            {"message": "列任务", "session_id": "sess-todo-web"},
+        )
+        check("todo 轮后返回最终回答", data.get("reply") == "清单已建好")
+        evs = data.get("events", [])
+        todo_evs = [e for e in evs if e.get("type") == "todo"]
+        check("事件含 todo 类型", len(todo_evs) >= 1)
+        check("todo 事件带完整清单",
+              "跑回归测试" in (todo_evs[-1].get("result") or ""))
+        check("响应带 todos",
+              any(t.get("id") == "t1" and t.get("status") == "in_progress"
+                  for t in (data.get("todos") or [])))
+
+        history = http_json("GET", f"{fx.base}/sessions/sess-todo-web/messages")
+        check("历史接口返回 todos",
+              any(t.get("content") == "跑回归测试"
+                  for t in (history.get("todos") or [])))
+    finally:
+        fx.close()
+
+
 class StreamDelta:
     """SSE 流式 delta 的假对象。"""
 
@@ -1067,6 +1109,7 @@ def main() -> None:
         test_tools_endpoint,
         test_chat_events_tool_call,
         test_chat_narration_as_note,
+        test_todo_event_and_panel_data,
         test_chat_stream_sse,
         test_auth_and_audit,
         test_delete_session_endpoint,
