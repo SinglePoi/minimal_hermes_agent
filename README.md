@@ -436,6 +436,13 @@ python server.py                 # 默认 127.0.0.1:8000
 | `/tools` | GET | 可用工具列表（核心 TOOLS + provider 工具，name + description） |
 | `/chat/stream` | POST | SSE 流式对话（event: activity/token/message/error/done） |
 | `/chat` | POST | `{"message": "...", "session_id": "..."?}` → 返回 `{"reply": ...}` |
+| `/sessions` | POST | 创建空会话（两步式第一步），返回 `{"session_id"}`（可传 `id`；默认服务端生成） |
+| `/sessions/<id>/chat` | POST | 向指定会话发消息（推荐，两步式第二步） |
+| `/sessions/<id>/chat/stream` | POST | 同上，SSE 流式（event: session/activity/token/message/done） |
+| `/sessions/<id>/export` | GET | 导出会话 `?format=md\|html`（附件下载） |
+| `/working_diff` | GET | 工作区 git 改动（`?mode=working\|staged\|all`、`?paths=`） |
+| `/clarify/pending` | GET | `?session_id=xxx` → 模型中途提问的待回答项 |
+| `/clarify/resolve` | POST | `{"session_id", "clarify_id"?, "answer"}` 回答澄清问题 |
 | `/approvals/pending` | GET | `?session_id=xxx` → 当前待审批项 |
 | `/approvals/resolve` | POST | `{"session_id", "choice": "once\|session\|always\|deny", "reason"?}` |
 | `/health` | GET | 探活 |
@@ -447,8 +454,9 @@ python server.py                 # 默认 127.0.0.1:8000
 
 审批流程：`/chat` 请求里的 agent 线程遇到危险命令会阻塞等待；客户端在另一个
 连接轮询 `pending`、再 `POST resolve`，线程被唤醒后 `/chat` 返回最终结果。
-Web 页面已内置该流程：请求期间每 800ms 轮询，弹出审批框点按钮即可。
-（流式/SSE 与 WebSocket 是二期。）
+中途提问（clarify）走同一套"门铃"流程：轮询 `/clarify/pending` 弹窗 →
+`POST /clarify/resolve` 唤醒。Web 页面已内置两个流程：请求期间每 800ms 轮询，
+弹窗点按钮即可。SSE 流式已实现；WebSocket 不在计划内。
 
 可选环境变量：
 
@@ -897,13 +905,12 @@ python minimal_agent.py
 | 中途问用户 `clarify.py` | `tools/clarify_tool.py`（schema/选项清洗/多选）+ `tools/clarify_gateway.py`（阻塞事件队列 + 超时） |
 | 两步式会话 API `POST /sessions` + `/sessions/<id>/chat` | `gateway/platforms/api_server.py`（POST /api/sessions 建会话 + /api/sessions/{id}/chat；客户端可传 id，默认服务端生成 `api_时间戳_uuid`） |
 
-骨架简化掉了的工业级细节：文件锁、注入威胁扫描、外部漂移检测、可插拔 MemoryProvider、
-会话压缩后的 lineage 去重（压缩黑洞处理）、记忆主动 nudge、审批的 cron/gateway 上下文、
-Smart Approval（辅助 LLM 审批）与连续拒绝熔断、命令混淆检测、工具并行里的中断语义与
-turn 级 budget 收尾、Skills 的 hub/组织同步/插件命名空间、压缩时的技能
-prune/reinject、文件工具的跨 profile/文件锁（陈旧检测已做简化版、V4A 补丁与
-模糊匹配已完成、文档抽取已完成见 33）、脱敏的 URL 查询参数/手机号/DB 连接串专项——
-这些是后续深入源码时值得关注的点。
+骨架当前简化掉（或有意不做）的工业级细节：文件锁、注入威胁扫描、外部漂移检测、
+会话压缩后的 lineage 去重（压缩黑洞处理）、Skills 的 hub/组织同步/插件命名空间、
+文件工具的跨 profile/文件锁、多外部 memory provider 同时挂载、cron 审批
+（用户取消）、MCP/ACP（已列入待办模块，见 HANDOFF）——这些是后续深入源码时
+值得关注的点。已对齐的近期能力（LLM 自动标题/终端输出清洗/working_diff/LLM 重试/
+REPL 斜杠命令/后台终端/会话导出/clarify/两步式会话 API）见上面对应关系表。
 
 ## 加新工具
 
@@ -911,15 +918,11 @@ prune/reinject、文件工具的跨 profile/文件锁（陈旧检测已做简化
 
 ## 下一步可以加什么
 
-- 服务增强：请求鉴权、操作审计、用户名密码登录、会话删除、标题与 fork 全部完成
-  （对齐 Hermes api_server 的 auth / DELETE / PATCH / fork）
-- 联网能力已完成（web_search / web_fetch，零依赖 + SSRF 防护）
-- 审批剩余：cron 审批上下文（`approvals.cron_mode`）
-- 文件工具增强：V4A patch / 模糊匹配 / 语法提示 / 简化陈旧检测已完成（见 31）；
-  文档抽取已完成（见 33）；剩余文件锁、跨 profile 检查
-- todo 工具已完成（见 34）；working_diff（工作区改动查看，130 行小件）待做
-- 并行执行的中断语义已完成（见 29），turn 级 budget 已完成（见 27）
-- Skills 前置条件检查已完成（见 30）；剩余：技能 hub 同步
-- 脱敏专项已完成（URL 查询参数、手机号、DB 连接串，见 28）
-- REPL 中断接线已完成（见 32）
-- 运维：服务化下的日志、进程守护
+- 已完成（1~49）：Agent Loop/工具/三层记忆/压缩/审批/并行/技能/文件工具/脱敏/
+  服务化+前端/鉴权审计登录/会话删除标题 fork/联网/时间工具/turn budget/中断语义/
+  LLM 自动标题/终端输出清洗/working_diff+网页工作区视图/LLM 重试/REPL 斜杠命令/
+  后台终端/会话导出/clarify 中途问用户/两步式会话 API（详见 README 功能列表）
+- 待办（详见 HANDOFF"待办模块"）：OpenAI 兼容接口（推荐）→ 运维日志/进程守护 →
+  MCP → 多代理/委派 → ACP → 大结果落盘/网站策略/澄清增强等小件
+- 明确暂不做：cron 审批（用户取消）、文件锁/跨 profile、Skills hub 同步、
+  多外部 memory provider 同时挂载

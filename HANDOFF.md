@@ -42,6 +42,20 @@ todo_tool.py                todo 工具：会话级内存任务清单 + 压缩�
 redact.py                   敏感文本脱敏：前缀密钥/赋值/JSON/YAML/请求头/JWT/私钥/URL userinfo（对齐 redact.py）
 tirith.py                   内容级安全扫描：终端注入/隐形字符/同形字域名/管道到解释器（tirith 的 Python 简化版）
 demo_file_tools.py          文件工具可视化演示（离线，python demo_file_tools.py 直接跑）
+title_generator.py          LLM 自动生成会话标题（后台线程 + set-if-empty 原子写入，对齐
+                            agent/title_generator.py）
+ansi_strip.py               ANSI 转义剥离 + 显示文本控制字符清洗（对齐 tools/ansi_strip.py）
+tool_output_limits.py       工具输出截断上限（默认 50000，头 40% + 尾 60%，对齐
+                            tools/tool_output_limits.py）
+working_diff.py             工作区 git diff：working/staged/all 三模式 + 未跟踪文件折入 +
+                            按文件拆分/汇总（对齐 tools/working_diff.py）
+retry_utils.py              LLM 调用重试：指数退避 + 随机抖动 + 可重试错误分类（对齐
+                            agent/retry_utils.py，简化版）
+process_registry.py         后台进程注册表：spawn/poll/wait/kill/shutdown_all（对齐
+                            tools/process_registry.py，简化版）
+session_export.py           会话导出 Markdown/HTML/文件（对齐 hermes_cli/session_export_*）
+clarify.py                  中途问用户：REPL 交互 + 网关队列（对齐 tools/clarify_tool.py +
+                            tools/clarify_gateway.py）
 tests/test_approval.py      审批回归测试（零依赖，python tests/test_approval.py 直接跑）
 tests/test_tool_dispatch.py 并行执行回归测试（零依赖，python tests/test_tool_dispatch.py 直接跑）
 tests/test_skills.py        Skills 回归测试（零依赖，python tests/test_skills.py 直接跑）
@@ -60,8 +74,17 @@ tests/test_approval_deny.py   用户 deny 规则回归测试（零依赖，pytho
 tests/test_tirith.py          内容级扫描回归测试（零依赖，python tests/test_tirith.py 直接跑）
 tests/test_gateway_approval.py 网关审批队列回归测试（零依赖，python tests/test_gateway_approval.py 直接跑）
 tests/test_server.py          HTTP 服务化回归测试（零依赖，python tests/test_server.py 直接跑）
+tests/test_title_generator.py  LLM 标题回归测试（零依赖，直接跑）
+tests/test_terminal_output.py  终端输出清洗回归测试（零依赖，直接跑）
+tests/test_working_diff.py     working_diff 回归测试（零依赖，直接跑）
+tests/test_llm_retry.py        LLM 重试回归测试（零依赖，直接跑）
+tests/test_repl_commands.py    REPL 斜杠命令回归测试（零依赖，直接跑）
+tests/test_process_registry.py 后台进程回归测试（零依赖，直接跑）
+tests/test_session_export.py   会话导出回归测试（零依赖，直接跑）
+tests/test_clarify.py          clarify 回归测试（零依赖，直接跑）
 server.py                    HTTP 服务化：/chat + /chat/stream(SSE) + /approvals/* +
-                             /sessions* + /skills /plugins /tools + 静态托管 web/（零新依赖）
+                             /sessions（两步式：POST /sessions 建会话 + /sessions/<id>/chat）+
+                             /clarify/* + /skills /plugins /tools + 静态托管 web/（零新依赖）
 dashboard_auth.py            用户名密码登录 + 无状态 session cookie（scrypt 哈希 + HMAC 签名，
                              对齐 Hermes plugins/dashboard_auth/basic；附 hash-password CLI）
 web/                         前端静态站点（原生 HTML/CSS/JS，零构建）：index.html + login.html + app.js + style.css
@@ -600,7 +623,8 @@ python minimal_agent.py "这个项目是做什么的？"
 python minimal_agent.py
 # 恢复会话
 python minimal_agent.py --resume session-xxx
-# HTTP 服务化（/chat + /chat/stream 流式 + 审批轮询/resolve）
+# HTTP 服务化（两步式会话：POST /sessions 建会话 → /sessions/<id>/chat[/stream]；
+# /chat[/stream] 为兼容旧接口；审批/澄清轮询 + resolve）
 python server.py                    # 默认 127.0.0.1:8000；浏览器打开 http://127.0.0.1:8000/
                                     # 即进入 Web 页面（对话 + 审批按钮）；端点见 README
 # 文件工具离线可视化演示
@@ -612,20 +636,20 @@ python demo_file_tools.py
 - 常用开关：`MEMORY_PROVIDER=vector`（语义召回）、`CONTEXT_WINDOW`、`PROTECT_LAST_N`
 - Windows 控制台 UTF-8 已内置兜底（见 39）；终端仍乱码可 `chcp 65001`
 - 本机测试可用内置 Python：`C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`
-- 提交策略：由用户手动提交；当前 HEAD `049b4c9`（文档抽取/todo 工具/事件托盘等，
-  2026-08-10），前序 `01d8b72`（脱敏专项 + 并行执行中断语义）、`b9a0a7f`（turn budget）
-- ⚠️ 工作树仍有未提交改动（提交由用户手动进行，新会话先看 `git status`）：
-  最近的 Codex 式过程展示收尾——旁白进托盘（note）、活动托盘耗时/工具默认收拢/
-  空思考不显示、todo 网页常驻卡片、duration_ms、轮次收尾内部指令不落库
-  （见 20/38/39）+ 本次 HANDOFF/README 查漏补缺
+- 提交策略：由用户手动提交；当前 HEAD `7033fbc`（clarify 中途提问 + 两步式会话 API，
+  2026-08-11），前序 `95f9477`（会话导出）、`d33e460`（后台终端）、`25ae297`
+  （REPL 斜杠 + 失败兜底）、`eed0e4a`（LLM 重试）、`b713b69`（LLM 标题/终端清洗/
+  working_diff 视图）
+- ✅ 工作树干净（用户已提交全部近期成果）；新会话先看 `git status` 确认
 - `.env` 当前激活：`DASHBOARD_USERNAME=admin` + `DASHBOARD_PASSWORD_HASH`（用户自配登录）、
   `MAX_AGENT_TURNS=5` / `TURN_TOKEN_BUDGET=0`、`AUDIT_LOG_PATH=audit.log`、
+  `TITLE_GENERATION_ENABLED=true`、`LLM_MAX_RETRIES=3`、
   `MEMORY_PROVIDER=vector` + `EMBEDDING_*`（密钥勿外泄、勿提交）
 
 ## 已验证的测试
 
 > 注：下面各测试文件记录的"条数"是当时统计，可能随用例增改漂移；
-> 以直接运行 `python tests/test_xxx.py` 的输出为准（当前共 20 套）。
+> 以直接运行 `python tests/test_xxx.py` 的输出为准（当前共 28 套）。
 
 - 多轮对话跨轮次回答、`--resume` 恢复
 - Qwen embedding 真调成功（1024 维）、向量召回 → 模型引用召回回答
@@ -739,6 +763,17 @@ python demo_file_tools.py
   note 已落库、旁白不进历史消息——只在托盘）；新增 todo 网页组
   （test_todo_event_and_panel_data：事件含 todo 类型且带完整清单、/chat 与
   历史接口返回 todos）
+- 新增回归测试（2026-08-10/11，均为零依赖直接跑）：
+  `tests/test_title_generator.py`（27 条：LLM 标题参数/清洗/原子写入/失败回退）、
+  `tests/test_terminal_output.py`（33 条：截断/ANSI/显示清洗/env 判定/清洗管线）、
+  `tests/test_working_diff.py`（28 条：三模式/路径过滤/空仓库/解析拆分/汇总/分发）、
+  `tests/test_llm_retry.py`（36 条：退避/错误分类/重试循环/失败转助手消息）、
+  `tests/test_repl_commands.py`（29 条：help/sessions/diff/resume/export/Ctrl+C 兜底）、
+  `tests/test_process_registry.py`（23 条：spawn/poll/wait/kill/shutdown_all）、
+  `tests/test_session_export.py`（22 条：md/html 转义/文件导出/REPL 命令）、
+  `tests/test_clarify.py`（22 条：选项清洗/REPL 交互/网关队列/分发）；
+  `tests/test_server.py` 累计覆盖两步式会话 API、clarify 端点、会话导出端点、
+  工作区改动端点、鉴权审计、SSE session 事件等
 
 ## 已知限制 / 下一步候选
 
@@ -750,14 +785,20 @@ python demo_file_tools.py
 - 思考内容回显依赖模型暴露 reasoning_content（deepseek-chat 无）；SSE 响应必须
   Connection: close（keep-alive 会导致 http.server 不关连接）；
   无推理内容的思考事件不展示、不落库（2026-08-10）
-- ⚠️ `__pycache__/minimal_agent.cpython-312.pyc` 被 git 跟踪（.gitignore 已含
-  __pycache__/ 但对已跟踪文件无效），建议 `git rm --cached` 一次
+- ✅ `__pycache__/*.pyc` 已不再被 git 跟踪（2026-08-10 已 `git rm --cached` 清理）
 - ⚠️ `build/1.txt`（用户测试写文件工具的产物，内容"hello python / 肯德基疯狂星期四"）
   已被 git 跟踪，如不需要可 `git rm`（新会话先确认是否保留）
 - 文件工具简化：V4A 补丁/模糊匹配/语法提示/简化陈旧检测（35）与文档抽取（37）已完成，
   仍无文件锁、跨 profile 检查；
   搜索仍跳过敏感文件（Hermes 也过滤敏感路径的搜索结果）
 - 并行执行中断语义已完成（见 33）；turn 级 budget 已完成（见 31）
+- 两步式会话 API（49）上线后，`POST /chat[/stream]` 保留为兼容旧接口（隐式建会话 + 聊）；
+  新前端一律走 `POST /sessions` → `/sessions/<id>/chat[/stream]`
+- clarify 网关模式默认超时 300s（超时/注销按"未回答"返回，绝不挂死线程）；
+  Hermes 的"提问发送失败返回哨兵让模型自选默认值"未实现（骨架 notify 为空回调，
+  目前不会失败，风险低）
+- 大工具输出仍直接进模型上下文（事件展示截 300 字符）；Hermes 的 tool_result_storage
+  （写盘 + 截断 + 引用）未做（列入待办）
 - 外部协议接入：MCP / ACP 已列入下方"待办模块"（2026-08-10 用户确认），未排期
 - Skills 增强：prune/reinject（20）与前置条件检查（34）已完成；剩余技能 hub 同步
   （Hermes 有，骨架简化掉了）
@@ -766,47 +807,66 @@ python demo_file_tools.py
 
 ## 待办模块（Roadmap，未排期）
 
+按"推荐顺序"排列（2026-08-11 汇总，均未排期）：
+
+- **OpenAI 兼容接口（推荐下一个）**：`POST /v1/chat/completions`（+ /chat/stream
+  兼容），让 Open WebUI / LibreChat 等现成前端直接连骨架。Hermes 参照：
+  api_server 的 OpenAI 兼容通道 + `_derive_chat_session_id`（system prompt +
+  首条用户消息哈希推导稳定会话 id）；骨架接入点：新端点复用
+  process_turn / handle_message_stream，会话路由走两步式（49）
+- **运维：服务化日志 + 进程守护**：结构化日志 + Windows 部署（服务 /
+  Task Scheduler / 手动），**需先定部署方式再动**。Hermes 参照：systemd /
+  gateway daemon
 - **MCP（Model Context Protocol）**：连外部工具/数据源。Hermes 参照：
   `hermes_cli/mcp_config.py` + `mcp_picker.py` + `optional-mcps/` +
   `tools/mcp_tool.py` + `mcp_serve.py`；骨架接入点：TOOLS 动态注册 + run_tool
   分发 + 并行安全查询 + 工具搜索渐进披露（tool_search）
+- **多代理/委派（架构级）**：delegate_tool + 子代理 + 会话路由；做它之前
+  "文件锁/跨 profile"才真正有用（可一并补 `tools/file_state.py` 思路）
 - **ACP（Agent Client Protocol）**：被 VS Code / Zed / JetBrains 等编辑器
   客户端调用。Hermes 参照：`acp_adapter/` + `hermes acp` 子命令；
   骨架接入点：独立 adapter 模块 + CLI 子命令
+- **大结果落盘 tool_result_storage**：超大工具输出写盘 + 截断 + 引用，
+  防撑爆上下文（Hermes：`tools/tool_result_storage.py` / `hook_output_spill.py`）
+- **网站策略 website_policy**：web_fetch/web_search 遵守用户可配域名块名单
+  （Hermes：`tools/website_policy.py`）
+- **澄清增强**：补 Hermes 细节——提问发送失败返回哨兵让模型自选默认值、
+  无限等待选项、等待期间心跳防看门狗误杀（骨架超时 300s 已有）
+- **会话导出增强**：HTML 带过程事件（思考/工具调用）、导出全文搜索/目录
+- **小件可选**：web_search 升级带 key 供应商（Tavily/SerpAPI，只改 web_tools.py）；
+  Web 工作区视图加 diff 行号、双击定位
+
+明确**暂不做**：文件锁/跨 profile（单代理低价值）、Skills hub 同步、
+多外部 memory provider 同时挂载（用户确认，与 Hermes 单 provider 一致）、
+cron 审批（用户取消）
 
 ## 下一阶段（前端 / 服务增强）
 
-- 服务增强线全部完成：请求鉴权、操作审计、用户名密码登录、会话删除/标题/fork（见 25~28，
-  对齐 Hermes api_server 的 auth / DELETE / PATCH / fork）；联网（29）、时间工具（30）、
-  turn budget（31）、脱敏专项（32）、并行中断语义（33）、技能前置条件（34）、
-  V4A patch + 模糊匹配（35）、REPL 中断接线（36）、文档抽取（37）、todo 工具（38）
-  均已完成
+- 服务增强线全部完成：请求鉴权、操作审计、用户名密码登录、会话删除/标题/fork（见 25~28）、
+  联网（29）、时间工具（30）、turn budget（31）、脱敏专项（32）、并行中断语义（33）、
+  技能前置条件（34）、V4A patch + 模糊匹配（35）、REPL 中断接线（36）、文档抽取（37）、
+  todo 工具（38）、Windows UTF-8 兜底（39）、LLM 自动标题（40）、终端输出清洗（41）、
+  working_diff 工具（42）、网页工作区改动视图（43）、LLM 重试（44）、REPL 斜杠命令（45）、
+  后台/常驻终端（46）、会话导出（47）、clarify 中途问用户（48）、两步式会话 API（49）
 - 审批线已完成（cron 审批按用户要求取消，见上）
-- 文件工具剩余：文件锁、跨 profile 检查（V4A/模糊/语法提示/简化陈旧检测/文档抽取已完成）
-- working_diff 已完成（42，2026-08-10）；终端输出清洗已完成（41）
-- Skills 剩余：技能 hub 同步
-- 运维：服务化下的日志、进程守护（Hermes 用 systemd/gateway daemon）
+- 文件工具剩余：文件锁、跨 profile 检查（单代理低价值，暂不做）
+- Skills 剩余：技能 hub 同步（明确暂不做）
+- 下一步待办见上方"待办模块"：OpenAI 兼容接口 → 运维 → MCP → 多代理 → ACP → 小件
 - 中断接线：REPL Ctrl+C 已完成（36）；一次性 /chat 无法感知断连（保持现状）
-- 可选：web_search 升级为带 key 供应商（Tavily/SerpAPI 等，只改 web_tools.py 内部）
 
 ## 给新会话的起始指令（可直接粘贴）
 
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里（2026-08-10）：服务增强线全部完成（鉴权/审计/登录/会话删除/标题/fork，
-  见 25~28）+ 联网（29）+ 时间工具（30）+ turn budget（31）+ 脱敏专项（32）+
-  并行执行中断语义（33）+ Skills 前置条件检查（34）+ V4A patch/模糊匹配（35）+
-  REPL 中断接线（36）+ 文档抽取（37）+ todo 工具（38）+ Windows UTF-8 兜底（39）；
-  过程展示已 Codex 化（事件持久化、旁白进托盘、耗时收拢、todo 网页卡片，见 20/38）；
-  全套 20 套回归通过；
-  HEAD `049b4c9`（用户已提交主体）；工作树剩最近收尾（旁白进托盘/todo 网页卡片/
-  耗时/空思考等）与 HANDOFF/README 本次查漏补缺，提交由用户手动进行。
-> 下一步候选：文件工具剩余（文件锁/跨 profile）/ 运维日志与进程守护。
-> working_diff（42）、终端输出清洗（41）、LLM 自动标题（40）、LLM 重试（44）、
-> REPL 斜杠命令（45）、后台/常驻终端（46）已完成；
-> MCP / ACP 已列入待办模块（未排期）；cron 审批已按用户要求取消；
-> Skills hub 已明确暂不做。
+> 我们上次停在这里（2026-08-11）：1~49 全部完成——最近一批（40~49）是
+> LLM 自动标题、终端输出清洗、working_diff 工具、网页工作区改动视图、
+> LLM 重试健壮性、REPL 斜杠命令、后台/常驻终端、会话导出、clarify 中途问用户、
+> 两步式会话 API（POST /sessions 先建后聊，/chat 保留为兼容旧接口）；
+> 全套 28 套回归通过；HEAD `7033fbc`（用户已提交，工作树干净）。
+> 下一步候选（详见"待办模块"）：**OpenAI 兼容接口（推荐）** → 运维日志/进程守护
+> → MCP → 多代理/委派 → ACP → 大结果落盘/网站策略/澄清增强等小件。
+> cron 审批已取消；文件锁/跨 profile、Skills hub、多外部 memory provider 明确暂不做。
 
 ## 发版检查记录（2026-08-10，release-check 技能）
 
