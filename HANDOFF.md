@@ -558,6 +558,38 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     - 测试：新增 tests/test_session_export.py（22 条断言：md/html 内容与转义/
       文件导出/格式与会话校验/REPL 命令）+ test_server.py 导出端点组
       （md/html/400/404/401/审计/静态断言），全套 27 套通过
+48. **中途问用户（clarify）**（2026-08-10，对齐 Hermes `tools/clarify_tool.py`
+    + `tools/clarify_gateway.py`）：
+    - 新模块 clarify.py：clarify_tool 支持单选（最多 4 选项 + "其他"自由输入）/
+      多选（user_response 为数组）/ 开放式；_flatten_choice 归一 dict 形选项
+      （label/description/text/title），垃圾丢弃；选项超 4 截断
+    - REPL：直接终端交互（console.input，编号选择 / 0 走其他 / 多选逗号分隔 /
+      开放式直答；EOF 返回"无法在非交互模式提问"）
+    - Web/服务：网关队列（与审批同款"门铃"）——/clarify/pending 轮询 +
+      /clarify/resolve 唤醒阻塞线程；超时（默认 300s）/会话注销按"未回答"
+      返回，绝不挂死；前端弹窗支持点选项/多选勾选/自由输入/取消
+    - 接入：TOOLS 注册 + run_tool 分发（session_key 定位队列）；并行白名单
+      加入"永不并行"集合（阻塞式交互）；server get_session 注册 notify、
+      remove_session/shutdown 注销唤醒；审计 clarify:pending / clarify:resolve
+    - 测试：新增 tests/test_clarify.py（22 条断言：选项清洗/校验/REPL 单选多选
+      开放式与 EOF/网关队列 pending-resolve-注销/TOOLS 注册/白名单/run_tool 分发）
+      + test_server.py 端点组（pending/resolve/400/审计/静态断言），全套 28 套通过
+    - 修复（2026-08-10 实测发现，已被 49 的两步式 API 取代）：新会话第一条
+      消息阻塞在 clarify 上时，轮询因 session_id 为空直接跳过 → 弹窗永不出现。
+      临时修复（前端预生成 id + 服务端早推 session 事件）已随 49 重构为
+      "先 POST /sessions 拿 id 再聊"，session_id 前置问题从根上消失
+49. **两步式会话 API（先建后聊）**（2026-08-10，对齐 Hermes api_server）：
+    - server.py：新增 `POST /sessions`（创建空会话返回 session_id；客户端可传
+      id，默认 `generate_session_id()` = `session-时间戳-随机` 防同秒碰撞；
+      幂等：同 id 重复创建返回同一会话）+ `POST /sessions/<id>/chat[/stream]`
+      （session_id 在 URL；`/chat[/stream]` 保留为兼容旧接口，隐式建会话 + 聊）
+    - 共用助手 _handle_chat / _handle_chat_stream 抽取，旧新路由同一套逻辑；
+      审计新增 sessions:create / sessions:chat / sessions:chat:stream
+    - web/app.js：新建对话先 `POST /sessions` 拿服务端生成的 id 再
+      `/sessions/<id>/chat/stream`（不再前端自生成 id）；sendStreaming 改走
+      新端点，`session` SSE 事件保留作兜底；REPL 仍走服务端生成
+    - 测试：test_server.py 新增端点组（创建/幂等/客户端传 id/非法 id 400/
+      两步式非流式与流式/审计/静态断言 createSession），全套 28 套通过
 
 ## 运行方式
 

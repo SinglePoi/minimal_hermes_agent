@@ -179,6 +179,24 @@
     </div>
   </div>
 
+  <!-- 中途提问弹窗（模型调 clarify：轮询 /clarify/pending → POST /clarify/resolve） -->
+  <div id="clarify-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="clarify-title">
+    <div class="approval-card">
+      <div class="approval-head">
+        <h2 id="clarify-title">❓ 需要你确认</h2>
+        <span id="clarify-queue" class="badge hidden"></span>
+      </div>
+      <p id="clarify-question" class="approval-desc"></p>
+      <div id="clarify-choices" class="clarify-choices"></div>
+      <input id="clarify-text" type="text" placeholder="输入你的回答…（有选项时可点上面的按钮）" autocomplete="off">
+      <div class="approval-actions">
+        <button class="btn ghost" id="btn-clarify-cancel" type="button">取消提问</button>
+        <span class="spacer" aria-hidden="true"></span>
+        <button class="btn primary" id="btn-clarify-submit" type="button">提交回答</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 服务鉴权 token 弹窗（接口返回 401 时弹出；token 只存 localStorage） -->
   <div id="token-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="token-title">
     <div class="approval-card">

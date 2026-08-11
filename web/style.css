@@ -971,6 +971,38 @@ html, body {
   margin-top: 8px;
 }
 
+/* 中途提问（clarify）选项与输入框 */
+.clarify-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.clarify-choice {
+  border-radius: 999px;
+  font-size: 13px;
+}
+
+.clarify-choice.selected {
+  background: var(--accent);
+  color: #fff;
+  border-color: transparent;
+}
+
+#clarify-text {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+}
+
+#clarify-text:focus { outline: 1px solid var(--accent); }
+
 .token-input {
   width: 100%;
   box-sizing: border-box;

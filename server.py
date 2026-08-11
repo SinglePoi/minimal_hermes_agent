@@ -6,10 +6,15 @@ HTTP 服务化 + gateway 审批通知（为前端铺路，对齐 Hermes dashboar
     python server.py [host] [port]      # 默认 127.0.0.1:8000
 
 端点：
-    POST /chat              发一条消息；body: {"message": "...", "session_id": "..."?}
-    POST /chat/stream       同上，但 SSE 流式返回（event: activity/token/message/error/done）
+    POST /sessions           创建空会话，返回 session_id（两步式：先建后聊，对齐 Hermes）
+    POST /sessions/<id>/chat          向指定会话发消息（推荐）
+    POST /sessions/<id>/chat/stream   同上，SSE 流式（event: session/activity/token/message/done）
+    POST /chat              兼容旧接口：隐式建会话 + 发消息（body 可带 session_id）
+    POST /chat/stream       兼容旧接口的流式版
     GET  /approvals/pending 轮询待审批；query: ?session_id=xxx
     POST /approvals/resolve 解决审批；body: {"session_id", "choice": once|session|always|deny, "reason"?}
+    GET  /clarify/pending   轮询待澄清问题；query: ?session_id=xxx
+    POST /clarify/resolve   回答澄清问题；body: {"session_id", "clarify_id"?, "answer"}
     GET  /health            探活
     GET  /                  前端页面（web/index.html）
     GET  /web/<file>        前端静态资源（app.js / style.css 等）
@@ -58,6 +63,7 @@ import title_generator  # noqa: E402
 import working_diff  # noqa: E402
 import process_registry  # noqa: E402
 import session_export  # noqa: E402
+import clarify  # noqa: E402
 from approval import (  # noqa: E402
     list_pending_approvals,
     register_gateway_notify,
@@ -130,6 +136,10 @@ def _audit_action(path: str, method: str = "GET") -> str:
         return "approvals:pending"
     if path.startswith("/approvals/resolve"):
         return "approvals:resolve"
+    if path.startswith("/clarify/pending"):
+        return "clarify:pending"
+    if path.startswith("/clarify/resolve"):
+        return "clarify:resolve"
     if path.startswith("/sessions/") and path.endswith("/fork"):
         return "sessions:fork"
     if path.startswith("/sessions/") and path.endswith("/archive"):
@@ -138,10 +148,14 @@ def _audit_action(path: str, method: str = "GET") -> str:
         return "sessions:export"
     if path.startswith("/sessions/") and path.endswith("/messages"):
         return "sessions:messages"
+    if path.startswith("/sessions/") and path.endswith("/chat/stream"):
+        return "sessions:chat:stream"
+    if path.startswith("/sessions/") and path.endswith("/chat"):
+        return "sessions:chat"
     if path.startswith("/sessions/"):
         return "sessions:delete" if method == "DELETE" else "sessions:title"
-    if path.startswith("/sessions"):
-        return "sessions:list"
+    if path == "/sessions":
+        return "sessions:create" if method == "POST" else "sessions:list"
     if path.startswith("/skills"):
         return "skills"
     if path.startswith("/plugins"):
@@ -209,6 +223,8 @@ class AgentServer:
         }
         # 网关会话：注册审批通知（危险命令将走队列阻塞，而非终端输入）
         register_gateway_notify(session_id, self._notify)
+        # 网关会话：注册 clarify 通知（模型中途提问走队列 + 轮询弹窗）
+        clarify.register_clarify_notify(session_id, self._notify)
         with self._lock:
             self.sessions[session_id] = state
         return state
@@ -257,6 +273,7 @@ class AgentServer:
         process_registry.shutdown_all()
         for session_id in list(self.sessions):
             unregister_gateway_notify(session_id)
+            clarify.unregister_clarify_notify(session_id)
         self.review_worker.flush(timeout=10)
         self.review_worker.shutdown()
         if self.manager is not None:
@@ -268,6 +285,7 @@ class AgentServer:
         with self._lock:
             if session_id in self.sessions:
                 unregister_gateway_notify(session_id)
+                clarify.unregister_clarify_notify(session_id)
                 del self.sessions[session_id]
 
 
@@ -519,6 +537,15 @@ class _Handler(BaseHTTPRequestHandler):
             pending = list_pending_approvals(session_id)
             self._send_json(200, {"session_id": session_id, "pending": pending})
             return
+        if parsed.path == "/clarify/pending":
+            session_id = (parse_qs(parsed.query).get("session_id") or [""])[0]
+            if not session_id:
+                self._send_json(400, {"error": "session_id required"})
+                return
+            self._audit_session_id = session_id
+            pending = clarify.list_pending_clarify(session_id)
+            self._send_json(200, {"session_id": session_id, "pending": pending})
+            return
         if parsed.path == "/sessions":
             try:
                 limit = int((parse_qs(parsed.query).get("limit") or ["50"])[0])
@@ -646,6 +673,66 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             self._audit("POST", self.path)
 
+    def _handle_chat(self, session_id: str, body: dict) -> None:
+        """处理一次非流式聊天（POST /sessions/<id>/chat 与兼容的 /chat 共用）。"""
+        message = body.get("message", "")
+        if not isinstance(message, str) or not message.strip():
+            self._send_json(400, {"error": "message required"})
+            return
+        try:
+            state = self.server.app.get_session(session_id)
+            reply, events, todos = self.server.app.handle_message(
+                session_id, state, message
+            )
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        self._send_json(
+            200,
+            {
+                "session_id": session_id,
+                "reply": reply,
+                "events": events,
+                "todos": todos,
+            },
+        )
+
+    def _handle_chat_stream(self, session_id: str, body: dict) -> None:
+        """处理一次流式聊天（POST /sessions/<id>/chat/stream 与兼容的 /chat/stream 共用）。"""
+        message = body.get("message", "")
+        if not isinstance(message, str) or not message.strip():
+            self._send_json(400, {"error": "message required"})
+            return
+        self._begin_sse()
+        try:
+            state = self.server.app.get_session(session_id)
+            # 客户端断开（SSE 写失败）→ 置位中断信号，停止本轮工具执行
+            interrupt_event = threading.Event()
+            # 第一时间把 session_id 推给前端：clarify/审批轮询在请求阻塞期间要用
+            self._sse("session", {"session_id": session_id})
+
+            def emit_activity(ev: dict) -> None:
+                if not self._sse("activity", ev):
+                    interrupt_event.set()
+
+            def emit_token(text: str) -> None:
+                if not self._sse("token", {"text": text}):
+                    interrupt_event.set()
+
+            reply = self.server.app.handle_message_stream(
+                session_id,
+                state,
+                message,
+                emit_event=emit_activity,
+                emit_token=emit_token,
+                interrupt_event=interrupt_event,
+            )
+        except Exception as exc:
+            self._sse("error", {"error": str(exc)})
+            reply = ""
+        self._sse("message", {"reply": reply, "session_id": session_id})
+        self._sse("done", {})
+
     def _handle_POST(self) -> None:
         parsed = urlparse(self.path)
         body = self._read_body()
@@ -678,69 +765,54 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._send_json(401, {"error": "unauthorized"})
             return
-        if parsed.path == "/chat":
-            message = body.get("message", "")
-            if not isinstance(message, str) or not message.strip():
-                self._send_json(400, {"error": "message required"})
-                return
-            session_id = body.get("session_id") or time.strftime(
-                "session-%Y%m%d-%H%M%S"
+        if parsed.path == "/sessions":
+            # 两步式 API 第一步：创建空会话（对齐 Hermes api_server POST /api/sessions）
+            raw_id = body.get("id") or body.get("session_id")
+            session_id = (
+                str(raw_id).strip() if raw_id else minimal_agent.generate_session_id()
             )
-            self._audit_session_id = session_id
-            try:
-                state = self.server.app.get_session(session_id)
-                reply, events, todos = self.server.app.handle_message(
-                    session_id, state, message
-                )
-            except Exception as exc:
-                self._send_json(500, {"error": str(exc)})
+            if not session_id or "/" in session_id or "\x00" in session_id:
+                self._send_json(400, {"error": "invalid session id"})
                 return
+            self._audit_session_id = session_id
+            if minimal_agent.load_session_prompt(session_id) is None:
+                system_prompt = minimal_agent.build_system_prompt(
+                    self.server.app.manager
+                )
+                minimal_agent.save_session_prompt(session_id, system_prompt)
             self._send_json(
-                200,
+                201,
                 {
                     "session_id": session_id,
-                    "reply": reply,
-                    "events": events,
-                    "todos": todos,
+                    "title": minimal_agent.get_session_title(session_id),
                 },
             )
             return
-        if parsed.path == "/chat/stream":
-            message = body.get("message", "")
-            if not isinstance(message, str) or not message.strip():
-                self._send_json(400, {"error": "message required"})
-                return
-            session_id = body.get("session_id") or time.strftime(
-                "session-%Y%m%d-%H%M%S"
-            )
+        if parsed.path == "/chat":
+            session_id = body.get("session_id") or minimal_agent.generate_session_id()
             self._audit_session_id = session_id
-            self._begin_sse()
-            try:
-                state = self.server.app.get_session(session_id)
-                # 客户端断开（SSE 写失败）→ 置位中断信号，停止本轮工具执行
-                interrupt_event = threading.Event()
-
-                def emit_activity(ev: dict) -> None:
-                    if not self._sse("activity", ev):
-                        interrupt_event.set()
-
-                def emit_token(text: str) -> None:
-                    if not self._sse("token", {"text": text}):
-                        interrupt_event.set()
-
-                reply = self.server.app.handle_message_stream(
-                    session_id,
-                    state,
-                    message,
-                    emit_event=emit_activity,
-                    emit_token=emit_token,
-                    interrupt_event=interrupt_event,
-                )
-            except Exception as exc:
-                self._sse("error", {"error": str(exc)})
-                reply = ""
-            self._sse("message", {"reply": reply, "session_id": session_id})
-            self._sse("done", {})
+            self._handle_chat(session_id, body)
+            return
+        if parsed.path == "/chat/stream":
+            session_id = body.get("session_id") or minimal_agent.generate_session_id()
+            self._audit_session_id = session_id
+            self._handle_chat_stream(session_id, body)
+            return
+        if parsed.path.startswith("/sessions/") and parsed.path.endswith("/chat/stream"):
+            session_id = unquote(parsed.path[len("/sessions/"):-len("/chat/stream")])
+            if not session_id or "/" in session_id:
+                self._send_json(404, {"error": "not found"})
+                return
+            self._audit_session_id = session_id
+            self._handle_chat_stream(session_id, body)
+            return
+        if parsed.path.startswith("/sessions/") and parsed.path.endswith("/chat"):
+            session_id = unquote(parsed.path[len("/sessions/"):-len("/chat")])
+            if not session_id or "/" in session_id:
+                self._send_json(404, {"error": "not found"})
+                return
+            self._audit_session_id = session_id
+            self._handle_chat(session_id, body)
             return
         if parsed.path == "/approvals/resolve":
             session_id = body.get("session_id", "")
@@ -755,6 +827,20 @@ class _Handler(BaseHTTPRequestHandler):
             count = resolve_gateway_approval(
                 session_id, choice, reason=body.get("reason")
             )
+            self._send_json(200, {"resolved": count})
+            return
+        if parsed.path == "/clarify/resolve":
+            session_id = body.get("session_id", "")
+            clarify_id = str(body.get("clarify_id") or "").strip()
+            answer = str(body.get("answer") or "").strip()
+            if not session_id or not answer:
+                self._send_json(
+                    400,
+                    {"error": "session_id and answer required"},
+                )
+                return
+            self._audit_session_id = session_id
+            count = clarify.resolve_clarify(session_id, clarify_id, answer)
             self._send_json(200, {"resolved": count})
             return
         if parsed.path.startswith("/sessions/") and parsed.path.endswith("/archive"):

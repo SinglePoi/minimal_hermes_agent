@@ -36,6 +36,7 @@ for stream in (sys.stdout, sys.stderr):
         pass
 
 import minimal_agent  # noqa: E402
+import clarify  # noqa: E402
 from approval import check_dangerous_command, register_gateway_notify  # noqa: E402
 from server import AgentServer, _Server  # noqa: E402
 
@@ -301,6 +302,7 @@ def test_static_frontend() -> None:
         index_body = body.decode("utf-8", errors="replace")
         check("首页包含页面标题", "今天想构建什么" in index_body)
         check("首页含工作区按钮", "btn-working-diff" in index_body)
+        check("首页含澄清弹窗", "clarify-overlay" in index_body)
 
         status, ctype, body = http_get(f"{fx.base}/web/app.js")
         check("GET /web/app.js 返回 200", status == 200)
@@ -309,6 +311,8 @@ def test_static_frontend() -> None:
         check("app.js 含审批轮询逻辑", "approvals/pending" in app_body)
         check("app.js 含工作区改动视图", "working-diff-view" in app_body)
         check("app.js 含会话导出逻辑", "sessionExport" in app_body)
+        check("app.js 含中途提问逻辑", "clarifyPending" in app_body)
+        check("app.js 两步式创建会话", "createSession" in app_body)
 
         status, _, _ = http_get(f"{fx.base}/web/style.css")
         check("GET /web/style.css 返回 200", status == 200)
@@ -769,6 +773,8 @@ def test_chat_stream_sse() -> None:
             'event: message' in body and '"reply": "完成"' in body,
         )
         check("SSE 含 done", "event: done" in body)
+        check("SSE 含 session 事件与会话 id", "event: session" in body)
+        check("SSE session 事件带 id", '"session_id": "sess-sse"' in body)
     finally:
         fx.close()
 
@@ -1277,6 +1283,145 @@ def test_session_export_endpoint() -> None:
         fx.close()
 
 
+def test_clarify_endpoint() -> None:
+    """中途提问端点：pending 可见 → resolve 唤醒阻塞线程；校验与审计。"""
+    import urllib.error
+
+    fx = ServerFixture()
+    try:
+        # get_session 会注册 clarify 通知；之后模型线程调用 clarify_tool 入队阻塞
+        fx.app.get_session("sess-clarify")
+        box: dict = {}
+        thread = threading.Thread(
+            target=lambda: box.setdefault(
+                "raw",
+                clarify.clarify_tool(
+                    "目标环境？",
+                    choices=["staging", "prod"],
+                    session_key="sess-clarify",
+                    timeout=10,
+                ),
+            ),
+            daemon=True,
+        )
+        thread.start()
+        time.sleep(0.2)
+
+        pending = http_json(
+            "GET", f"{fx.base}/clarify/pending?session_id=sess-clarify"
+        )
+        check("pending 1 条", len(pending["pending"]) == 1)
+        item = pending["pending"][0]
+        check("pending 含问题与选项", "目标环境？" in item["question"])
+        check("pending 选项完整", item["choices"] == ["staging", "prod"])
+
+        resolved = http_json(
+            "POST",
+            f"{fx.base}/clarify/resolve",
+            {
+                "session_id": "sess-clarify",
+                "clarify_id": item["clarify_id"],
+                "answer": "prod",
+            },
+        )
+        check("resolve 返回 1", resolved.get("resolved") == 1)
+        thread.join(timeout=5)
+        data = json.loads(box.get("raw", "{}"))
+        check("agent 线程拿到回答", data.get("user_response") == "prod")
+
+        # 参数校验：缺 answer → 400
+        try:
+            http_json(
+                "POST",
+                f"{fx.base}/clarify/resolve",
+                {"session_id": "sess-clarify"},
+            )
+            check("缺 answer -> 400", False)
+        except urllib.error.HTTPError as exc:
+            check("缺 answer -> 400", exc.code == 400)
+
+        # 审计
+        log_file = Path(fx.tmp.name) / "audit.log"
+        entries = [
+            json.loads(line)
+            for line in log_file.read_text(encoding="utf-8").strip().splitlines()
+        ]
+        check(
+            "审计 clarify:pending",
+            any(e.get("action") == "clarify:pending" and e.get("status") == 200 for e in entries),
+        )
+        check(
+            "审计 clarify:resolve",
+            any(e.get("action") == "clarify:resolve" and e.get("status") == 200 for e in entries),
+        )
+    finally:
+        fx.close()
+
+
+def test_sessions_create_chat_endpoint() -> None:
+    """两步式会话 API：POST /sessions 建会话拿 id → /sessions/<id>/chat[/stream] 聊天。"""
+    import urllib.error
+
+    fx = ServerFixture()
+    try:
+        created = http_json("POST", f"{fx.base}/sessions", {})
+        check("创建会话返回 201 语义（session_id）", bool(created.get("session_id")))
+        check("服务端生成 id 带前缀", created["session_id"].startswith("session-"))
+
+        again = http_json("POST", f"{fx.base}/sessions", {"id": created["session_id"]})
+        check("同 id 重复创建幂等", again.get("session_id") == created["session_id"])
+
+        custom = http_json("POST", f"{fx.base}/sessions", {"id": "custom-sess"})
+        check("客户端可传 id", custom.get("session_id") == "custom-sess")
+
+        # 非法 id → 400
+        try:
+            http_json("POST", f"{fx.base}/sessions", {"id": "a/b"})
+            check("非法 id -> 400", False)
+        except urllib.error.HTTPError as exc:
+            check("非法 id -> 400", exc.code == 400)
+
+        # 两步式聊天（非流式）
+        reply = http_json(
+            "POST",
+            f"{fx.base}/sessions/custom-sess/chat",
+            {"message": "你好"},
+        )
+        check("两步式聊天返回回复", reply.get("reply") == "你好，我是助手")
+        check("两步式聊天带会话 id", reply.get("session_id") == "custom-sess")
+
+        # 两步式流式：session 事件 + done
+        payload = json.dumps({"message": "执行"}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{fx.base}/sessions/custom-sess/chat/stream",
+            data=payload,
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        check("流式含 session 事件", "event: session" in body)
+        check("流式会话 id 正确", '"session_id": "custom-sess"' in body)
+        check("流式含 done", "event: done" in body)
+
+        # 审计：sessions:create 与 sessions:chat
+        log_file = Path(fx.tmp.name) / "audit.log"
+        entries = [
+            json.loads(line)
+            for line in log_file.read_text(encoding="utf-8").strip().splitlines()
+        ]
+        check(
+            "审计 sessions:create",
+            any(e.get("action") == "sessions:create" and e.get("status") == 201 for e in entries),
+        )
+        check(
+            "审计 sessions:chat",
+            any(e.get("action") == "sessions:chat" and e.get("status") == 200 for e in entries),
+        )
+    finally:
+        fx.close()
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== HTTP 服务化回归测试 ==")
@@ -1298,6 +1443,8 @@ def main() -> None:
         test_turn_budget,
         test_working_diff_endpoint,
         test_session_export_endpoint,
+        test_clarify_endpoint,
+        test_sessions_create_chat_endpoint,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

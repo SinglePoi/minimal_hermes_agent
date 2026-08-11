@@ -35,8 +35,8 @@ from typing import Any, Callable, Optional
 MAX_TOOL_WORKERS = 8
 
 # 永远不并行的工具（对齐 Hermes：todo 是会话级有状态写入，与其他工具并行
-# 会竞争同一份清单；Hermes 的 {"clarify"} 等交互工具同理）
-_NEVER_PARALLEL_TOOLS = frozenset({"todo"})
+# 会竞争同一份清单；clarify 是阻塞式交互提问，同样不能并行）
+_NEVER_PARALLEL_TOOLS = frozenset({"todo", "clarify"})
 
 # 只读、无共享可变状态的工具 → 可并行
 _PARALLEL_SAFE_TOOLS = frozenset({

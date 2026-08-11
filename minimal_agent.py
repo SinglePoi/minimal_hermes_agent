@@ -35,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -65,6 +66,7 @@ from working_diff import (
 )
 import process_registry
 from retry_utils import call_with_retry
+import clarify
 from todo_tool import (
     TODO_SCHEMA,
     get_todo_store,
@@ -331,6 +333,11 @@ def load_context_files() -> str:
             f"## 项目上下文（{path.name}@{base.name}）\n{_truncate_context(content, path.name)}"
         )
     return "\n\n".join(sections)
+
+
+def generate_session_id() -> str:
+    """生成带随机后缀的会话 id（防同一秒并发创建碰撞）。"""
+    return f"session-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
 
 def _db_conn() -> sqlite3.Connection:
@@ -1260,6 +1267,39 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "clarify",
+            "description": (
+                "中途向用户提问（需要用户拍板、任务有歧义、或想收集反馈时用）。"
+                "choices 最多给 4 个选项（界面会自动加'其他'自由输入），不给 choices "
+                "就是开放式提问；multi_select=true 表示可多选。"
+                "危险命令的确认不要用这个（terminal 工具自带审批）；低风险决策应"
+                "自己做默认选择，别滥用提问。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "问题本身（不要把选项写进问题文本）",
+                    },
+                    "choices": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 4,
+                        "description": "最多 4 个预设选项（可选）",
+                    },
+                    "multi_select": {
+                        "type": "boolean",
+                        "description": "是否多选（默认 false）",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "skills_list",
             "description": (
                 "列出所有可用技能（名称 + 一句话描述，最小元数据）。"
@@ -1674,6 +1714,13 @@ def run_tool(
         )
     if name == "process":
         return process_registry.process_tool(args)
+    if name == "clarify":
+        return clarify.clarify_tool(
+            question=args.get("question", ""),
+            choices=args.get("choices"),
+            multi_select=bool(args.get("multi_select", False)),
+            session_key=session_key,
+        )
     if name == "working_diff":
         return working_diff_tool(
             mode=args.get("mode", "working"),

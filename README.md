@@ -351,6 +351,19 @@
     `GET /sessions/<id>/export?format=md|html`（附件下载，走统一鉴权 +
     审计 sessions:export）。简化掉：SHA256 导出校验、压缩分段、tool_calls
     明细（Hermes 有）
+43. **中途问用户（clarify）**（2026-08-10，对齐 Hermes `tools/clarify_tool.py`
+    + `tools/clarify_gateway.py`）：模型需要用户拍板/任务有歧义/收集反馈时调
+    `clarify` 工具——单选（最多 4 个选项 + "其他"自由输入）/ 多选 / 开放式三种
+    形态；REPL 直接终端交互（编号选择），Web 走网关队列（/clarify/pending
+    轮询弹窗 + /clarify/resolve 唤醒，与审批同一套门铃思路，超时 300s 防挂死）；
+    危险命令确认不用它（terminal 自带审批）；已加入并行白名单的"永不并行"集合
+44. **两步式会话 API（先建后聊）**（2026-08-10，对齐 Hermes api_server）：
+    `POST /sessions` 先创建空会话返回 session_id（服务端生成
+    `session-时间戳-随机`，也可客户端传 id），再 `POST /sessions/<id>/chat[/stream]`
+    聊天——session_id 在 URL 里，请求阻塞期间轮询天然可用（clarify/审批不再
+    依赖"响应末尾才知道 id"）；原 `POST /chat[/stream]` 保留为兼容旧接口
+    （隐式建会话 + 聊）；前端新建对话先调 POST /sessions 拿 id 再聊；
+    REPL 仍走服务端生成；审计 sessions:create / sessions:chat
 
 ## 你需要准备的
 
@@ -881,6 +894,8 @@ python minimal_agent.py
 | REPL 斜杠命令 `/help` `/sessions` `/resume` `/diff` | Hermes CLI 的 slash 体系（`hermes_cli/commands.py`）+ `tools/working_diff.py` 的 `/diff`（骨架简化：仅 4+1 个命令） |
 | 后台进程 `process_registry.py` + `process` 工具 | `tools/process_registry.py`（spawn/poll/wait/kill，滚动 200KB 缓冲；骨架无检查点/TTL/notify） |
 | 会话导出 `session_export.py` + `/export` | `hermes_cli/session_export_md.py` + `session_export_html.py`（骨架简化：无 SHA256 校验/分段/tool_calls） |
+| 中途问用户 `clarify.py` | `tools/clarify_tool.py`（schema/选项清洗/多选）+ `tools/clarify_gateway.py`（阻塞事件队列 + 超时） |
+| 两步式会话 API `POST /sessions` + `/sessions/<id>/chat` | `gateway/platforms/api_server.py`（POST /api/sessions 建会话 + /api/sessions/{id}/chat；客户端可传 id，默认服务端生成 `api_时间戳_uuid`） |
 
 骨架简化掉了的工业级细节：文件锁、注入威胁扫描、外部漂移检测、可插拔 MemoryProvider、
 会话压缩后的 lineage 去重（压缩黑洞处理）、记忆主动 nudge、审批的 cron/gateway 上下文、

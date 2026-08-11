@@ -9,7 +9,12 @@ const API = {
   chatStream: "/chat/stream",
   pending: "/approvals/pending",
   resolve: "/approvals/resolve",
+  clarifyPending: "/clarify/pending",
+  clarifyResolve: "/clarify/resolve",
   sessions: "/sessions",
+  createSession: "/sessions",
+  chatSession: (id) => "/sessions/" + encodeURIComponent(id) + "/chat",
+  chatSessionStream: (id) => "/sessions/" + encodeURIComponent(id) + "/chat/stream",
   plugins: "/plugins",
   skills: "/skills",
   tools: "/tools",
@@ -37,6 +42,7 @@ const state = {
   abort: null,
   queueCount: 0,
   pendingItem: null,
+  clarifyItem: null,
   hasMessages: false,
   loginAvailable: false,
 };
@@ -1185,7 +1191,9 @@ async function switchSession(id, title) {
   }
   stopPolling();
   state.pendingItem = null;
+  state.clarifyItem = null;
   $("approval-overlay").classList.add("hidden");
+  $("clarify-overlay").classList.add("hidden");
   hideAllViews();
   state.sessionId = id;
   state.sessionTitle = title || "会话";
@@ -1280,6 +1288,15 @@ async function pollApprovals() {
   } catch (e) {
     /* 轮询失败静默重试，主请求的错误由 /chat 抛给用户 */
   }
+  try {
+    const data = await httpJson(
+      "GET",
+      API.clarifyPending + "?session_id=" + encodeURIComponent(state.sessionId)
+    );
+    renderClarify(data.pending || []);
+  } catch (e) {
+    /* 静默 */
+  }
 }
 
 function startPolling() {
@@ -1311,6 +1328,67 @@ async function resolveApproval(choice) {
     await pollApprovals();
   } catch (e) {
     appendMessage("error", "审批提交失败：" + e.message);
+  }
+}
+
+/* ---------- 中途提问（clarify） ---------- */
+
+function renderClarify(items) {
+  const item = items.length ? items[0] : null;
+  state.clarifyItem = item;
+  if (!item) {
+    $("clarify-overlay").classList.add("hidden");
+    return;
+  }
+  $("clarify-question").textContent = item.question || "";
+  const box = $("clarify-choices");
+  box.textContent = "";
+  if (item.choices && item.choices.length) {
+    item.choices.forEach((c) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn clarify-choice";
+      btn.textContent = c;
+      btn.dataset.value = c;
+      if (item.multi_select) {
+        btn.addEventListener("click", () => btn.classList.toggle("selected"));
+      } else {
+        btn.addEventListener("click", () => resolveClarify(c));
+      }
+      box.appendChild(btn);
+    });
+  }
+  $("clarify-queue").classList.toggle("hidden", items.length <= 1);
+  $("clarify-queue").textContent = "队列 " + items.length;
+  $("clarify-text").value = "";
+  $("clarify-overlay").classList.remove("hidden");
+}
+
+async function resolveClarify(answer) {
+  if (!state.sessionId || !state.clarifyItem) return;
+  const item = state.clarifyItem;
+  let finalAnswer = answer;
+  if (item.multi_select) {
+    const picked = Array.from(
+      document.querySelectorAll("#clarify-choices .selected")
+    ).map((b) => b.dataset.value);
+    const text = $("clarify-text").value.trim();
+    if (picked.length) finalAnswer = JSON.stringify(picked);
+    else if (text) finalAnswer = text;
+  } else {
+    const text = $("clarify-text").value.trim();
+    if (text) finalAnswer = text;
+  }
+  if (!finalAnswer || !finalAnswer.trim()) return;
+  try {
+    await httpJson("POST", API.clarifyResolve, {
+      session_id: state.sessionId,
+      clarify_id: item.clarify_id,
+      answer: finalAnswer,
+    });
+    await pollApprovals();
+  } catch (e) {
+    appendMessage("error", "回答提交失败：" + e.message);
   }
 }
 
@@ -1365,7 +1443,7 @@ async function sendStreaming(body, retried) {
 
   let resp;
   try {
-    resp = await fetch(API.chatStream, opts);
+    resp = await fetch(API.chatSessionStream(state.sessionId), opts);
   } catch (e) {
     // 主动取消（新对话/切换会话）不再回退；连接失败回退非流式
     if (state.abort && state.abort.signal.aborted) return true;
@@ -1397,6 +1475,12 @@ async function sendStreaming(body, retried) {
   };
 
   await readSse(resp, {
+    session: (d) => {
+      if (d.session_id) {
+        state.sessionId = d.session_id;
+        saveSession(d.session_id);
+      }
+    },
     activity: (ev) => handleActivityEvent(ev, tray),
     token: (d) => {
       replyText += d.text || "";
@@ -1424,6 +1508,19 @@ async function sendMessage() {
   const text = inputEl.value.trim();
   if (!text || state.inFlight) return;
 
+  // 两步式：新会话先 POST /sessions 让服务端生成 id，再发聊天请求
+  // （对齐 Hermes api_server：先建会话拿 id，后续请求都带它）
+  if (!state.sessionId) {
+    try {
+      const created = await httpJson("POST", API.createSession, {});
+      state.sessionId = created.session_id;
+      saveSession(state.sessionId);
+    } catch (e) {
+      appendMessage("error", "创建会话失败：" + e.message);
+      return;
+    }
+  }
+
   const token = turnToken;  // 本轮令牌：切换会话后失效，过期结果直接丢弃
   inputEl.value = "";
   autoResize();
@@ -1438,19 +1535,14 @@ async function sendMessage() {
   startPolling();
 
   const body = { message: text };
-  if (state.sessionId) body.session_id = state.sessionId;
 
   try {
     const streamed = await sendStreaming(body);
     if (token !== turnToken) return;  // 会话已切换：丢弃旧轮结果
     if (!streamed) {
       // 旧服务器或流式不可用：回退到一次性 /chat
-      const data = await httpJson("POST", API.chat, body);
+      const data = await httpJson("POST", API.chatSession(state.sessionId), body);
       if (token !== turnToken) return;
-      if (data.session_id) {
-        state.sessionId = data.session_id;
-        saveSession(data.session_id);
-      }
       setThinking(false);
       const tray = beginActivityTray();  // 活动在消息上方，一次性返回后立即收拢
       (data.events || []).forEach((ev) => handleActivityEvent(ev, tray));
@@ -1554,6 +1646,13 @@ function bindEvents() {
     $("deny-box").classList.add("hidden");
   });
   $("btn-deny-confirm").addEventListener("click", () => resolveApproval("deny"));
+  $("btn-clarify-submit").addEventListener("click", () => resolveClarify(""));
+  $("btn-clarify-cancel").addEventListener("click", () =>
+    resolveClarify("（用户取消）")
+  );
+  $("clarify-text").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") resolveClarify("");
+  });
 
   // 鉴权 token 弹窗按钮
   $("btn-token-save").addEventListener("click", () => {
