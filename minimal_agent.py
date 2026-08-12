@@ -53,6 +53,7 @@ from tool_dispatch import (
     tool_arguments,
     tool_name,
 )
+import mcp_client  # noqa: E402
 from skills import build_skills_index, skills_list, skill_view
 import web_tools
 from title_generator import auto_title_session, maybe_auto_title
@@ -1778,14 +1779,26 @@ def run_tool(
     if manager is not None and manager.has_tool(name):
         # 外部 provider 自带工具（如 keyword 的 memory_search）
         return manager.handle_tool_call(name, args)
+    mcp_result = mcp_client.call_mcp_tool(name, args)
+    if mcp_result is not None:
+        # MCP 外部工具（mcp__<服务器>__<工具>）；非 MCP 工具名返回 None 落到未知工具
+        return mcp_result
     return f"未知工具：{name}"
 
 
 def get_tools(manager: MemoryManager | None = None) -> list[dict[str, Any]]:
-    """核心工具 + 外部 provider 自带工具（对齐 Hermes：TOOLS + get_all_tool_schemas）。"""
+    """核心工具 + 外部 provider 自带工具 + MCP 工具（对齐 Hermes：TOOLS +
+    get_all_tool_schemas + MCP 工具注册）。MCP 服务器显式声明支持并行的工具
+    同步进 tool_dispatch 的并行判定（其余 MCP 工具一律串行）。"""
     tools: list[dict[str, Any]] = list(TOOLS)
     if manager:
         tools.extend(manager.get_all_tool_schemas())
+    mcp_schemas = mcp_client.get_mcp_tool_schemas()
+    tools.extend(mcp_schemas)
+    if mcp_schemas:
+        mcp_client.register_parallel_tool_names(
+            mcp_client.get_mcp_parallel_tool_names()
+        )
     return tools
 
 
@@ -1799,6 +1812,7 @@ def available_tool_names(manager: MemoryManager | None = None) -> set[str]:
     names = {tool_name(t) for t in TOOLS}
     if manager is not None and hasattr(manager, "get_all_tool_schemas"):
         names.update(tool_name(t) for t in manager.get_all_tool_schemas())
+    names.update(mcp_client.get_mcp_tool_names())
     return names
 
 
@@ -2645,6 +2659,8 @@ def main():
     bg_killed = process_registry.shutdown_all()
     if bg_killed:
         console.print(f"[dim]🧹 已终止 {bg_killed} 个后台进程[/dim]")
+    # MCP 子进程兜底清理（防退出后残留外部 MCP 服务器进程）
+    mcp_client.shutdown_mcp()
     console.print(
         f"\n[dim]会话已保存。下次用 --resume {repl_state.session_id} 继续对话。[/dim]"
     )

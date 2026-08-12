@@ -72,6 +72,7 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(override=True)
 
 import minimal_agent  # noqa: E402
+import mcp_client  # noqa: E402
 import dashboard_auth  # noqa: E402
 import skills  # noqa: E402
 import title_generator  # noqa: E402
@@ -143,6 +144,8 @@ def _audit_action(path: str, method: str = "GET") -> str:
         return "openai:chat"
     if path.startswith("/v1/models"):
         return "openai:models"
+    if path.startswith("/mcp"):
+        return "mcp"
     if path.startswith("/api/auth/login"):
         return "auth:login"
     if path.startswith("/api/auth/logout"):
@@ -484,6 +487,8 @@ class AgentServer:
         self._title_threads.clear()
         # 后台进程兜底清理：服务退出即终止会话内启动的后台进程（防孤儿）
         process_registry.shutdown_all()
+        # MCP 子进程兜底清理：服务退出即终止外部 MCP 服务器进程（防孤儿）
+        mcp_client.shutdown_mcp()
         for session_id in list(self.sessions):
             unregister_gateway_notify(session_id)
             clarify.unregister_clarify_notify(session_id)
@@ -829,6 +834,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/plugins":
             self._send_json(200, {"plugins": list_provider_plugins()})
+            return
+        if parsed.path == "/mcp":
+            # MCP 服务器状态（名称/工具数/并行声明；触发一次配置加载）
+            self._send_json(200, {"servers": mcp_client.mcp_status()})
             return
         if parsed.path == "/tools":
             tool_rows = []

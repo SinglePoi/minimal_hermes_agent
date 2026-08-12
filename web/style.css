@@ -13,6 +13,7 @@
   --danger: #c0392b;
   --radius: 16px;
   --shadow: 0 8px 28px rgba(61, 58, 51, 0.08), 0 2px 8px rgba(61, 58, 51, 0.05);
+  --glass-blur: 22px;
 }
 
 * { box-sizing: border-box; }
@@ -20,7 +21,12 @@
 html, body {
   height: 100%;
   margin: 0;
-  background: linear-gradient(160deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
+  /* 毛玻璃需要"背后有颜色"：暖陶土 + 柔蓝 + 浅绿的柔和光斑铺底 */
+  background:
+    radial-gradient(1100px 720px at 10% -10%, rgba(217, 119, 87, 0.30), transparent 62%),
+    radial-gradient(900px 640px at 96% 6%, rgba(88, 166, 255, 0.20), transparent 56%),
+    radial-gradient(1000px 760px at 50% 112%, rgba(46, 160, 67, 0.15), transparent 60%),
+    linear-gradient(160deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
   background-attachment: fixed;
   color: var(--text);
   font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", system-ui, sans-serif;
@@ -30,22 +36,29 @@ html, body {
   display: flex;
   height: 100dvh;
   width: 100%;
+  padding: 14px;
+  gap: 14px;
 }
 
 .hidden { display: none !important; }
 
 /* ---------- 左侧状态栏（毛玻璃） ---------- */
 .sidebar {
-  width: 246px;
+  width: 252px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  gap: 22px;
-  padding: 22px 18px;
-  background-color: var(--panel);
-  border-right: 1px solid var(--line-soft);
-  backdrop-filter: blur(20px) saturate(1.3);
-  -webkit-backdrop-filter: blur(20px) saturate(1.3);
+  gap: 20px;
+  padding: 20px 16px;
+  /* 毛玻璃：半透明白渐变 + 强模糊 + 顶部高光 + 悬浮阴影 */
+  background: linear-gradient(165deg, rgba(255, 255, 255, 0.68) 0%, rgba(250, 247, 240, 0.50) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.78);
+  border-radius: 22px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    0 10px 36px rgba(61, 58, 51, 0.10);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.55);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.55);
   overflow-y: auto;
 }
 
@@ -108,20 +121,27 @@ html, body {
 .side-nav-btn {
   width: 100%;
   justify-content: center;
+  padding: 9px 12px;
+  border-radius: 12px;
   background: rgba(255, 255, 255, 0.35);
-  border-color: var(--line-soft);
+  border-color: transparent;
   color: var(--muted);
+  font-weight: 500;
+  transition: background-color 0.18s ease, color 0.18s ease,
+    border-color 0.18s ease, box-shadow 0.18s ease;
 }
 
 .side-nav-btn:hover {
   color: var(--text);
-  border-color: var(--line);
+  background: rgba(255, 255, 255, 0.66);
+  border-color: var(--line-soft);
 }
 
 .side-nav-btn.active {
-  color: var(--text);
-  border-color: var(--accent);
-  background: rgba(217, 119, 87, 0.08);
+  color: #fff;
+  border-color: transparent;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  box-shadow: 0 4px 14px rgba(217, 119, 87, 0.35);
 }
 
 .session-list {
@@ -230,6 +250,107 @@ html, body {
   justify-content: space-between;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+/* 插件页标签页（MCP / 记忆插件 / 技能 / 工具） */
+.plugin-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--panel-strong);
+  border: 1px solid var(--line-soft);
+  border-radius: 14px;
+  box-shadow: inset 0 1px 2px rgba(61, 58, 51, 0.04);
+}
+
+.plugin-tab {
+  flex: 1;
+  padding: 9px 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.plugin-tab:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.plugin-tab.active {
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  box-shadow: 0 3px 10px rgba(217, 119, 87, 0.35);
+}
+
+.plugin-panels {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.plugin-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.plugin-panel .workspace-list {
+  flex: 1;
+  min-height: 0;
+  padding: 2px;
+  gap: 8px;
+}
+
+/* 插件页空状态美化 */
+.plugin-panel .session-empty {
+  text-align: center;
+  padding: 30px 12px;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* 插件页卡片美化 */
+.workspace-view .session-item {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid var(--line-soft);
+  box-shadow: 0 1px 2px rgba(61, 58, 51, 0.03);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.workspace-view .session-item:hover {
+  transform: translateY(-1px);
+  border-color: rgba(217, 119, 87, 0.35);
+  box-shadow: var(--shadow);
+}
+
+.workspace-view .session-item-title {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+/* 徽标配色：工具数绿、可并行蓝（启用中沿用默认陶土色） */
+.plugin-badge-count {
+  color: #2e7d32;
+  border-color: rgba(46, 125, 50, 0.35);
+  background: rgba(46, 125, 50, 0.08);
+}
+
+.plugin-badge-parallel {
+  color: #2f6fd0;
+  border-color: rgba(47, 111, 208, 0.35);
+  background: rgba(47, 111, 208, 0.08);
 }
 
 /* 工作区改动视图：模式切换 + diff 面板 */
@@ -510,18 +631,16 @@ html, body {
   flex-direction: column;
 }
 
-/* 顶部标题栏 */
+/* 顶部标题栏（融入右侧玻璃块：仅一行标题，无独立底色） */
 .topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
-  padding: 12px 22px;
-  border-bottom: 1px solid var(--line-soft);
-  background-color: rgba(250, 247, 240, 0.5);
-  backdrop-filter: blur(14px) saturate(1.25);
-  -webkit-backdrop-filter: blur(14px) saturate(1.25);
-  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 18px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.55);
+  background: transparent;
+  flex-shrink: 0;
 }
 
 .view-title {
@@ -541,6 +660,33 @@ html, body {
   flex-direction: column;
   overflow: hidden;
   position: relative;
+  /* 与侧栏同款毛玻璃面板，形成一体感 */
+  background: rgba(250, 247, 240, 0.56);
+  border: 1px solid rgba(255, 255, 255, 0.74);
+  border-radius: 22px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.75),
+    0 10px 36px rgba(61, 58, 51, 0.08);
+  backdrop-filter: blur(20px) saturate(1.45);
+  -webkit-backdrop-filter: blur(20px) saturate(1.45);
+}
+
+/* 对话容器：消息 + 输入框同宽居左（860px），右侧留白给【环境信息】卡片；
+   首页/工作区视图下不占满高度（只显示底部输入卡），对话模式下 .grow 撑满 */
+.conversation-pane {
+  display: flex;
+  flex-direction: column;
+  width: min(860px, 100%);
+  margin-right: auto;
+  min-height: 0;
+}
+
+.conversation-pane.grow {
+  flex: 1;
+}
+
+.conversation-pane.fill {
+  width: 100%;
 }
 
 /* 首页：hero + 建议卡片 */
@@ -591,9 +737,10 @@ html, body {
   padding: 18px 16px;
   border: 1px solid var(--line-soft);
   border-radius: 14px;
-  background: var(--panel);
-  backdrop-filter: blur(10px) saturate(1.2);
-  -webkit-backdrop-filter: blur(10px) saturate(1.2);
+  background: rgba(255, 255, 255, 0.58);
+  backdrop-filter: blur(16px) saturate(1.4);
+  -webkit-backdrop-filter: blur(16px) saturate(1.4);
+  border-color: rgba(255, 255, 255, 0.72);
   color: var(--text);
   text-align: left;
   font-family: inherit;
@@ -816,31 +963,87 @@ html, body {
 
 /* 输入区（毛玻璃） */
 .composer {
-  display: flex;
-  gap: 12px;
-  padding: 16px 22px;
-  border-top: 1px solid var(--line-soft);
-  background-color: rgba(250, 247, 240, 0.55);
-  backdrop-filter: blur(18px) saturate(1.3);
-  -webkit-backdrop-filter: blur(18px) saturate(1.3);
+  padding: 14px 16px 16px;
+  background: transparent;
 }
 
-.composer textarea {
-  flex: 1;
+/* 输入卡：输入框 + 功能栏共用一个白色圆角容器；限宽居中（对齐消息阅读宽度） */
+.composer-box {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  margin: 0;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(61, 58, 51, 0.12);
+  border-radius: 18px;
+  box-shadow:
+    inset 0 1px 3px rgba(61, 58, 51, 0.03),
+    0 2px 12px rgba(61, 58, 51, 0.06);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.composer-box:focus-within {
+  border-color: rgba(217, 119, 87, 0.5);
+  box-shadow:
+    inset 0 1px 3px rgba(61, 58, 51, 0.03),
+    0 0 0 3px rgba(217, 119, 87, 0.14);
+}
+
+.composer-box textarea {
+  border: none;
+  background: transparent;
+  box-shadow: none;
   resize: none;
   min-height: 44px;
   max-height: 170px;
-  padding: 11px 14px;
-  border: 1px solid var(--line);
-  border-radius: 13px;
-  background: rgba(255, 255, 255, 0.72);
+  padding: 14px 16px 6px;
   color: var(--text);
   font-size: 14px;
   font-family: inherit;
   line-height: 1.55;
-  box-shadow: inset 0 1px 3px rgba(61, 58, 51, 0.04);
 }
-.composer textarea:focus { outline: 1px solid var(--accent); }
+
+/* 功能栏：左侧提示，右侧圆形发送按钮（纯图标），同在白色容器内 */
+.composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px 10px;
+}
+
+.composer-hint {
+  font-size: 11.5px;
+  color: var(--muted);
+  user-select: none;
+}
+
+.btn-send {
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  box-shadow: 0 4px 12px rgba(217, 119, 87, 0.35);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+}
+
+.btn-send:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(217, 119, 87, 0.42);
+}
+
+.btn-send:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
+}
 
 .btn {
   border: 1px solid var(--line);
@@ -874,8 +1077,8 @@ html, body {
   position: fixed;
   inset: 0;
   background: rgba(53, 47, 40, 0.42);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1026,7 +1229,48 @@ html, body {
 
 @media (max-width: 560px) {
   .suggestions { grid-template-columns: 1fr; }
-  .topbar { padding: 10px 14px; }
   .composer { padding: 12px 14px; }
   .thread { padding: 18px 14px; }
+}
+
+/* ---------- 无障碍（对齐 ui-ux-pro-max UX 清单） ---------- */
+
+/* 键盘焦点可见环（鼠标点击不显示，避免视觉噪音） */
+.btn:focus-visible,
+.side-nav-btn:focus-visible,
+.plugin-tab:focus-visible,
+.btn-send:focus-visible,
+textarea:focus-visible,
+input:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid rgba(217, 119, 87, 0.78);
+  outline-offset: 2px;
+}
+
+/* 输入卡内的 textarea：焦点反馈交给容器（focus-within），避免双重红框 */
+.composer-box textarea:focus-visible {
+  outline: none;
+}
+
+/* 隐藏滚动条（保留滚动功能；对话/列表区域视觉更干净） */
+* {
+  scrollbar-width: none;
+}
+
+*::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+/* 尊重系统"减少动态"偏好：关掉过渡与动画 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }

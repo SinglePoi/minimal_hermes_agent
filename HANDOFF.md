@@ -75,6 +75,8 @@ tests/test_tirith.py          内容级扫描回归测试（零依赖，python t
 tests/test_gateway_approval.py 网关审批队列回归测试（零依赖，python tests/test_gateway_approval.py 直接跑）
 tests/test_server.py          HTTP 服务化回归测试（含 OpenAI 兼容组与日志事件组；零依赖，直接跑）
 tests/test_server_logging.py  服务化日志回归测试（零依赖，python tests/test_server_logging.py 直接跑）
+tests/test_mcp_client.py      MCP 客户端回归测试（零依赖，python tests/test_mcp_client.py 直接跑）
+tests/fake_mcp_server.py      测试用假 MCP 服务器（stdio JSON-RPC，echo/fail/slow 三个工具）
 tests/test_title_generator.py  LLM 标题回归测试（零依赖，直接跑）
 tests/test_terminal_output.py  终端输出清洗回归测试（零依赖，直接跑）
 tests/test_working_diff.py     working_diff 回归测试（零依赖，直接跑）
@@ -91,6 +93,10 @@ server_logging.py            服务化日志：JSON Lines 结构化 + 大小轮�
                              （对齐 hermes_logging.py 简化版；SERVER_LOG_PATH/MAX_MB/BACKUP_COUNT）
 server_ctl.ps1               服务控制脚本：start/stop/status/restart（后台启动 + PID +
                              探活 + 进程树停止；UTF-8 带 BOM，PowerShell 5.1 必需）
+mcp_client.py                MCP 客户端：stdio JSON-RPC 2.0（initialize/tools/list/
+                             tools/call），工具注册 TOOLS（mcp__ 前缀），安全环境过滤
+                             + ${VAR} 插值 + 截断脱敏 + 超时兜底（对齐 tools/mcp_tool.py）
+mcp_servers.example.json     MCP 配置示例（复制为 mcp_servers.json 使用；后者已 gitignore）
 dashboard_auth.py            用户名密码登录 + 无状态 session cookie（scrypt 哈希 + HMAC 签名，
                              对齐 Hermes plugins/dashboard_auth/basic；附 hash-password CLI）
 web/                         前端静态站点（原生 HTML/CSS/JS，零构建）：index.html + login.html + app.js + style.css
@@ -223,11 +229,13 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
 24. **前端 Web 页面（web/ 静态站点）**：对齐 Hermes dashboard 交互契约（参考
     Hermes `web/` 的 Vite + React 设计，按骨架惯例简化为原生 HTML/CSS/JS，
     零构建、零新依赖）——server.py 托管 `web/`（GET / 与 /web/*，含路径穿越
-    防护），同一 origin 免跨域；布局参考 Codex 首页（毛玻璃侧栏 + 标题栏 +
-    hero/建议卡片 + 底部输入框，首条消息后切会话线程）；品牌为通用 Agent
+    防护），同一 origin 免跨域；布局参考 Codex 首页（毛玻璃侧栏 + 右侧一整块
+    玻璃面板：融入式顶部标题栏（会话/视图名）+ hero/建议卡片 + 会话线程 +
+    融入底部的输入框；2026-08-12 composer 移入 content 后重做：输入区上方 +
+    功能栏下方，右侧圆形纯图标发送按钮；全局隐藏滚动条）；品牌为通用 Agent
     （不再叫夜莺，也不限定客服天气等业务范围）：
     - 对话：POST /chat、Markdown 子集渲染（先转义防 XSS）、建议卡片一键发送、
-      会话 ID 落 localStorage、可粘贴旧 ID 恢复、新对话按钮（侧栏 + 顶栏双入口）
+      会话 ID 落 localStorage、可粘贴旧 ID 恢复、新对话按钮（侧栏入口）
     - 过程活动展示：run_agent_turn/process_turn 新增 events 参数，/chat 响应带
       events（tool/skill/source 三类，参数经 redact 脱敏、结果截断 300 字符），
       前端渲染成"活动托盘"放在助手消息上方（实时展开），回复完成后自动收拢成
@@ -273,13 +281,16 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
       会话列表（非抽屉），只显示已归档会话（走 archived_only=1，修复
       include_archived 把未归档也列出的问题），每条仅"取消归档"、不支持
       打开会话，支持返回对话；
-    - 插件/技能视图：【插件】列 memory provider（GET /plugins，
-      memory_manager.list_provider_plugins 枚举 providers/ + docstring 首行 +
-      MEMORY_PROVIDER 启用标记），【技能】列可用技能（GET /skills 走
-      skills.discover_skills）；与已归档共用通用工作区视图切换
-      （VIEWS 注册表 + showView/closeView）；【工具】列全部工具（GET /tools：
-      server 的 self.tools = 核心 TOOLS + provider 工具）；侧栏导航按钮收进
-      .side-nav 紧凑分组（gap 6px）
+    - 插件页（合并视图 + 标签页，2026-08-12 改）：侧栏【插件】一个入口，页面
+      顶部 MCP 服务器 / 记忆插件 / 技能 / 工具四个标签页（data-tab +
+      switchPluginTab 切换，aria-selected 同步）；进入时 Promise.all 并行拉
+      四组数据渲染；MCP 卡片带工具数（绿）/可并行（蓝）双徽标、卡片悬停浮起；
+      VIEWS 注册表 + showView/closeView 不变；侧栏导航按钮收进紧凑分组
+      （新对话/已归档/插件/工作区）
+    - 视觉美化（2026-08-12，按 ui-ux-pro-max 设计系统）：背景叠加暖陶土/柔蓝/
+      浅绿光斑渐变；侧栏与主内容悬浮圆角毛玻璃面板（blur 20-22px + 顶部高光 +
+      悬浮阴影）；导航/插件标签陶土渐变胶囊；:focus-visible 焦点环 +
+      prefers-reduced-motion 无障碍支持（无头 Edge 截图 + 像素采样验证）
       sessions 表首次访问自动 ALTER TABLE 迁移补 archived 列
     - 审批弹窗：/chat 阻塞期间每 800ms 轮询 pending，按钮 允许一次/本会话/
       永久允许/拒绝（拒绝可填理由）；allow_permanent=false（smart deny）时
@@ -684,6 +695,44 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
     - 测试：`tests/test_server_logging.py` 新增（20 条断言：JSON 格式/轮转/
       脱敏/会话上下文/幂等与 force/环境变量）；test_server.py 新增日志事件组
       （/chat 后 turn.end 带 session_id/耗时/回复长度）；全套 29 套回归通过
+52. **MCP（Model Context Protocol）客户端**（2026-08-12，对齐 Hermes
+    `tools/mcp_tool.py` + `hermes_cli/mcp_config.py` 简化版）：
+    - `mcp_client.py`（零新依赖）：stdio 传输 + JSON-RPC 2.0——Popen 子进程 →
+      initialize（2024-11-05）→ notifications/initialized → tools/list（含
+      nextCursor 分页兜底）→ tools/call；读线程 + 队列 + 每服务器串行锁；
+      工具调用超时视为卡死：终止子进程，后续调用返回"未连接"，不挂死 Agent Loop
+    - 工具注册：`mcp__<服务器>__<工具>` 前缀命名（对齐 Hermes
+      mcp_prefixed_tool_name，sanitize 非 [A-Za-z0-9_-] 为 _）；inputSchema
+      透传为 OpenAI function parameters；接入 get_tools / available_tool_names /
+      run_tool 分发（在 provider 工具之后、未知工具之前）
+    - 配置：`mcp_servers.json`（已 gitignore；`MCP_SERVERS_PATH` 覆盖，留空禁用；
+      参考 `mcp_servers.example.json`）——command/args/env/timeout/
+      connect_timeout/supports_parallel_tool_calls；字段校验失败跳过并给提示
+    - 安全（对齐 Hermes）：`_build_safe_env` 只透传安全基线 + 配置显式 env
+      （密钥不泄露给外部进程）；`${VAR}` / `${env:VAR}` 插值；结果/错误回传前
+      truncate_output（50000）+ redact_sensitive_text(force=True)
+    - 并行：MCP 工具默认串行（外部副作用未知）；tool_dispatch 增加
+      `_parallel_safe()` 钩子，配置声明 supports_parallel_tool_calls=true 才进
+      并行判定（对齐 Hermes 同名配置键）
+    - 退出清理：REPL main() 与 AgentServer.shutdown() 调 shutdown_mcp() 终止
+      全部外部子进程（防孤儿）
+    - 网页：新增 GET /mcp（服务器状态：名称/工具数/可并行），侧栏【插件】改为
+      合并视图——MCP 服务器 / 记忆插件 / 技能 / 工具四个标签页切换展示（原独立
+      的技能/工具按钮移除；/skills /tools 端点保留，供插件页拉取）
+    - 测试：`tests/test_mcp_client.py` 新增（配置加载/插值与安全环境过滤/
+      连接发现/调用/超时/命令不存在/截断脱敏/并行白名单/minimal_agent 集成，
+      用 `tests/fake_mcp_server.py` 真实 stdio 子进程端到端）；test_server.py
+      新增 /tools 集成组；全套 30 套回归通过
+    - 实测（2026-08-12）：接官方 @modelcontextprotocol/server-filesystem（npx），
+      连接约 5s 注册 14 个工具，list_directory / read_text_file 真实调用成功
+    - 实战加固：Windows 下 npx 实际是 npx.cmd，Popen 不解析 .cmd → 启动命令
+      先用 shutil.which 解析（找不到回退原命令）；PowerShell/记事本保存的 JSON
+      常带 UTF-8 BOM → 配置读取用 utf-8-sig（均补了回归断言）
+    - 未做（Hermes 有）：HTTP / StreamableHTTP / SSE 传输、自动重连、
+      sampling（服务器请求 LLM）、resources/prompts 工具
+    - 注意：MCP 规范要求 UTF-8；中文 Windows 下自研 Python MCP 服务器默认
+      stdout 为 GBK，需在服务器里 reconfigure(encoding="utf-8")（测试假服务器
+      已示范），否则父进程按 UTF-8 解码会乱码
 
 ## 运行方式
 
@@ -857,6 +906,12 @@ python demo_file_tools.py
   会话上下文（set/clear）、setup 幂等与 force 重配、环境变量配置（路径/阈值/
   备份数），20 条断言；test_server.py 新增日志事件组（/chat 后 turn.end 带
   session_id/耗时/回复长度）
+- 回归测试脚本 `tests/test_mcp_client.py`（新增，2026-08-12）：配置加载（缺失/
+  非法 JSON/字段校验）、${VAR} 插值与安全环境过滤（密钥不传子进程）、连接与
+  工具发现（mcp__ 前缀/schema 透传/分页）、调用（成功/isError/超时终止/命令
+  不存在）、截断与脱敏、并行白名单（默认串行、声明后并行）、minimal_agent
+  集成（run_tool 分发/get_tools/available_tool_names）；test_server.py 新增
+  /tools 集成组（配置指向 tests/fake_mcp_server.py 后工具列表含 MCP 工具）
 
 ## 已知限制 / 下一步候选
 
@@ -890,18 +945,17 @@ python demo_file_tools.py
 
 ## 待办模块（Roadmap，未排期）
 
-按"推荐顺序"排列（2026-08-12 汇总；OpenAI 兼容接口与运维线"手动启动 + 日志
-轮转"已于 2026-08-12 完成，其余均未排期）：
+按"推荐顺序"排列（2026-08-12 汇总；OpenAI 兼容接口、运维线"手动启动 + 日志
+轮转"、MCP 客户端已于 2026-08-12 完成，其余均未排期）：
 
 - **运维：Windows 服务化 / Task Scheduler（可选，未排期）**：手动启动 +
   结构化日志 + 轮转已完成（见 51）；如需开机自启/崩溃自动拉起再排
   Task Scheduler 或注册 Windows 服务。Hermes 参照：systemd / gateway daemon
-- **MCP（Model Context Protocol）**：连外部工具/数据源。Hermes 参照：
-  `hermes_cli/mcp_config.py` + `mcp_picker.py` + `optional-mcps/` +
-  `tools/mcp_tool.py` + `mcp_serve.py`；骨架接入点：TOOLS 动态注册 + run_tool
-  分发 + 并行安全查询 + 工具搜索渐进披露（tool_search）
 - **多代理/委派（架构级）**：delegate_tool + 子代理 + 会话路由；做它之前
   "文件锁/跨 profile"才真正有用（可一并补 `tools/file_state.py` 思路）
+- **MCP 增强（可选）**：stdio 已完成（52）；如需 HTTP/StreamableHTTP/SSE
+  传输、自动重连、sampling、resources/prompts 工具再排。Hermes 参照：
+  `tools/mcp_tool.py`（其余部分）+ `mcp_serve.py`
 - **ACP（Agent Client Protocol）**：被 VS Code / Zed / JetBrains 等编辑器
   客户端调用。Hermes 参照：`acp_adapter/` + `hermes acp` 子命令；
   骨架接入点：独立 adapter 模块 + CLI 子命令
@@ -931,9 +985,11 @@ cron 审批（用户取消）
 - OpenAI 兼容接口已完成（50）：/v1/models + /v1/chat/completions（非流式 + SSE）
 - 运维线"手动启动 + 结构化日志 + 轮转"已完成（51）；Task Scheduler /
   Windows 服务未做（需长期驻留时再排）
+- MCP 客户端已完成（52）：stdio JSON-RPC，工具注册 + run_tool 分发 + 并行
+  白名单 + 退出清理；HTTP/SSE 传输、sampling 未做
 - 文件工具剩余：文件锁、跨 profile 检查（单代理低价值，暂不做）
 - Skills 剩余：技能 hub 同步（明确暂不做）
-- 下一步待办见上方"待办模块"：MCP → 多代理 → ACP → 小件（运维剩余可选）
+- 下一步待办见上方"待办模块"：多代理/委派 → ACP → 小件（运维/MCP 增强可选）
 - 中断接线：REPL Ctrl+C 已完成（36）；一次性 /chat 无法感知断连（保持现状）
 
 ## 给新会话的起始指令（可直接粘贴）
@@ -941,7 +997,7 @@ cron 审批（用户取消）
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里（2026-08-12）：1~51 全部完成——最近一批（40~49）是
+> 我们上次停在这里（2026-08-12）：1~52 全部完成——最近一批（40~49）是
 > LLM 自动标题、终端输出清洗、working_diff 工具、网页工作区改动视图、
 > LLM 重试健壮性、REPL 斜杠命令、后台/常驻终端、会话导出、clarify 中途问用户、
 > 两步式会话 API（POST /sessions 先建后聊，/chat 保留为兼容旧接口）；
@@ -952,9 +1008,12 @@ cron 审批（用户取消）
 > 第 51 项是 **运维线：服务化日志 + 手动启动**（server_logging.py JSON Lines +
 > 轮转 + 脱敏 + 会话关联；server_ctl.ps1 start/stop/status/restart，部署方式
 > 用户已定为手动启动；Task Scheduler / Windows 服务未做）。
-> 全套 29 套回归通过 + OpenAI SDK 端到端冒烟通过 + server_ctl 全流程实测。
-> 下一步候选（详见"待办模块"）：**MCP** → 多代理/委派 → ACP → 大结果落盘/
-> 网站策略/澄清增强等小件（运维剩余 Task Scheduler / Windows 服务可选）。
+> 第 52 项是 **MCP 客户端**（mcp_client.py：stdio JSON-RPC，工具注册进 TOOLS、
+> mcp__ 前缀命名、安全环境过滤 + ${VAR} 插值 + 截断脱敏 + 超时兜底；配置
+> mcp_servers.json，HTTP/SSE 传输与 sampling 未做）。
+> 全套 30 套回归通过 + OpenAI SDK 端到端冒烟通过 + server_ctl 全流程实测。
+> 下一步候选（详见"待办模块"）：**多代理/委派** → ACP → 大结果落盘/网站策略/
+> 澄清增强等小件（运维 Task Scheduler / MCP 增强可选）。
 > cron 审批已取消；文件锁/跨 profile、Skills hub、多外部 memory provider 明确暂不做。
 
 ## 发版检查记录（2026-08-10，release-check 技能）

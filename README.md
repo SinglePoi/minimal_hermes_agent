@@ -110,8 +110,17 @@
 20. **前端 Web 页面（web/ 静态站点）**：对齐 Hermes dashboard 的交互契约（参考
     Hermes `web/` 的 Vite + React 设计，按骨架惯例简化为原生 HTML/CSS/JS，
     零构建、零新依赖）——`server.py` 直接托管 `web/`（`GET /` 与 `/web/*`），
-    同一 origin 免跨域；布局参考 Codex 首页：左侧毛玻璃侧栏（品牌/能力清单）+
-    顶部标题栏 + 首页 hero/四张建议卡片 + 底部毛玻璃输入框，首条消息后切到会话线程：
+    同一 origin 免跨域；布局参考 Codex 首页：左侧悬浮圆角毛玻璃侧栏（品牌/能力清单）+
+    右侧一整块玻璃面板（顶部融入式标题栏显示会话/视图名，hero/建议卡片与会话
+    线程共用，底部输入框融入对话块），首条消息后切到会话线程：
+    - 视觉（2026-08-12 按 ui-ux-pro-max 设计系统美化）：背景叠加暖陶土/柔蓝/浅绿
+      光斑渐变，侧栏与主内容为同款毛玻璃面板（blur 20-22px + 顶部高光 + 悬浮阴影）、
+      导航与插件页标签用陶土色渐变胶囊；补齐 :focus-visible 焦点环与
+      prefers-reduced-motion 无障碍支持；隐藏滚动条（保留滚动功能）
+    - 输入框（2026-08-12 重做）：输入区 + 功能栏同处一个**白色圆角输入卡**
+      （输入区在上、功能栏在下：左侧 Enter/Shift+Enter 提示，右侧**圆形纯图标
+      发送按钮**，发送中禁用变灰；聚焦整卡描边）；对话容器（消息 + 输入卡）
+      限宽 860px **居左**，右侧留白给后续【环境信息】卡片（首页不参与该容器）
     - 对话：`POST /chat` 发消息、渲染 Markdown 子集（代码块/行内代码/加粗/
       斜体/列表，先转义再包标签防 XSS）、建议卡片一键发送、会话 ID 自动生成并
       持久化到 localStorage、可粘贴旧会话 ID 恢复、新对话按钮
@@ -138,11 +147,11 @@
       取消归档；侧栏"新对话"下方的【已归档】按钮把主工作区切换为归档列表，
       只显示已归档会话（`GET /sessions?archived_only=1`），每条仅"取消归档"、
       不支持打开会话，支持"← 返回对话"；`?include_archived=1` 表示未归档+归档都返回
-    - 插件/技能视图：【插件】列 memory provider（`GET /plugins`，含启用中标记），
-      【技能】列可用技能（`GET /skills`，name + description），与【已归档】一样
-      切换主工作区、支持"← 返回对话"；【工具】列全部可用工具
-      （`GET /tools`：核心 TOOLS + provider 自带工具，name + description）；
-      侧栏导航按钮（新对话/已归档/插件/技能/工具）收进紧凑分组
+    - 插件页（合并视图 + 标签页）：侧栏【插件】一个入口，页面顶部
+      **MCP 服务器 / 记忆插件 / 技能 / 工具**四个标签页切换（数据一次并行拉取，
+      点击标签切换展示）；MCP 卡片带"工具数（绿）/可并行（蓝）"徽标、卡片悬停
+      浮起；与【已归档】一样切换主工作区、支持"← 返回对话"；侧栏导航按钮
+      （新对话/已归档/插件/工作区）收进紧凑分组
     - 审批弹窗：/chat 阻塞期间每 800ms 轮询 `GET /approvals/pending`，展示命令与
       原因（服务端已脱敏），按钮 允许一次/本会话允许/永久允许/拒绝（拒绝可填理由）；
       smart deny 场景按网关数据的 `allow_permanent=false` 自动隐藏"永久允许"
@@ -402,6 +411,25 @@
       探活确认；与手动前台运行 `python server.py` 等价；`logs/` 与 `server.pid`
       已 gitignore（Hermes 参照 systemd / gateway daemon，Windows 手动模式为
       Task Scheduler / Windows 服务的前置阶段）
+47. **MCP（Model Context Protocol）客户端**（2026-08-12，对齐 Hermes
+    `tools/mcp_tool.py` + `hermes_cli/mcp_config.py` 简化版）：
+    - `mcp_client.py`：stdio 传输的 JSON-RPC 2.0 客户端——启动子进程 →
+      initialize → notifications/initialized → tools/list（含分页兜底）→
+      tools/call；工具注册进 TOOLS，模型可像内置工具一样调用
+    - 工具名带 `mcp__<服务器>__<工具>` 前缀（对齐 Hermes 的
+      mcp_prefixed_tool_name）；配置在 `mcp_servers.json`（已 gitignore，
+      `MCP_SERVERS_PATH` 可覆盖；参考 `mcp_servers.example.json`）
+    - 安全（对齐 Hermes）：子进程环境只透传安全基线变量 + 配置显式 env、
+      `${VAR}` / `${env:VAR}` 插值（密钥不进配置文件）、结果与错误回传前
+      截断（50000）+ 脱敏；工具调用超时视为服务器卡死，终止子进程不挂死循环
+    - 并行判定：MCP 工具默认串行（外部副作用未知），配置声明
+      `supports_parallel_tool_calls: true` 才进入并行白名单
+    - 退出清理：REPL / 服务停止时统一 shutdown_mcp() 终止外部子进程（防孤儿）
+    - 网页：`GET /mcp` 服务器状态（名称/工具数/可并行）；侧栏【插件】合并视图
+      （MCP 服务器 / 记忆插件 / 技能 / 工具四组一页，原独立技能/工具入口移除）
+    - 未做（Hermes 有）：HTTP / StreamableHTTP / SSE 传输、自动重连、sampling
+    - 注意：中文 Windows 下自研 Python MCP 服务器需自己
+      `reconfigure(encoding="utf-8")`（MCP 规范要求 UTF-8；测试假服务器已示范）
 
 ## 你需要准备的
 
@@ -555,6 +583,7 @@ python server.py                 # 默认 127.0.0.1:8000
 | `SERVER_LOG_PATH` | 服务化日志路径（结构化 JSON Lines + 大小轮转；相对项目根目录） | `logs/server.log` |
 | `SERVER_LOG_MAX_MB` | 单个日志文件轮转阈值（MB） | `5` |
 | `SERVER_LOG_BACKUP_COUNT` | 保留的轮转备份份数 | `3` |
+| `MCP_SERVERS_PATH` | MCP 服务器配置路径（JSON；留空 = 禁用 MCP） | `mcp_servers.json` |
 
 > 鉴权与审计：`SERVER_AUTH_TOKEN` 是生产密钥，只从环境变量注入；前端 401 时会弹出
 > token 输入框并自动重试，token 只存浏览器 localStorage。审计日志与 Hermes 的
@@ -927,6 +956,49 @@ python -c "from openai import OpenAI; c = OpenAI(base_url='http://127.0.0.1:8000
 `SERVER_AUTH_TOKEN`，默认推导会话无需任何配置即可用。流式下工具调用以标准
 `delta.tool_calls` 帧输出，Open WebUI 能看到工具名与参数（参数已脱敏）。
 
+## 体验 MCP（外部工具）
+
+**例：接官方 filesystem 服务器**（需要 Node.js/npx）。先把 `mcp_servers.json`
+写成这样：
+
+```powershell
+Copy-Item mcp_servers.example.json mcp_servers.json   # 或手写下面这份
+```
+
+```json
+{
+  "filesystem": {
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "C:/Users/Administrator/Documents/Codex/2026-08-03/ru/outputs/minimal_agent/mcp_demo_data"
+    ],
+    "timeout": 120,
+    "connect_timeout": 60
+  }
+}
+```
+
+然后启动服务（REPL 或 HTTP 都行），工具会自动注册：
+
+```powershell
+python server.py
+# 浏览器打开 http://127.0.0.1:8000，或直接验证：
+#   GET http://127.0.0.1:8000/tools  → 能看到 mcp__filesystem__list_directory 等 14 个工具
+```
+
+实测结果（2026-08-12）：连接耗时约 5s（npx 首次下载包），注册 14 个工具；
+`mcp__filesystem__list_directory` 返回 `[FILE] readme.txt`，
+`mcp__filesystem__read_text_file` 能读出文件内容。对话里模型需要时就会调用
+`mcp__<服务器>__<工具>`（与内置工具同一套调用/并行/审批体系，结果截断 + 脱敏
+后回传）。没有 `mcp_servers.json` 时 MCP 自动跳过，不影响其他功能。
+
+其他服务器同理：`command`/`args`/`env`（密钥用 `${VAR}` 插值注入，不写明文）、
+可选 `timeout` / `connect_timeout` / `supports_parallel_tool_calls`。Windows 上
+`npx` 这类命令实际是 `npx.cmd`，客户端已用 `shutil.which` 自动解析；配置 JSON
+带 BOM 也能读（utf-8-sig）。复制 `mcp_servers.example.json` 可看到更多字段。
+
 ## 与 Hermes 源码的对应关系
 
 | 本骨架 | Hermes 源码 |
@@ -992,6 +1064,7 @@ python -c "from openai import OpenAI; c = OpenAI(base_url='http://127.0.0.1:8000
 | OpenAI 兼容 `GET /v1/models` + `POST /v1/chat/completions` | `gateway/platforms/api_server.py`（`_handle_chat_completions` / `_write_sse_chat_completion` / `_derive_chat_session_id` / `_openai_error` / `_normalize_chat_content`；骨架简化：单模型无 model_routes、`/v1/responses` 与 `X-Hermes-Session-Key` 未做） |
 | 服务化日志 `server_logging.py` | `hermes_logging.py`（setup_logging / RotatingFileHandler / RedactingFormatter / set_session_context；骨架简化：JSON Lines 单文件、单进程用标准库轮转） |
 | 手动启动 `server_ctl.ps1` | Hermes systemd / gateway daemon（Windows 手动模式：后台启动 + PID + 探活 + 进程树停止；Task Scheduler / Windows 服务未做，留待长期驻留需要） |
+| MCP 客户端 `mcp_client.py` | `tools/mcp_tool.py` + `hermes_cli/mcp_config.py`（stdio JSON-RPC 2.0：initialize/tools/list/tools/call、`mcp__` 前缀命名、安全环境过滤、`${VAR}` 插值、supports_parallel_tool_calls；骨架简化：仅 stdio、无自动重连/sampling/HTTP-SSE） |
 
 骨架当前简化掉（或有意不做）的工业级细节：文件锁、注入威胁扫描、外部漂移检测、
 会话压缩后的 lineage 去重（压缩黑洞处理）、Skills 的 hub/组织同步/插件命名空间、
@@ -1009,10 +1082,10 @@ REPL 斜杠命令/后台终端/会话导出/clarify/两步式会话 API/OpenAI �
 - 已完成（1~49）：Agent Loop/工具/三层记忆/压缩/审批/并行/技能/文件工具/脱敏/
   服务化+前端/鉴权审计登录/会话删除标题 fork/联网/时间工具/turn budget/中断语义/
   LLM 自动标题/终端输出清洗/working_diff+网页工作区视图/LLM 重试/REPL 斜杠命令/
-  后台终端/会话导出/clarify 中途问用户/两步式会话 API/OpenAI 兼容接口
+  后台终端/会话导出/clarify 中途问用户/两步式会话 API/OpenAI 兼容接口/
+  服务化日志+手动启动/MCP 客户端
   （详见 README 功能列表）
-- 待办（详见 HANDOFF"待办模块"）：运维日志/进程守护 → MCP → 多代理/委派 → ACP →
-  （运维线"手动启动 + 日志轮转"已完成，剩余 Task Scheduler / Windows 服务）
-  MCP → 多代理/委派 → ACP → 大结果落盘/网站策略/澄清增强等小件
+- 待办（详见 HANDOFF"待办模块"）：多代理/委派 → ACP → 大结果落盘/网站策略/
+  澄清增强等小件（运维剩余 Task Scheduler / Windows 服务可选）
 - 明确暂不做：cron 审批（用户取消）、文件锁/跨 profile、Skills hub 同步、
   多外部 memory provider 同时挂载

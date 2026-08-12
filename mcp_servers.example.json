@@ -1,0 +1,25 @@
+{
+  "filesystem": {
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "C:/path/to/your/folder"
+    ],
+    "env": {},
+    "timeout": 120,
+    "connect_timeout": 30,
+    "supports_parallel_tool_calls": false
+  },
+  "github": {
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-github"
+    ],
+    "env": {
+      "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+    },
+    "supports_parallel_tool_calls": true
+  }
+}

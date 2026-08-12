@@ -28,8 +28,6 @@
         <button id="btn-new-session-side" class="btn primary new-chat-btn" type="button">＋ 新对话</button>
         <button id="btn-archived" class="btn side-nav-btn" type="button">已归档</button>
         <button id="btn-plugins" class="btn side-nav-btn" type="button">插件</button>
-        <button id="btn-skills" class="btn side-nav-btn" type="button">技能</button>
-        <button id="btn-tools" class="btn side-nav-btn" type="button">工具</button>
         <button id="btn-working-diff" class="btn side-nav-btn" type="button">工作区</button>
       </div>
 
@@ -54,11 +52,12 @@
 
     <!-- 右侧主列：标题栏 + 内容区 + 输入框 -->
     <div class="main-col">
-      <header class="topbar">
-        <div class="view-title" id="view-title">新对话</div>
-      </header>
-
       <main class="content">
+        <!-- 顶部标题栏（融入右侧玻璃块：会话/视图标题） -->
+        <header class="topbar">
+          <div class="view-title" id="view-title">新对话</div>
+        </header>
+
         <!-- 首页：hero + 建议卡片（参考 Codex 首页布局） -->
         <section class="home" id="home">
           <div class="hero">
@@ -85,10 +84,36 @@
           </div>
         </section>
 
-        <!-- 会话线程（首条消息后显示） -->
-        <section class="thread hidden" id="chat" aria-live="polite"></section>
+        <!-- 对话容器（不含首页）：消息 + 任务清单 + 输入框同宽居左，
+             右侧留白给后续【环境信息】卡片 -->
+        <div class="conversation-pane fill" id="conversation-pane">
+          <!-- 会话线程（首条消息后显示） -->
+          <section class="thread hidden" id="chat" aria-live="polite"></section>
 
-        <!-- 工作区视图：已归档 / 插件 / 技能（点击侧栏按钮切换主工作区） -->
+          <!-- 任务清单面板（todo 工具，常驻展示当前会话任务） -->
+          <div id="todo-panel" class="todo-panel hidden"></div>
+
+          <!-- 输入框（融入对话块） -->
+          <footer class="composer">
+            <div class="composer-box">
+              <textarea id="input" rows="1"
+                        placeholder="输入消息…" disabled></textarea>
+              <div class="composer-bar">
+                <span class="composer-hint">Enter 发送 · Shift+Enter 换行</span>
+                <button id="btn-send" class="btn-send" type="button" aria-label="发送" disabled>
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none"
+                       stroke="currentColor" stroke-width="2.2" stroke-linecap="round"
+                       stroke-linejoin="round" aria-hidden="true">
+                    <path d="M12 19V5"/>
+                    <path d="m5 12 7-7 7 7"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </footer>
+        </div>
+
+        <!-- 工作区视图：已归档 / 插件（MCP+记忆插件+技能+工具合并）/ 工作区改动 -->
         <section class="workspace-view hidden" id="archived-view">
           <div class="workspace-view-head">
             <span class="view-title">已归档</span>
@@ -101,21 +126,26 @@
             <span class="view-title">插件</span>
             <button id="btn-plugins-back" class="btn ghost" type="button">← 返回对话</button>
           </div>
-          <div class="workspace-list" id="plugins-list"></div>
-        </section>
-        <section class="workspace-view hidden" id="skills-view">
-          <div class="workspace-view-head">
-            <span class="view-title">技能</span>
-            <button id="btn-skills-back" class="btn ghost" type="button">← 返回对话</button>
+          <div class="plugin-tabs" role="tablist">
+            <button class="plugin-tab active" type="button" data-tab="mcp" role="tab" aria-selected="true">MCP 服务器</button>
+            <button class="plugin-tab" type="button" data-tab="plugins" role="tab" aria-selected="false">记忆插件</button>
+            <button class="plugin-tab" type="button" data-tab="skills" role="tab" aria-selected="false">技能</button>
+            <button class="plugin-tab" type="button" data-tab="tools" role="tab" aria-selected="false">工具</button>
           </div>
-          <div class="workspace-list" id="skills-list"></div>
-        </section>
-        <section class="workspace-view hidden" id="tools-view">
-          <div class="workspace-view-head">
-            <span class="view-title">工具</span>
-            <button id="btn-tools-back" class="btn ghost" type="button">← 返回对话</button>
+          <div class="plugin-panels">
+            <div class="plugin-panel" id="panel-mcp">
+              <div class="workspace-list" id="mcp-list"></div>
+            </div>
+            <div class="plugin-panel hidden" id="panel-plugins">
+              <div class="workspace-list" id="plugins-list"></div>
+            </div>
+            <div class="plugin-panel hidden" id="panel-skills">
+              <div class="workspace-list" id="skills-list"></div>
+            </div>
+            <div class="plugin-panel hidden" id="panel-tools">
+              <div class="workspace-list" id="tools-list"></div>
+            </div>
           </div>
-          <div class="workspace-list" id="tools-list"></div>
         </section>
         <section class="workspace-view hidden" id="working-diff-view">
           <div class="workspace-view-head">
@@ -137,16 +167,8 @@
             <div class="wdiff-right" id="wdiff-files"></div>
           </div>
         </section>
+
       </main>
-
-      <!-- 任务清单面板（todo 工具，常驻展示当前会话任务） -->
-      <div id="todo-panel" class="todo-panel hidden"></div>
-
-      <footer class="composer">
-        <textarea id="input" rows="1"
-                  placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
-        <button id="btn-send" class="btn primary" type="button">发送</button>
-      </footer>
     </div>
   </div>
 

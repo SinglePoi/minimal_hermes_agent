@@ -38,6 +38,7 @@ for stream in (sys.stdout, sys.stderr):
         pass
 
 import minimal_agent  # noqa: E402
+import mcp_client  # noqa: E402
 import clarify  # noqa: E402
 import server_logging  # noqa: E402
 from approval import check_dangerous_command, register_gateway_notify  # noqa: E402
@@ -180,6 +181,7 @@ class ServerFixture:
                 "SERVER_LOG_PATH",
                 "SERVER_LOG_MAX_MB",
                 "SERVER_LOG_BACKUP_COUNT",
+                "MCP_SERVERS_PATH",
             )
         }
         os.environ.pop("SERVER_AUTH_TOKEN", None)
@@ -192,6 +194,7 @@ class ServerFixture:
             "DASHBOARD_COOKIE_SECURE",
         ):
             os.environ.pop(key, None)
+        os.environ.pop("MCP_SERVERS_PATH", None)
         # 标题生成默认关闭：后台 LLM 线程会污染精确调用计数（BudgetFakeClient）与
         # 顺序假 client（seq）断言；专门的标题测试单独开启
         os.environ["TITLE_GENERATION_ENABLED"] = "0"
@@ -217,6 +220,7 @@ class ServerFixture:
         self.server.server_close()
         self.app.shutdown()
         server_logging.shutdown_logging()
+        mcp_client.shutdown_mcp()
         self.tmp.cleanup()
         minimal_agent.SESSION_DB = Path(ROOT) / "sessions.db"
         for key, value in self._env_backup.items():
@@ -313,6 +317,16 @@ def test_static_frontend() -> None:
         check("首页包含页面标题", "今天想构建什么" in index_body)
         check("首页含工作区按钮", "btn-working-diff" in index_body)
         check("首页含澄清弹窗", "clarify-overlay" in index_body)
+        check(
+            "首页含插件标签页视图",
+            "plugin-tabs" in index_body
+            and "plugin-tab" in index_body
+            and "MCP 服务器" in index_body,
+        )
+        check(
+            "首页不再有独立技能/工具按钮",
+            "btn-skills" not in index_body and "btn-tools" not in index_body,
+        )
 
         status, ctype, body = http_get(f"{fx.base}/web/app.js")
         check("GET /web/app.js 返回 200", status == 200)
@@ -323,6 +337,12 @@ def test_static_frontend() -> None:
         check("app.js 含会话导出逻辑", "sessionExport" in app_body)
         check("app.js 含中途提问逻辑", "clarifyPending" in app_body)
         check("app.js 两步式创建会话", "createSession" in app_body)
+        check(
+            "app.js 含 MCP 渲染与标签切换",
+            "renderMCPList" in app_body
+            and "switchPluginTab" in app_body
+            and "mcp-list" in app_body,
+        )
 
         status, _, _ = http_get(f"{fx.base}/web/style.css")
         check("GET /web/style.css 返回 200", status == 200)
@@ -485,6 +505,9 @@ def test_skills_and_plugins_endpoints() -> None:
             all(isinstance(p.get("description"), str) for p in plugins["plugins"]),
         )
         check("插件条目含 active 标记", all("active" in p for p in plugins["plugins"]))
+
+        mcp_status = http_json("GET", f"{fx.base}/mcp")
+        check("MCP 状态默认空", mcp_status.get("servers") == [])
     finally:
         fx.close()
 
@@ -1798,11 +1821,29 @@ def test_openai_session_header_and_limits() -> None:
         )
         check("带 token 的模型列表", models.get("object") == "list")
         log_file = Path(fx.tmp.name) / "audit.log"
-        entries = [
-            json.loads(line)
-            for line in log_file.read_text(encoding="utf-8").strip().splitlines()
-        ]
-        check("审计含 openai:models", any(e.get("action") == "openai:models" and e.get("status") == 200 for e in entries))
+        def audit_entries() -> list[dict]:
+            """读取审计日志并解析 JSON Lines。"""
+            if not log_file.exists():
+                return []
+            return [
+                json.loads(line)
+                for line in log_file.read_text(encoding="utf-8").strip().splitlines()
+                if line.strip()
+            ]
+
+        # 审计行在响应发送后才写（do_GET finally），轮询等落盘避免竞态
+        deadline = time.time() + 3
+        models_audited = False
+        while time.time() < deadline:
+            if any(
+                e.get("action") == "openai:models" and e.get("status") == 200
+                for e in audit_entries()
+            ):
+                models_audited = True
+                break
+            time.sleep(0.05)
+        check("审计含 openai:models", models_audited)
+        entries = audit_entries()
         check("审计含 openai:chat", any(e.get("action") == "openai:chat" for e in entries))
         check("审计含 403 记录", any(e.get("action") == "openai:chat" and e.get("status") == 403 for e in entries))
         check("审计含 413 记录", any(e.get("action") == "openai:chat" and e.get("status") == 413 for e in entries))
@@ -1846,6 +1887,43 @@ def test_server_log_events() -> None:
         fx.close()
 
 
+def test_mcp_tools_endpoint() -> None:
+    """/tools 反映 MCP 工具（配置指向假服务器后重载工具表）。"""
+    fx = ServerFixture()
+    tmp = tempfile.TemporaryDirectory()
+    try:
+        config = {
+            "demo": {
+                "command": sys.executable,
+                "args": [
+                    str(Path(__file__).resolve().parent / "fake_mcp_server.py")
+                ],
+                "timeout": 5,
+                "connect_timeout": 5,
+            }
+        }
+        cfg_path = Path(tmp.name) / "mcp_servers.json"
+        cfg_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        os.environ["MCP_SERVERS_PATH"] = str(cfg_path)
+        mcp_client.shutdown_mcp()  # 重置单例，让 get_tools 按新配置重新加载
+        fx.app.tools = minimal_agent.get_tools(fx.app.manager)
+        tools = http_json("GET", f"{fx.base}/tools")
+        names = [t["name"] for t in tools["tools"]]
+        check("/tools 含 MCP 工具", "mcp__demo__echo" in names)
+        check("/tools 含 MCP 工具描述", any(
+            t["name"] == "mcp__demo__echo" and t["description"]
+            for t in tools["tools"]
+        ))
+        mcp_status = http_json("GET", f"{fx.base}/mcp")
+        check("/mcp 含 demo 服务器", any(
+            s.get("name") == "demo" and s.get("tools") == 3
+            for s in mcp_status.get("servers", [])
+        ))
+    finally:
+        tmp.cleanup()
+        fx.close()
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== HTTP 服务化回归测试 ==")
@@ -1876,6 +1954,7 @@ def main() -> None:
         test_openai_stream_tool_call_redacted,
         test_openai_session_header_and_limits,
         test_server_log_events,
+        test_mcp_tools_endpoint,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

@@ -20,7 +20,6 @@
 
 简化掉的部分：
     - _is_destructive_command()（Hermes 用于 terminal checkpoint，骨架无 checkpoint 系统）
-    - MCP 工具并行安全查询（骨架无 MCP）
     - 中断语义与 turn 级 budget/steer 收尾（Hermes 在 executor 里做）
 """
 
@@ -30,6 +29,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+import mcp_client  # noqa: E402
 
 # 对齐 Hermes run_agent._MAX_TOOL_WORKERS
 MAX_TOOL_WORKERS = 8
@@ -55,6 +56,15 @@ _PARALLEL_SAFE_TOOLS = frozenset({
 _PATH_SCOPED_READERS = frozenset({"read_file", "search_files"})
 _PATH_SCOPED_WRITERS = frozenset({"write_file", "patch"})
 _PATH_SCOPED_TOOLS = _PATH_SCOPED_READERS | _PATH_SCOPED_WRITERS
+
+
+def _parallel_safe(name: str) -> bool:
+    """工具是否可并行：内置只读白名单 + MCP 服务器显式声明支持并行的工具。
+
+    对齐 Hermes：MCP 工具默认串行（外部副作用未知），只有配置里显式声明
+    supports_parallel_tool_calls=true 的才进入并行判定。
+    """
+    return name in _PARALLEL_SAFE_TOOLS or mcp_client.parallel_safe_mcp_tool(name)
 
 
 # =========================================================================
@@ -233,7 +243,7 @@ def _plan_tool_batch_segments(
             current.append(tool_call)
             continue
 
-        if name in _PARALLEL_SAFE_TOOLS:
+        if _parallel_safe(name):
             current.append(tool_call)
             continue
 

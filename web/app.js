@@ -16,6 +16,7 @@ const API = {
   chatSession: (id) => "/sessions/" + encodeURIComponent(id) + "/chat",
   chatSessionStream: (id) => "/sessions/" + encodeURIComponent(id) + "/chat/stream",
   plugins: "/plugins",
+  mcp: "/mcp",
   skills: "/skills",
   tools: "/tools",
   workingDiff: "/working_diff",
@@ -53,8 +54,9 @@ const homeEl = $("home");
 const inputEl = $("input");
 const sendBtn = $("btn-send");
 const viewTitle = $("view-title");
+const conversationPane = $("conversation-pane");
 
-/* 工作区视图注册表：已归档 / 插件 / 技能 */
+/* 工作区视图注册表：已归档 / 插件（MCP+记忆插件+技能+工具合并）/ 工作区改动 */
 const VIEWS = {
   archived: {
     viewId: "archived-view",
@@ -66,16 +68,6 @@ const VIEWS = {
     label: "插件",
     load: refreshPluginsList,
   },
-  skills: {
-    viewId: "skills-view",
-    label: "技能",
-    load: refreshSkillsList,
-  },
-  tools: {
-    viewId: "tools-view",
-    label: "工具",
-    load: refreshToolsList,
-  },
   wdiff: {
     viewId: "working-diff-view",
     label: "工作区改动",
@@ -85,8 +77,6 @@ const VIEWS = {
 const NAV_BUTTONS = {
   archived: "btn-archived",
   plugins: "btn-plugins",
-  skills: "btn-skills",
-  tools: "btn-tools",
   wdiff: "btn-working-diff",
 };
 
@@ -169,6 +159,9 @@ function renderMarkdown(text) {
 function showThread() {
   homeEl.classList.add("hidden");
   chatEl.classList.remove("hidden");
+  conversationPane.classList.remove("hidden");
+  conversationPane.classList.add("grow");
+  conversationPane.classList.remove("fill");
   hideAllViews();
   viewTitle.textContent = state.sessionTitle || "会话";
   state.hasMessages = true;
@@ -177,6 +170,9 @@ function showThread() {
 function showHome() {
   homeEl.classList.remove("hidden");
   chatEl.classList.add("hidden");
+  conversationPane.classList.remove("hidden");
+  conversationPane.classList.remove("grow");
+  conversationPane.classList.add("fill");
   hideAllViews();
   viewTitle.textContent = "新对话";
   state.hasMessages = false;
@@ -838,6 +834,9 @@ function showView(name) {
   if (!v) return;
   homeEl.classList.add("hidden");
   chatEl.classList.add("hidden");
+  conversationPane.classList.add("hidden");
+  conversationPane.classList.remove("grow");
+  conversationPane.classList.remove("fill");
   hideAllViews();
   $(v.viewId).classList.remove("hidden");
   $(NAV_BUTTONS[name]).classList.add("active");
@@ -926,20 +925,69 @@ function renderSkillList(list) {
 
 async function refreshPluginsList() {
   try {
-    const data = await httpJson("GET", API.plugins);
-    renderPluginList(data.plugins || []);
+    // 合并视图一次拉齐：MCP 服务器 / 记忆插件 / 技能 / 工具
+    const [mcpData, pluginData, skillData, toolData] = await Promise.all([
+      httpJson("GET", API.mcp),
+      httpJson("GET", API.plugins),
+      httpJson("GET", API.skills),
+      httpJson("GET", API.tools),
+    ]);
+    renderMCPList(mcpData.servers || []);
+    renderPluginList(pluginData.plugins || []);
+    renderSkillList(skillData.skills || []);
+    renderToolList(toolData.tools || []);
   } catch (e) {
     /* 静默 */
   }
 }
 
-async function refreshSkillsList() {
-  try {
-    const data = await httpJson("GET", API.skills);
-    renderSkillList(data.skills || []);
-  } catch (e) {
-    /* 静默 */
+function switchPluginTab(name) {
+  /* 插件页标签切换：MCP / 记忆插件 / 技能 / 工具 */
+  document.querySelectorAll(".plugin-tab").forEach((btn) => {
+    const active = btn.dataset.tab === name;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  ["mcp", "plugins", "skills", "tools"].forEach((key) => {
+    $("panel-" + key).classList.toggle("hidden", key !== name);
+  });
+}
+
+function renderMCPList(list) {
+  const box = $("mcp-list");
+  box.textContent = "";
+  if (!list.length) {
+    const empty = document.createElement("div");
+    empty.className = "session-empty";
+    empty.textContent = "未配置 MCP 服务器（mcp_servers.json）";
+    box.appendChild(empty);
+    return;
   }
+  list.forEach((s) => {
+    const item = document.createElement("div");
+    item.className = "session-item stack";
+    const head = document.createElement("div");
+    head.className = "session-item-head";
+    const title = document.createElement("span");
+    title.className = "session-item-title";
+    title.textContent = s.name;
+    head.appendChild(title);
+    const countBadge = document.createElement("span");
+    countBadge.className = "session-item-badge plugin-badge-count";
+    countBadge.textContent = `${s.tools} 个工具`;
+    head.appendChild(countBadge);
+    if (s.parallel) {
+      const parallelBadge = document.createElement("span");
+      parallelBadge.className = "session-item-badge plugin-badge-parallel";
+      parallelBadge.textContent = "可并行";
+      head.appendChild(parallelBadge);
+    }
+    const desc = document.createElement("div");
+    desc.className = "session-item-desc";
+    desc.textContent = s.active ? "已连接" : "未连接";
+    item.append(head, desc);
+    box.appendChild(item);
+  });
 }
 
 function renderToolList(list) {
@@ -967,15 +1015,6 @@ function renderToolList(list) {
     item.append(head, desc);
     box.appendChild(item);
   });
-}
-
-async function refreshToolsList() {
-  try {
-    const data = await httpJson("GET", API.tools);
-    renderToolList(data.tools || []);
-  } catch (e) {
-    /* 静默 */
-  }
 }
 
 /* ---------- 工作区改动视图 ---------- */
@@ -1529,7 +1568,7 @@ async function sendMessage() {
   setThinking(true);
   state.inFlight = true;
   sendBtn.disabled = true;
-  sendBtn.textContent = "…";
+  sendBtn.setAttribute("aria-label", "发送中");
   inputEl.disabled = true;
   state.abort = new AbortController();
   startPolling();
@@ -1558,8 +1597,8 @@ async function sendMessage() {
     }
   } finally {
     state.inFlight = false;
-    sendBtn.disabled = false;
-    sendBtn.textContent = "发送";
+    updateSendState();
+    sendBtn.setAttribute("aria-label", "发送");
     inputEl.disabled = false;
     stopPolling();
     inputEl.focus();
@@ -1596,6 +1635,11 @@ function autoResize() {
   inputEl.style.height = Math.min(inputEl.scrollHeight, 170) + "px";
 }
 
+function updateSendState() {
+  /* 发送按钮状态跟随输入内容：无文本 / 发送中 / 输入禁用时置灰 */
+  sendBtn.disabled = !inputEl.value.trim() || state.inFlight || inputEl.disabled;
+}
+
 /* ---------- 初始化 ---------- */
 
 function bindEvents() {
@@ -1606,7 +1650,10 @@ function bindEvents() {
       sendMessage();
     }
   });
-  inputEl.addEventListener("input", autoResize);
+  inputEl.addEventListener("input", () => {
+    autoResize();
+    updateSendState();
+  });
 
   // 建议卡片：点击即发送
   document.querySelectorAll(".suggestion").forEach((btn) => {
@@ -1621,13 +1668,12 @@ function bindEvents() {
   $("btn-new-session-side").addEventListener("click", handleNewSession);
   $("btn-archived").addEventListener("click", () => toggleView("archived"));
   $("btn-plugins").addEventListener("click", () => toggleView("plugins"));
-  $("btn-skills").addEventListener("click", () => toggleView("skills"));
-  $("btn-tools").addEventListener("click", () => toggleView("tools"));
   $("btn-working-diff").addEventListener("click", () => toggleView("wdiff"));
+  document.querySelectorAll(".plugin-tab").forEach((btn) => {
+    btn.addEventListener("click", () => switchPluginTab(btn.dataset.tab));
+  });
   $("btn-archived-back").addEventListener("click", closeView);
   $("btn-plugins-back").addEventListener("click", closeView);
-  $("btn-skills-back").addEventListener("click", closeView);
-  $("btn-tools-back").addEventListener("click", closeView);
   $("btn-working-diff-back").addEventListener("click", closeView);
   $("btn-working-diff-refresh").addEventListener("click", refreshWorkingDiff);
   $("btn-wdiff-working").addEventListener("click", () => setWorkingDiffMode("working"));
@@ -1714,6 +1760,7 @@ function init() {
       refreshUserCard();
     });
   inputEl.disabled = false;
+  updateSendState();
   inputEl.focus();
 }
 

@@ -7,5 +7,7 @@ approval_allowlist.json
 audit.log
 logs/
 server.pid
+mcp_servers.json
+mcp_demo_data/
 providers/keyword/memory.json
 providers/vector/vectors.json
