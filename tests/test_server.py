@@ -14,6 +14,8 @@ HTTP 服务化 + 网关审批端点的回归测试（零依赖，直接运行）
     - GET /skills 技能列表与 GET /plugins 插件列表
     - GET /tools 工具列表（核心 TOOLS）
     - POST /chat/stream SSE 流式（思考/工具活动 + token + message + done）
+    - OpenAI 兼容：GET /v1/models、POST /v1/chat/completions（非流式 + SSE chunk、
+      会话推导、X-Hermes-Session-Id 安全门、错误信封、请求体上限）
 """
 
 import json
@@ -1422,6 +1424,326 @@ def test_sessions_create_chat_endpoint() -> None:
         fx.close()
 
 
+def test_openai_models_endpoint() -> None:
+    """GET /v1/models：OpenAI 风格模型列表（Open WebUI / LibreChat 发现用）。"""
+    fx = ServerFixture()
+    try:
+        resp = http_json("GET", f"{fx.base}/v1/models")
+        check("模型列表 object=list", resp.get("object") == "list")
+        check("模型列表含 data", isinstance(resp.get("data"), list) and len(resp["data"]) >= 1)
+        check("模型 id 与配置一致", resp["data"][0].get("id") == minimal_agent.MODEL)
+        check("模型条目 object=model", resp["data"][0].get("object") == "model")
+    finally:
+        fx.close()
+
+
+def test_openai_chat_completions() -> None:
+    """POST /v1/chat/completions：标准响应 + parts 归一化 + OpenAI 错误信封。"""
+    import urllib.error
+
+    fx = ServerFixture()
+    try:
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": "你是助手"},
+                {"role": "user", "content": "你好"},
+            ],
+        }
+        req = urllib.request.Request(
+            f"{fx.base}/v1/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            session_header = resp.headers.get("X-Hermes-Session-Id", "")
+        check("对象为 chat.completion", data.get("object") == "chat.completion")
+        check("id 前缀 chatcmpl-", str(data.get("id", "")).startswith("chatcmpl-"))
+        check("choices index=0", data["choices"][0]["index"] == 0)
+        check(
+            "assistant 消息内容",
+            data["choices"][0]["message"]["role"] == "assistant"
+            and data["choices"][0]["message"]["content"] == "你好，我是助手",
+        )
+        check("finish_reason=stop", data["choices"][0]["finish_reason"] == "stop")
+        check(
+            "usage 字段齐全",
+            data["usage"]["prompt_tokens"] >= 0
+            and data["usage"]["completion_tokens"] >= 0
+            and data["usage"]["total_tokens"] >= 0,
+        )
+        check("会话头为 api- 推导", session_header.startswith("api-"))
+
+        # content 为 parts 数组：text 拼接、image_url 静默跳过（骨架不支持多模态）
+        parts_payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "你是助手"}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "你好"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "http://example.com/a.png"},
+                        },
+                    ],
+                },
+            ]
+        }
+        parts_reply = http_json(
+            "POST", f"{fx.base}/v1/chat/completions", parts_payload
+        )
+        check(
+            "parts 文本归一化后正常回答",
+            parts_reply["choices"][0]["message"]["content"] == "你好，我是助手",
+        )
+
+        # 错误信封：缺 messages / 无用户消息 / 非法 JSON
+        for bad, label in (
+            ({"model": "x"}, "缺 messages -> 400 错误信封"),
+            (
+                {"messages": [{"role": "assistant", "content": "只有助手"}]},
+                "无用户消息 -> 400 错误信封",
+            ),
+        ):
+            try:
+                http_json("POST", f"{fx.base}/v1/chat/completions", bad)
+                check(label, False)
+            except urllib.error.HTTPError as exc:
+                err = json.loads(exc.read().decode("utf-8"))
+                check(label, exc.code == 400 and err.get("error", {}).get("type") == "invalid_request_error")
+
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", fx.port, timeout=10)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=b"{not json",
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        err = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        check(
+            "非法 JSON -> 400 错误信封",
+            resp.status == 400 and err.get("error", {}).get("type") == "invalid_request_error",
+        )
+    finally:
+        fx.close()
+
+
+def test_openai_chat_derived_session_and_seed() -> None:
+    """OpenAI 兼容：同首条消息推导同会话；带历史的首请求折入一次。"""
+    fx = ServerFixture()
+    try:
+        def chat(messages: list[dict]) -> tuple[str, dict]:
+            """发一次 /v1/chat/completions，返回 (X-Hermes-Session-Id, 响应体)。"""
+            payload = json.dumps(
+                {"messages": messages}, ensure_ascii=False
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                f"{fx.base}/v1/chat/completions", data=payload, method="POST"
+            )
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.headers.get("X-Hermes-Session-Id", ""), json.loads(
+                    resp.read().decode("utf-8")
+                )
+
+        sid1, data1 = chat([{"role": "user", "content": "第一问"}])
+        check("首请求返回助手回复", data1["choices"][0]["message"]["content"] == "你好，我是助手")
+        check("推导会话 id 为 api- 前缀", sid1.startswith("api-"))
+
+        sid2, _ = chat([{"role": "user", "content": "第一问"}])
+        check("同首条消息推导同会话", sid1 == sid2)
+        state = fx.app.sessions[sid1]
+        check("两轮后会话消息数=5", len(state["messages"]) == 5)
+
+        # 带历史的首请求：历史折入会话（只发生一次，之后以会话内状态为准）
+        sid3, _ = chat(
+            [
+                {"role": "user", "content": "开场"},
+                {"role": "assistant", "content": "开场答"},
+                {"role": "user", "content": "继续问"},
+            ]
+        )
+        check("带历史首请求推导独立会话", sid3.startswith("api-") and sid3 != sid1)
+        state3 = fx.app.sessions[sid3]
+        contents = [m.get("content", "") for m in state3["messages"]]
+        check("历史折入（开场）", "开场" in contents)
+        check("历史折入（开场答）", "开场答" in contents)
+        check("折入后消息数=5", len(state3["messages"]) == 5)
+    finally:
+        fx.close()
+
+
+def test_openai_chat_stream() -> None:
+    """OpenAI 兼容流式：role/content/finish chunk + hermes.tool.progress + [DONE]。"""
+    tool_call_chunk = StreamChunk(
+        StreamDelta(
+            tool_calls=[
+                SimpleNamespace(
+                    index=0,
+                    id="call_1",
+                    type="function",
+                    function=SimpleNamespace(name="get_current_time", arguments=""),
+                )
+            ]
+        )
+    )
+    args_chunk = StreamChunk(
+        StreamDelta(
+            tool_calls=[
+                SimpleNamespace(
+                    index=0,
+                    id=None,
+                    type=None,
+                    function=SimpleNamespace(name=None, arguments="{}"),
+                )
+            ]
+        )
+    )
+    batches = [
+        [StreamChunk(StreamDelta(reasoning_content="先想想")), tool_call_chunk, args_chunk],
+        [
+            StreamChunk(StreamDelta(content="完")),
+            StreamChunk(
+                StreamDelta(content="成了"), usage=SimpleNamespace(prompt_tokens=10)
+            ),
+        ],
+    ]
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=StreamCompletions(batches))
+    )
+    fx = ServerFixture(client=client)
+    try:
+        payload = json.dumps(
+            {"stream": True, "messages": [{"role": "user", "content": "几点了"}]},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{fx.base}/v1/chat/completions", data=payload, method="POST"
+        )
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            session_header = resp.headers.get("X-Hermes-Session-Id", "")
+        check("流式含 role chunk", '"delta": {"role": "assistant"}' in body)
+        check(
+            "流式 content 逐段转发（打字机）",
+            '"delta": {"content": "完"}' in body
+            and '"delta": {"content": "成了"}' in body,
+        )
+        check("流式含 finish_reason stop", '"finish_reason": "stop"' in body)
+        check("流式含 usage", '"usage"' in body)
+        check("流式含 [DONE]", "data: [DONE]" in body)
+        check(
+            "流式含工具进度事件",
+            "event: hermes.tool.progress" in body
+            and '"status": "running"' in body
+            and '"status": "completed"' in body,
+        )
+        check("流式会话头为 api-", session_header.startswith("api-"))
+    finally:
+        fx.close()
+
+
+def test_openai_session_header_and_limits() -> None:
+    """X-Hermes-Session-Id：未配 token 拒绝；配 token 放行；非法 id/超大请求体拒绝。"""
+    import http.client
+    import urllib.error
+
+    fx = ServerFixture()
+    try:
+        payload = json.dumps(
+            {"messages": [{"role": "user", "content": "你好"}]}, ensure_ascii=False
+        ).encode("utf-8")
+
+        def post(headers: dict) -> tuple[int, dict]:
+            """发 POST，返回 (状态码, 响应体字典)。"""
+            req = urllib.request.Request(
+                f"{fx.base}/v1/chat/completions", data=payload, method="POST"
+            )
+            req.add_header("Content-Type", "application/json")
+            for key, value in headers.items():
+                req.add_header(key, value)
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    return resp.status, json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+
+        # 未配置 token：会话续接被拒（对齐 Hermes 安全门）
+        status, err = post({"X-Hermes-Session-Id": "manual-1"})
+        check("未配 token 的 header 会话 -> 403", status == 403)
+        check("403 为 OpenAI 错误信封", err.get("error", {}).get("type") == "invalid_request_error")
+
+        # 非法会话 id（路径穿越）与超长 id → 400
+        os.environ["SERVER_AUTH_TOKEN"] = "test-openai-token"
+        status, _ = post(
+            {"Authorization": "Bearer test-openai-token", "X-Hermes-Session-Id": "../evil"}
+        )
+        check("非法会话 id -> 400", status == 400)
+        status, _ = post(
+            {"Authorization": "Bearer test-openai-token", "X-Hermes-Session-Id": "x" * 200}
+        )
+        check("超长会话 id -> 400", status == 400)
+
+        # 带 token + 合法 header：沿用指定会话
+        status, data = post(
+            {"Authorization": "Bearer test-openai-token", "X-Hermes-Session-Id": "manual-ok"}
+        )
+        check("带 token header 会话放行", status == 200 and data["choices"][0]["message"]["content"] == "你好，我是助手")
+        check("指定会话状态已建", "manual-ok" in fx.app.sessions)
+
+        # 未带 Bearer 的 /v1 请求 -> 401（统一鉴权门卫）
+        status, _ = post({})
+        check("未带 token 的 /v1 请求 -> 401", status == 401)
+
+        # 超大请求体 -> 413（Content-Length 前置检查，不读 body）
+        conn = http.client.HTTPConnection("127.0.0.1", fx.port, timeout=10)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=b"x",
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": "99999999",
+            },
+        )
+        resp = conn.getresponse()
+        err = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        check("超大请求体 -> 413", resp.status == 413)
+        check("413 为 OpenAI 错误信封", err.get("error", {}).get("code") == "body_too_large")
+
+        # 审计：openai:models 与 openai:chat（含 403/401/413 记录）
+        models = http_json(
+            "GET",
+            f"{fx.base}/v1/models",
+            headers={"Authorization": "Bearer test-openai-token"},
+        )
+        check("带 token 的模型列表", models.get("object") == "list")
+        log_file = Path(fx.tmp.name) / "audit.log"
+        entries = [
+            json.loads(line)
+            for line in log_file.read_text(encoding="utf-8").strip().splitlines()
+        ]
+        check("审计含 openai:models", any(e.get("action") == "openai:models" and e.get("status") == 200 for e in entries))
+        check("审计含 openai:chat", any(e.get("action") == "openai:chat" for e in entries))
+        check("审计含 403 记录", any(e.get("action") == "openai:chat" and e.get("status") == 403 for e in entries))
+        check("审计含 413 记录", any(e.get("action") == "openai:chat" and e.get("status") == 413 for e in entries))
+        check("审计含 401 记录", any(e.get("action") == "openai:chat" and e.get("status") == 401 for e in entries))
+        check("审计记录推导/指定会话 id", any(e.get("session_id") == "manual-ok" for e in entries))
+    finally:
+        fx.close()
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== HTTP 服务化回归测试 ==")
@@ -1445,6 +1767,11 @@ def main() -> None:
         test_session_export_endpoint,
         test_clarify_endpoint,
         test_sessions_create_chat_endpoint,
+        test_openai_models_endpoint,
+        test_openai_chat_completions,
+        test_openai_chat_derived_session_and_seed,
+        test_openai_chat_stream,
+        test_openai_session_header_and_limits,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

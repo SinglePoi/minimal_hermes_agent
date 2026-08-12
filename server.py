@@ -11,6 +11,10 @@ HTTP 服务化 + gateway 审批通知（为前端铺路，对齐 Hermes dashboar
     POST /sessions/<id>/chat/stream   同上，SSE 流式（event: session/activity/token/message/done）
     POST /chat              兼容旧接口：隐式建会话 + 发消息（body 可带 session_id）
     POST /chat/stream       兼容旧接口的流式版
+    GET  /v1/models          OpenAI 兼容：模型列表（Open WebUI / LibreChat 等前端发现用）
+    POST /v1/chat/completions OpenAI 兼容：Chat Completions 格式（非流式 + stream=true SSE；
+                             会话默认按 system + 首条用户消息推导稳定的 api-<digest> id，
+                             也可用 X-Hermes-Session-Id 显式续接（需配置鉴权 token））
     GET  /approvals/pending 轮询待审批；query: ?session_id=xxx
     POST /approvals/resolve 解决审批；body: {"session_id", "choice": once|session|always|deny, "reason"?}
     GET  /clarify/pending   轮询待澄清问题；query: ?session_id=xxx
@@ -37,13 +41,16 @@ HTTP 服务化 + gateway 审批通知（为前端铺路，对齐 Hermes dashboar
 resolve 与 /chat 可以同时进行）。
 """
 
+import hashlib
 import json
 import hmac
 import os
+import re
 import secrets
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -120,6 +127,10 @@ def _audit_log_path() -> Path:
 
 def _audit_action(path: str, method: str = "GET") -> str:
     """把请求映射成简短动作名（审计日志用；method 用于区分同名路径的不同动作）。"""
+    if path.startswith("/v1/chat/completions"):
+        return "openai:chat"
+    if path.startswith("/v1/models"):
+        return "openai:models"
     if path.startswith("/api/auth/login"):
         return "auth:login"
     if path.startswith("/api/auth/logout"):
@@ -169,6 +180,175 @@ def _audit_action(path: str, method: str = "GET") -> str:
     if path.startswith("/web/") or path in ("/", "/index.html"):
         return "static"
     return "other"
+
+
+# ---- OpenAI 兼容接口（对齐 Hermes gateway/platforms/api_server.py）----
+
+# 请求体大小上限（对齐 Hermes：超大请求体返回 413 而不是读爆内存）
+_OPENAI_MAX_BODY_BYTES = 5 * 1024 * 1024
+# 归一化 content 的单段上限（对齐 Hermes MAX_NORMALIZED_TEXT_LENGTH = 64KB）
+_OPENAI_MAX_TEXT_LENGTH = 65_536
+# content 为 parts 数组时的条数上限（对齐 Hermes MAX_CONTENT_LIST_SIZE）
+_OPENAI_MAX_CONTENT_PARTS = 1_000
+# X-Hermes-Session-Id 长度上限（防 header 注入/超长枚举）
+_OPENAI_MAX_SESSION_HEADER_LEN = 128
+# OpenAI Chat Completions 端点路径（带/不带尾部斜杠都接受）
+_OPENAI_COMPLETIONS_PATHS = ("/v1/chat/completions", "/v1/chat/completions/")
+# 文本 part 类型别名（对齐 Hermes _TEXT_PART_TYPES：新旧 API 拼写都接受）
+_OPENAI_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
+
+
+def _openai_error(
+    message: str,
+    err_type: str = "invalid_request_error",
+    param: str | None = None,
+    code: str | None = None,
+) -> dict:
+    """构造 OpenAI 风格错误信封（对齐 Hermes _openai_error，SDK 才能正确抛异常）。"""
+    return {
+        "error": {
+            "message": str(message),
+            "type": err_type,
+            "param": param,
+            "code": code,
+        }
+    }
+
+
+def _coerce_openai_bool(value: Any, default: bool = False) -> bool:
+    """把 OpenAI 客户端的布尔字段（stream 等）归一成 bool（对齐 Hermes _coerce_request_bool）。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off", ""):
+            return False
+    return default
+
+
+def _normalize_openai_content(content: Any, *, _depth: int = 0) -> str:
+    """把 OpenAI 消息 content（字符串或 parts 数组）归一成纯文本。
+
+    对齐 Hermes _normalize_chat_content：text/input_text/output_text 拼接成文本，
+    图片等非文本 part 静默跳过（骨架管线不支持多模态）；递归深度、条数与
+    输出长度都有上限，防恶意超大消息。
+    """
+    if _depth > 10 or content is None:
+        return ""
+    if isinstance(content, str):
+        return content[:_OPENAI_MAX_TEXT_LENGTH]
+    if isinstance(content, list):
+        parts: list[str] = []
+        total = 0
+        for item in content[:_OPENAI_MAX_CONTENT_PARTS]:
+            if isinstance(item, str):
+                if item:
+                    parts.append(item[:_OPENAI_MAX_TEXT_LENGTH])
+                    total += len(parts[-1])
+            elif isinstance(item, dict):
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type in _OPENAI_TEXT_PART_TYPES:
+                    text = str(item.get("text") or "")
+                    if text:
+                        parts.append(text[:_OPENAI_MAX_TEXT_LENGTH])
+                        total += len(parts[-1])
+            elif isinstance(item, list):
+                nested = _normalize_openai_content(item, _depth=_depth + 1)
+                if nested:
+                    parts.append(nested)
+                    total += len(nested)
+            if total >= _OPENAI_MAX_TEXT_LENGTH:
+                break
+        result = "\n".join(parts)
+        return result[:_OPENAI_MAX_TEXT_LENGTH]
+    try:
+        result = str(content)
+        return result[:_OPENAI_MAX_TEXT_LENGTH]
+    except Exception:
+        return ""
+
+
+def _openai_content_has_payload(content: str) -> bool:
+    """content 是否有可见文本（用于拒绝空消息）。"""
+    return bool(content.strip())
+
+
+def _derive_chat_session_id(system_prompt: str, first_user_message: str) -> str:
+    """从 system prompt + 首条用户消息推导稳定的会话 id（对齐 Hermes _derive_chat_session_id）。
+
+    OpenAI 兼容前端（Open WebUI / LibreChat 等）每次请求都带全文历史；同一对话的
+    首条用户消息与 system prompt 跨轮不变，sha256 取前 16 位得到确定性 id，
+    让无状态客户端跨轮复用同一个骨架会话。
+    """
+    seed = f"{system_prompt or ''}\n{first_user_message or ''}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    return f"api-{digest}"
+
+
+def _estimate_openai_usage(messages: list[dict], reply: str) -> dict[str, int]:
+    """估算 OpenAI usage 字段（骨架未统计真实 token；按字符/3 粗略估算）。
+
+    字段名对齐 Hermes：prompt_tokens / completion_tokens / total_tokens。
+    """
+    prompt_text = "".join(
+        str(m.get("content", ""))
+        for m in messages
+        if isinstance(m.get("content"), str)
+    )
+    return {
+        "prompt_tokens": (len(prompt_text) + 2) // 3,
+        "completion_tokens": (len(reply or "") + 2) // 3,
+        "total_tokens": (len(prompt_text) + len(reply or "") + 2) // 3,
+    }
+
+
+def _layer_openai_system(state: dict, client_system_prompt: str) -> dict | None:
+    """把客户端 system prompt 临时叠加为第二条 system 消息（对齐 Hermes ephemeral 层）。
+
+    不走 messages[0] 改造：骨架的系统提示词已持久化，临时层只在轮次内存在，
+    调用方在轮次结束后必须 _restore_openai_system 移除，避免污染历史/落库。
+    """
+    if not client_system_prompt:
+        return None
+    inserted = {"role": "system", "content": client_system_prompt}
+    state["messages"].insert(1, inserted)
+    return inserted
+
+
+def _restore_openai_system(state: dict, inserted: dict | None) -> None:
+    """移除临时叠加的 system 消息（压缩等路径可能已把它丢掉，按对象身份移除）。"""
+    if inserted is None:
+        return
+    try:
+        state["messages"].remove(inserted)
+    except ValueError:
+        pass
+
+
+def _seed_openai_history(state: dict, session_id: str, history: list[dict]) -> None:
+    """新推导的会话若只有系统消息，把请求体自带的历史折入会话（只发生一次）。
+
+    Open WebUI 等前端新建对话时若粘贴了多轮转录，首请求就带完整历史；此后
+    各轮以会话内状态为准（state 非空即跳过），避免把历史重复落库。
+    """
+    if len(state["messages"]) > 1:
+        return
+    added = [
+        {"role": m["role"], "content": m["content"]}
+        for m in history
+        if m["role"] in ("user", "assistant") and m["content"].strip()
+    ]
+    if not added:
+        return
+    state["messages"].extend(added)
+    minimal_agent.persist_messages(
+        session_id, state["messages"], start=state["persisted_count"]
+    )
+    state["persisted_count"] = len(state["messages"])
 
 
 class AgentServer:
@@ -386,8 +566,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _begin_sse(self) -> None:
-        """开始 SSE 响应（text/event-stream 头）。"""
+    def _begin_sse(self, extra_headers: dict | None = None) -> None:
+        """开始 SSE 响应（text/event-stream 头）；extra_headers 供自定义响应头。"""
         self._last_status = 200
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -395,20 +575,33 @@ class _Handler(BaseHTTPRequestHandler):
         # SSE 结束后由服务器关闭连接（close-delimited），客户端读到 EOF 即结束
         self.send_header("Connection", "close")
         self.send_header("X-Accel-Buffering", "no")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
 
-    def _sse(self, event: str, data: Any) -> bool:
-        """写一条 SSE 帧；客户端断开返回 False（供中断信号使用），不抛错。"""
+    def _sse(self, event: str | None, data: Any) -> bool:
+        """写一条 SSE 帧；客户端断开返回 False（供中断信号使用），不抛错。
+
+        event 为 None 时只写 ``data: <json>`` 行（OpenAI chat.completion.chunk 格式）；
+        否则带 ``event: <name>`` 行（骨架自有活动事件格式）。
+        """
         try:
-            body = (
-                f"event: {event}\n"
-                f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-            ).encode("utf-8")
+            body = f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+            if event:
+                body = f"event: {event}\n".encode("utf-8") + body
             self.wfile.write(body)
             self.wfile.flush()
             return True
         except Exception:
             return False
+
+    def _sse_done(self) -> None:
+        """写 OpenAI 流结束哨兵 ``data: [DONE]``（不转 JSON 引号）。"""
+        try:
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except Exception:
+            pass
 
     def _read_body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
@@ -509,6 +702,23 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not self._authorized():
             self._send_json(401, {"error": "unauthorized"})
+            return
+        if parsed.path in ("/v1/models", "/v1/models/"):
+            # OpenAI 兼容模型列表（Open WebUI / LibreChat 等启动时探测；对齐 Hermes /v1/models）
+            self._send_json(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": minimal_agent.MODEL,
+                            "object": "model",
+                            "created": int(time.time()),
+                            "owned_by": "hermes-agent",
+                        }
+                    ],
+                },
+            )
             return
         if parsed.path == "/api/auth/me":
             session_token = dashboard_auth.read_session_token(
@@ -733,8 +943,242 @@ class _Handler(BaseHTTPRequestHandler):
         self._sse("message", {"reply": reply, "session_id": session_id})
         self._sse("done", {})
 
+    def _handle_openai_chat(self, body: dict) -> None:
+        """处理 POST /v1/chat/completions（OpenAI Chat Completions 格式，对齐 Hermes api_server）。
+
+        无 X-Hermes-Session-Id 时按 system + 首条用户消息推导稳定的 api-<digest> 会话；
+        带该请求头则显式续接指定会话（需配置 SERVER_AUTH_TOKEN，防未鉴权枚举会话历史）。
+        stream=true 走 OpenAI chunk SSE，否则返回标准 chat.completion JSON。
+        """
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            self._send_json(
+                400,
+                _openai_error("Missing or invalid 'messages' field"),
+            )
+            return
+
+        client_system_prompt = ""
+        conversation_messages: list[dict[str, str]] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "").strip()
+            content = _normalize_openai_content(msg.get("content"))
+            if role == "system":
+                if content:
+                    client_system_prompt = (
+                        f"{client_system_prompt}\n{content}"
+                        if client_system_prompt
+                        else content
+                    )
+            elif role in ("user", "assistant"):
+                conversation_messages.append({"role": role, "content": content})
+
+        # 最后一条 user 消息作为本轮输入，之前的 user/assistant 作为历史
+        last_user_idx = -1
+        for i in range(len(conversation_messages) - 1, -1, -1):
+            if conversation_messages[i]["role"] == "user":
+                last_user_idx = i
+                break
+        if last_user_idx < 0 or not _openai_content_has_payload(
+            conversation_messages[last_user_idx]["content"]
+        ):
+            self._send_json(
+                400,
+                _openai_error("No user message found in messages"),
+            )
+            return
+        user_message = conversation_messages[last_user_idx]["content"]
+        history = conversation_messages[:last_user_idx]
+
+        stream = _coerce_openai_bool(body.get("stream"), False)
+        model = (
+            str(body.get("model") or minimal_agent.MODEL).strip()
+            or minimal_agent.MODEL
+        )
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        created = int(time.time())
+
+        provided_session_id = (self.headers.get("X-Hermes-Session-Id") or "").strip()
+        if provided_session_id:
+            # 安全门（对齐 Hermes）：会话续接暴露历史，必须配置鉴权 token 才允许
+            if not _auth_token():
+                self._send_json(
+                    403,
+                    _openai_error(
+                        "Session continuation requires API key authentication. "
+                        "Configure SERVER_AUTH_TOKEN to enable this feature."
+                    ),
+                )
+                return
+            if re.search(r"[\r\n\x00]", provided_session_id) or "/" in provided_session_id:
+                self._send_json(400, _openai_error("Invalid session ID"))
+                return
+            if len(provided_session_id) > _OPENAI_MAX_SESSION_HEADER_LEN:
+                self._send_json(400, _openai_error("Session ID too long"))
+                return
+            session_id = provided_session_id
+        else:
+            first_user = next(
+                (m["content"] for m in conversation_messages if m["role"] == "user"),
+                "",
+            )
+            session_id = _derive_chat_session_id(client_system_prompt, first_user)
+        self._audit_session_id = session_id
+
+        state = self.server.app.get_session(session_id)
+        if not provided_session_id:
+            # 新推导会话且请求自带历史：折入一次，之后以会话内状态为准
+            _seed_openai_history(state, session_id, history)
+
+        if stream:
+            self._handle_openai_chat_stream(
+                session_id,
+                state,
+                user_message,
+                client_system_prompt,
+                model,
+                completion_id,
+                created,
+            )
+            return
+
+        inserted = _layer_openai_system(state, client_system_prompt)
+        try:
+            reply, _events, _todos = self.server.app.handle_message(
+                session_id, state, user_message
+            )
+        except Exception as exc:
+            self._send_json(500, _openai_error(str(exc), err_type="server_error"))
+            return
+        finally:
+            _restore_openai_system(state, inserted)
+
+        usage = _estimate_openai_usage(state["messages"], reply)
+        self._send_json(
+            200,
+            {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": reply},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": usage,
+            },
+            extra_headers={"X-Hermes-Session-Id": session_id},
+        )
+
+    def _handle_openai_chat_stream(
+        self,
+        session_id: str,
+        state: dict,
+        user_message: str,
+        client_system_prompt: str,
+        model: str,
+        completion_id: str,
+        created: int,
+    ) -> None:
+        """OpenAI 兼容 SSE 流式：role chunk → content 增量 → finish chunk → [DONE]。
+
+        工具/技能活动同步发自定义 ``hermes.tool.progress`` 事件（对齐 Hermes），
+        OpenAI 客户端会忽略未知事件类型；客户端断开置位中断信号停止本轮。
+        """
+        self._begin_sse(extra_headers={"X-Hermes-Session-Id": session_id})
+
+        def base_chunk(delta: dict, finish_reason=None) -> dict:
+            """构造 chat.completion.chunk 帧骨架。"""
+            return {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {"index": 0, "delta": delta, "finish_reason": finish_reason}
+                ],
+            }
+
+        def write_chunk(chunk: dict) -> bool:
+            """写一条 OpenAI chunk 帧（data: <json>）；断开返回 False。"""
+            return self._sse(None, chunk)
+
+        try:
+            write_chunk(base_chunk({"role": "assistant"}))
+            interrupt_event = threading.Event()
+
+            def emit_activity(ev: dict) -> None:
+                # 工具/技能进度：result 为空 = 开始，非空 = 完成（对齐 Hermes
+                # hermes.tool.progress 的 running/completed 生命周期）
+                if ev.get("type") in ("tool", "skill"):
+                    status = "running" if not ev.get("result") else "completed"
+                    self._sse(
+                        "hermes.tool.progress",
+                        {
+                            "tool": ev.get("name", ""),
+                            "toolCallId": f"call_{ev.get('id', 0)}",
+                            "status": status,
+                        },
+                    )
+                if not self._sse("activity", ev):
+                    interrupt_event.set()
+
+            def emit_token(text: str) -> None:
+                if not text:
+                    return
+                if not write_chunk(base_chunk({"content": text})):
+                    interrupt_event.set()
+
+            inserted = _layer_openai_system(state, client_system_prompt)
+            try:
+                reply = self.server.app.handle_message_stream(
+                    session_id,
+                    state,
+                    user_message,
+                    emit_event=emit_activity,
+                    emit_token=emit_token,
+                    interrupt_event=interrupt_event,
+                )
+            finally:
+                _restore_openai_system(state, inserted)
+        except Exception as exc:
+            # 流中途崩溃：发 error finish chunk 再收尾，客户端拿到明确失败而非断流
+            write_chunk(base_chunk({}, finish_reason="error"))
+            self._sse_done()
+            return
+
+        finish_chunk = base_chunk({}, finish_reason="stop")
+        finish_chunk["usage"] = _estimate_openai_usage(state["messages"], reply)
+        write_chunk(finish_chunk)
+        self._sse_done()
+
     def _handle_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path in _OPENAI_COMPLETIONS_PATHS:
+            # OpenAI 兼容端点：请求体大小前置检查（对齐 Hermes：413 而不是读爆内存）
+            raw_len = (self.headers.get("Content-Length") or "").strip()
+            try:
+                length = int(raw_len) if raw_len else 0
+            except ValueError:
+                self._send_json(
+                    400,
+                    _openai_error(
+                        "Invalid Content-Length header.",
+                        code="invalid_content_length",
+                    ),
+                )
+                return
+            if length > _OPENAI_MAX_BODY_BYTES:
+                self._send_json(
+                    413,
+                    _openai_error("Request body too large.", code="body_too_large"),
+                )
+                return
         body = self._read_body()
         if parsed.path == "/api/auth/login":
             username = str(body.get("username", ""))
@@ -764,6 +1208,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not self._authorized():
             self._send_json(401, {"error": "unauthorized"})
+            return
+        if parsed.path in _OPENAI_COMPLETIONS_PATHS:
+            self._handle_openai_chat(body)
             return
         if parsed.path == "/sessions":
             # 两步式 API 第一步：创建空会话（对齐 Hermes api_server POST /api/sessions）

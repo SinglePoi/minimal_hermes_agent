@@ -123,11 +123,12 @@
       工具调用条目默认收拢（▸），无推理内容的思考不显示；
       过程事件会**落库**（events 表，挂在本轮用户消息 id 下），切换会话重放历史时
       按轮次还原成收拢状态的活动托盘（含 duration_ms 耗时）；**中间轮的旁白也作为
-      note 事件进托盘**且不再落库为 assistant 消息——气泡与历史消息都只保留
-      最终回答，过程全在托盘（对齐 Codex 交互）
+      note 事件进托盘**且不再落库为 assistant 消息——历史消息只保留最终回答；
+      气泡最终也以最终回答为准（流式中途的中间文字会先上屏，message 事件到达后
+      覆盖），过程全在托盘（对齐 Codex 交互）
     - SSE 流式：`POST /chat/stream` 以 text/event-stream 实时推送
       activity（思考/工具/技能/来源）/ token（回复增量）/ message / error / done；
-      前端优先走流式（思考与工具事件边发生边显示、回复逐 token 上屏），
+      前端优先走流式（思考与工具事件边发生边显示、回复逐 token 上屏打字机效果），
       旧服务器或流式不可用时自动回退一次性 `/chat`
     - 侧栏会话列表：`GET /sessions` 列出历史会话（最后活跃倒序 + 预览 + 消息数），
       点击条目经 `GET /sessions/<id>/messages` 加载历史回显；侧栏有"新对话"入口
@@ -364,6 +365,23 @@
     依赖"响应末尾才知道 id"）；原 `POST /chat[/stream]` 保留为兼容旧接口
     （隐式建会话 + 聊）；前端新建对话先调 POST /sessions 拿 id 再聊；
     REPL 仍走服务端生成；审计 sessions:create / sessions:chat
+45. **OpenAI 兼容接口**（2026-08-12，对齐 Hermes `gateway/platforms/api_server.py`）：
+    `GET /v1/models` 模型列表 + `POST /v1/chat/completions`（OpenAI Chat Completions
+    格式，非流式 + `stream=true` SSE chunk 流）——Open WebUI / LibreChat / LobeChat
+    等现成前端把 Base URL 指向 `http://host:port/v1` 即可直连骨架：
+    - 会话默认按「system + 首条用户消息」sha256 推导稳定的 `api-<digest>` id，
+      无状态前端跨轮复用同一骨架会话（对齐 Hermes `_derive_chat_session_id`）；
+      新推导会话的首请求若自带历史则折入一次，之后以会话内状态为准
+    - 客户端 system 消息作为临时指令层叠加（对齐 Hermes 的 ephemeral system
+      prompt：不持久化、每请求重叠加、压缩重建后不污染）
+    - `X-Hermes-Session-Id` 请求头显式续接指定会话（需配置 `SERVER_AUTH_TOKEN`，
+      对齐 Hermes 安全门：未鉴权禁止枚举会话历史）；非法/超长 id 400
+    - content 支持字符串或 parts 数组（text/input_text/output_text 拼接、图片等
+      非文本 part 静默跳过，骨架管线不支持多模态）；请求体上限 5MB（413）、
+      OpenAI 风格错误信封（400/403/413/500）、usage 按字符数估算
+    - 响应带 `X-Hermes-Session-Id` 头；流式发标准 `chat.completion.chunk`
+      （role → content → finish → `[DONE]`），工具/技能活动同步发自定义
+      `hermes.tool.progress` 事件；均走统一鉴权 + 审计（openai:chat / openai:models）
 
 ## 你需要准备的
 
@@ -842,6 +860,23 @@ python minimal_agent.py
 并行只发生在「只读、无共享状态」的工具之间；写记忆、执行命令的工具始终按顺序
 执行，保证 side effect 边界与全串行一致（对齐 Hermes 的分段规划器）。
 
+## 体验 OpenAI 兼容接口
+
+Open WebUI / LibreChat / LobeChat 等前端在设置里把 Base URL 指向
+`http://localhost:8000/v1`、API Key 填任意值即可直连（服务端配了
+`SERVER_AUTH_TOKEN` 时填该 token）。命令行冒烟（OpenAI SDK）：
+
+```powershell
+python server.py          # 默认 127.0.0.1:8000
+
+python -c "from openai import OpenAI; c = OpenAI(base_url='http://127.0.0.1:8000/v1', api_key='x'); print(c.chat.completions.create(model='deepseek-chat', messages=[{'role': 'user', 'content': '你好'}]).choices[0].message.content)"
+```
+
+说明：骨架只认自己的工具/技能/记忆体系，请求里的 `tools` / `temperature` /
+`max_tokens` 等 OpenAI 参数暂不生效（模型与工具仍走骨架配置）；`/v1/responses`
+（OpenAI Responses API）未实现；`X-Hermes-Session-Id` 续接需要配置
+`SERVER_AUTH_TOKEN`，默认推导会话无需任何配置即可用。
+
 ## 与 Hermes 源码的对应关系
 
 | 本骨架 | Hermes 源码 |
@@ -904,13 +939,14 @@ python minimal_agent.py
 | 会话导出 `session_export.py` + `/export` | `hermes_cli/session_export_md.py` + `session_export_html.py`（骨架简化：无 SHA256 校验/分段/tool_calls） |
 | 中途问用户 `clarify.py` | `tools/clarify_tool.py`（schema/选项清洗/多选）+ `tools/clarify_gateway.py`（阻塞事件队列 + 超时） |
 | 两步式会话 API `POST /sessions` + `/sessions/<id>/chat` | `gateway/platforms/api_server.py`（POST /api/sessions 建会话 + /api/sessions/{id}/chat；客户端可传 id，默认服务端生成 `api_时间戳_uuid`） |
+| OpenAI 兼容 `GET /v1/models` + `POST /v1/chat/completions` | `gateway/platforms/api_server.py`（`_handle_chat_completions` / `_write_sse_chat_completion` / `_derive_chat_session_id` / `_openai_error` / `_normalize_chat_content`；骨架简化：单模型无 model_routes、`/v1/responses` 与 `X-Hermes-Session-Key` 未做） |
 
 骨架当前简化掉（或有意不做）的工业级细节：文件锁、注入威胁扫描、外部漂移检测、
 会话压缩后的 lineage 去重（压缩黑洞处理）、Skills 的 hub/组织同步/插件命名空间、
 文件工具的跨 profile/文件锁、多外部 memory provider 同时挂载、cron 审批
 （用户取消）、MCP/ACP（已列入待办模块，见 HANDOFF）——这些是后续深入源码时
 值得关注的点。已对齐的近期能力（LLM 自动标题/终端输出清洗/working_diff/LLM 重试/
-REPL 斜杠命令/后台终端/会话导出/clarify/两步式会话 API）见上面对应关系表。
+REPL 斜杠命令/后台终端/会话导出/clarify/两步式会话 API/OpenAI 兼容接口）见上面对应关系表。
 
 ## 加新工具
 
@@ -921,8 +957,9 @@ REPL 斜杠命令/后台终端/会话导出/clarify/两步式会话 API）见上
 - 已完成（1~49）：Agent Loop/工具/三层记忆/压缩/审批/并行/技能/文件工具/脱敏/
   服务化+前端/鉴权审计登录/会话删除标题 fork/联网/时间工具/turn budget/中断语义/
   LLM 自动标题/终端输出清洗/working_diff+网页工作区视图/LLM 重试/REPL 斜杠命令/
-  后台终端/会话导出/clarify 中途问用户/两步式会话 API（详见 README 功能列表）
-- 待办（详见 HANDOFF"待办模块"）：OpenAI 兼容接口（推荐）→ 运维日志/进程守护 →
-  MCP → 多代理/委派 → ACP → 大结果落盘/网站策略/澄清增强等小件
+  后台终端/会话导出/clarify 中途问用户/两步式会话 API/OpenAI 兼容接口
+  （详见 README 功能列表）
+- 待办（详见 HANDOFF"待办模块"）：运维日志/进程守护 → MCP → 多代理/委派 → ACP →
+  大结果落盘/网站策略/澄清增强等小件
 - 明确暂不做：cron 审批（用户取消）、文件锁/跨 profile、Skills hub 同步、
   多外部 memory provider 同时挂载

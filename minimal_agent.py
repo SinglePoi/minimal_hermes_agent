@@ -1957,10 +1957,13 @@ def run_agent_turn(
             },
         )
         if on_token is not None:
-            # 方案 B（对齐 Codex 交互）：流式也先不把 token 推给气泡——中间轮的
-            # 旁白属于"过程"，走 note 事件进活动托盘；只有最终回答才一次性交给气泡
+            # 真正的逐 token 流（2026-08-12）：call_llm_stream 收到一段 content
+            # 就 on_token 转发一段（打字机效果）；中间轮的旁白仍作为 note 事件
+            # 进活动托盘（前端 message 事件到达后以最终回答为准覆盖气泡）
             try:
-                msg, prompt_tokens = call_llm_stream(client, messages, tools)
+                msg, prompt_tokens = call_llm_stream(
+                    client, messages, tools, on_token=on_token
+                )
             except Exception as exc:
                 _handle_model_call_failure(exc, messages)
                 return
@@ -2096,9 +2099,8 @@ def run_agent_turn(
 
             continue  # 回到循环开头，把结果再发给大模型
 
-        # 模型直接给了文字回答 → 流式下一次性把内容交给气泡，写回历史并输出
-        if on_token is not None and content:
-            on_token(content)
+        # 模型直接给了文字回答 → 流式下 content 已在 call_llm_stream 里逐段
+        # 转发给客户端（打字机效果），这里只写回历史并输出
         messages.append({"role": "assistant", "content": content})
         console.print()
         console.print(Panel(content, title="🤖 助手", border_style="green"))

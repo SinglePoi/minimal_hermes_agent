@@ -73,7 +73,7 @@ tests/test_skills_compression.py 技能压缩联动回归测试（零依赖，py
 tests/test_approval_deny.py   用户 deny 规则回归测试（零依赖，python tests/test_approval_deny.py 直接跑）
 tests/test_tirith.py          内容级扫描回归测试（零依赖，python tests/test_tirith.py 直接跑）
 tests/test_gateway_approval.py 网关审批队列回归测试（零依赖，python tests/test_gateway_approval.py 直接跑）
-tests/test_server.py          HTTP 服务化回归测试（零依赖，python tests/test_server.py 直接跑）
+tests/test_server.py          HTTP 服务化回归测试（含 OpenAI 兼容组；零依赖，直接跑）
 tests/test_title_generator.py  LLM 标题回归测试（零依赖，直接跑）
 tests/test_terminal_output.py  终端输出清洗回归测试（零依赖，直接跑）
 tests/test_working_diff.py     working_diff 回归测试（零依赖，直接跑）
@@ -84,7 +84,8 @@ tests/test_session_export.py   会话导出回归测试（零依赖，直接跑�
 tests/test_clarify.py          clarify 回归测试（零依赖，直接跑）
 server.py                    HTTP 服务化：/chat + /chat/stream(SSE) + /approvals/* +
                              /sessions（两步式：POST /sessions 建会话 + /sessions/<id>/chat）+
-                             /clarify/* + /skills /plugins /tools + 静态托管 web/（零新依赖）
+                             /clarify/* + /skills /plugins /tools + OpenAI 兼容
+                             （GET /v1/models + POST /v1/chat/completions）+ 静态托管 web/（零新依赖）
 dashboard_auth.py            用户名密码登录 + 无状态 session cookie（scrypt 哈希 + HMAC 签名，
                              对齐 Hermes plugins/dashboard_auth/basic；附 hash-password CLI）
 web/                         前端静态站点（原生 HTML/CSS/JS，零构建）：index.html + login.html + app.js + style.css
@@ -234,8 +235,11 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
       还原收拢态活动托盘；load_session_messages 补充 id 字段
     - 旁白进托盘（方案 B，2026-08-10，对齐 Codex 交互）：中间轮（带 tool_calls）
       的 assistant 旁白改为 **note 事件**（"过程说明"）进活动托盘并落库，
-      不再通过 on_token 流进消息气泡；只有最终回答（不带 tool_calls）才一次性
-      交给气泡——气泡只留最终回答，过程（思考/旁白/工具）全在可收拢的托盘里
+      不再落库成 assistant 消息；气泡最终只留最终回答，过程（思考/旁白/工具）
+      全在可收拢的托盘里
+      （2026-08-12 调整：SSE content 改为逐段实时转发——打字机效果；
+      中间轮旁白文字会先上屏，最终 message 事件以最终回答为准覆盖气泡；
+      旁白 note 事件与"不落库"行为不变）
     - Codex 式托盘样式（2026-08-10）：过程中显示"已耗时 X.Xs"计时（500ms 刷新）、
       过程条目直接展开（纯文本、无图标/无卡片、左侧细竖线分隔），最终回答出来后
       自动收拢成一行"已处理 · 耗时 Xs"（无计数），点击展开/收起；**每个工具调用
@@ -613,6 +617,33 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
       新端点，`session` SSE 事件保留作兜底；REPL 仍走服务端生成
     - 测试：test_server.py 新增端点组（创建/幂等/客户端传 id/非法 id 400/
       两步式非流式与流式/审计/静态断言 createSession），全套 28 套通过
+50. **OpenAI 兼容接口**（2026-08-12，对齐 Hermes `gateway/platforms/api_server.py`）：
+    - server.py：`GET /v1/models`（OpenAI 风格模型列表，Open WebUI / LibreChat
+      前端发现用）+ `POST /v1/chat/completions`（非流式标准 chat.completion +
+      `stream=true` 的 SSE chunk：role → content 逐段转发（打字机效果，
+      2026-08-12 起 call_llm_stream 的 on_token 真正接线）→ finish → `[DONE]`）
+    - 会话推导对齐 Hermes `_derive_chat_session_id`：无请求头时按
+      「system + 首条用户消息」sha256 取前 16 位 → `api-<digest>`，无状态前端
+      跨轮复用同一骨架会话；新推导会话的首请求若自带历史（粘贴的转录）折入一次，
+      之后以会话内状态为准（不重复落库）
+    - `X-Hermes-Session-Id` 显式续接：需配置 `SERVER_AUTH_TOKEN`（对齐 Hermes
+      安全门：未鉴权禁止枚举会话历史）；非法（含斜杠/控制字符）与超长 id 400
+    - 客户端 system 消息作为临时指令层：以第二条 system 消息叠进本轮
+      （对齐 Hermes ephemeral system prompt：不持久化、每请求重叠加、压缩重建
+      不污染持久化提示词，轮次结束按对象身份移除）
+    - content 归一化对齐 Hermes `_normalize_chat_content`：字符串或 parts 数组
+      （text/input_text/output_text 拼接、图片等非文本 part 静默跳过、递归/条数/
+      长度上限）；请求体 5MB 上限（413）、非法 Content-Length 400、OpenAI 风格
+      错误信封 `_openai_error`（400/403/413/500）、usage 按字符数估算
+    - 流式同步发自定义 `hermes.tool.progress` 事件（running/completed，对齐
+      Hermes）；响应带 `X-Hermes-Session-Id` 头；统一鉴权 + 审计
+      （openai:chat / openai:models）
+    - 简化（对齐 README 惯例）：单模型无 model_routes、`/v1/responses` 与
+      `X-Hermes-Session-Key` 未做、请求里 tools/temperature 等参数不生效
+    - 测试：test_server.py 新增 OpenAI 兼容组（models/非流式+parts 归一化/错误
+      信封/会话推导与历史折入/SSE chunk+工具进度/header 安全门 403+400/413/
+      鉴权 401/审计 openai:*），44 条断言全过；OpenAI SDK 端到端冒烟
+      （非流式/流式/models）通过；全套 28 套回归通过
 
 ## 运行方式
 
@@ -636,11 +667,10 @@ python demo_file_tools.py
 - 常用开关：`MEMORY_PROVIDER=vector`（语义召回）、`CONTEXT_WINDOW`、`PROTECT_LAST_N`
 - Windows 控制台 UTF-8 已内置兜底（见 39）；终端仍乱码可 `chcp 65001`
 - 本机测试可用内置 Python：`C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`
-- 提交策略：由用户手动提交；当前 HEAD `7033fbc`（clarify 中途提问 + 两步式会话 API，
-  2026-08-11），前序 `95f9477`（会话导出）、`d33e460`（后台终端）、`25ae297`
-  （REPL 斜杠 + 失败兜底）、`eed0e4a`（LLM 重试）、`b713b69`（LLM 标题/终端清洗/
-  working_diff 视图）
-- ✅ 工作树干净（用户已提交全部近期成果）；新会话先看 `git status` 确认
+- 提交策略：由用户手动提交；当前 HEAD `083f5cd`（2026-08-12，HANDOFF/README 汇总
+  40~49 + 待办 Roadmap），前序 `7033fbc`（clarify 中途提问 + 两步式会话 API）
+- ⚠️ 工作树含未提交改动：第 50 项 OpenAI 兼容接口（server.py / tests/test_server.py /
+  README.md / HANDOFF.md）；提交前先跑 `python tests/test_server.py` 与全套回归
 - `.env` 当前激活：`DASHBOARD_USERNAME=admin` + `DASHBOARD_PASSWORD_HASH`（用户自配登录）、
   `MAX_AGENT_TURNS=5` / `TURN_TOKEN_BUDGET=0`、`AUDIT_LOG_PATH=audit.log`、
   `TITLE_GENERATION_ENABLED=true`、`LLM_MAX_RETRIES=3`、
@@ -774,6 +804,13 @@ python demo_file_tools.py
   `tests/test_clarify.py`（22 条：选项清洗/REPL 交互/网关队列/分发）；
   `tests/test_server.py` 累计覆盖两步式会话 API、clarify 端点、会话导出端点、
   工作区改动端点、鉴权审计、SSE session 事件等
+- 回归测试脚本 `tests/test_server.py` 新增 OpenAI 兼容组（2026-08-12）：/v1/models
+  模型列表、/v1/chat/completions 非流式标准响应（chatcmpl-/choices/usage/
+  finish_reason）+ content parts 数组归一化、OpenAI 错误信封（缺 messages/
+  无用户消息/非法 JSON）、会话推导稳定性与首请求历史折入、SSE chunk
+  （role/content/finish/[DONE]/hermes.tool.progress）、X-Hermes-Session-Id
+  安全门（未配 token 403/非法与超长 id 400/配 token 放行）、请求体 5MB 上限 413、
+  /v1 统一鉴权 401、审计 openai:chat / openai:models 与 403/413/401 记录
 
 ## 已知限制 / 下一步候选
 
@@ -807,13 +844,9 @@ python demo_file_tools.py
 
 ## 待办模块（Roadmap，未排期）
 
-按"推荐顺序"排列（2026-08-11 汇总，均未排期）：
+按"推荐顺序"排列（2026-08-12 汇总；OpenAI 兼容接口已于 2026-08-12 完成，
+其余均未排期）：
 
-- **OpenAI 兼容接口（推荐下一个）**：`POST /v1/chat/completions`（+ /chat/stream
-  兼容），让 Open WebUI / LibreChat 等现成前端直接连骨架。Hermes 参照：
-  api_server 的 OpenAI 兼容通道 + `_derive_chat_session_id`（system prompt +
-  首条用户消息哈希推导稳定会话 id）；骨架接入点：新端点复用
-  process_turn / handle_message_stream，会话路由走两步式（49）
 - **运维：服务化日志 + 进程守护**：结构化日志 + Windows 部署（服务 /
   Task Scheduler / 手动），**需先定部署方式再动**。Hermes 参照：systemd /
   gateway daemon
@@ -849,9 +882,10 @@ cron 审批（用户取消）
   working_diff 工具（42）、网页工作区改动视图（43）、LLM 重试（44）、REPL 斜杠命令（45）、
   后台/常驻终端（46）、会话导出（47）、clarify 中途问用户（48）、两步式会话 API（49）
 - 审批线已完成（cron 审批按用户要求取消，见上）
+- OpenAI 兼容接口已完成（50）：/v1/models + /v1/chat/completions（非流式 + SSE）
 - 文件工具剩余：文件锁、跨 profile 检查（单代理低价值，暂不做）
 - Skills 剩余：技能 hub 同步（明确暂不做）
-- 下一步待办见上方"待办模块"：OpenAI 兼容接口 → 运维 → MCP → 多代理 → ACP → 小件
+- 下一步待办见上方"待办模块"：运维 → MCP → 多代理 → ACP → 小件
 - 中断接线：REPL Ctrl+C 已完成（36）；一次性 /chat 无法感知断连（保持现状）
 
 ## 给新会话的起始指令（可直接粘贴）
@@ -859,12 +893,15 @@ cron 审批（用户取消）
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里（2026-08-11）：1~49 全部完成——最近一批（40~49）是
+> 我们上次停在这里（2026-08-12）：1~50 全部完成——最近一批（40~49）是
 > LLM 自动标题、终端输出清洗、working_diff 工具、网页工作区改动视图、
 > LLM 重试健壮性、REPL 斜杠命令、后台/常驻终端、会话导出、clarify 中途问用户、
 > 两步式会话 API（POST /sessions 先建后聊，/chat 保留为兼容旧接口）；
-> 全套 28 套回归通过；HEAD `7033fbc`（用户已提交，工作树干净）。
-> 下一步候选（详见"待办模块"）：**OpenAI 兼容接口（推荐）** → 运维日志/进程守护
+> 第 50 项是 **OpenAI 兼容接口**（GET /v1/models + POST /v1/chat/completions，
+> 非流式 + SSE，会话按 system+首条用户消息推导 api-<digest>，X-Hermes-Session-Id
+> 续接需 SERVER_AUTH_TOKEN）；
+> 全套 28 套回归通过 + OpenAI SDK 端到端冒烟通过。
+> 下一步候选（详见"待办模块"）：**运维日志/进程守护**（需先定部署方式）
 > → MCP → 多代理/委派 → ACP → 大结果落盘/网站策略/澄清增强等小件。
 > cron 审批已取消；文件锁/跨 profile、Skills hub、多外部 memory provider 明确暂不做。
 
