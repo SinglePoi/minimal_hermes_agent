@@ -73,7 +73,8 @@ tests/test_skills_compression.py 技能压缩联动回归测试（零依赖，py
 tests/test_approval_deny.py   用户 deny 规则回归测试（零依赖，python tests/test_approval_deny.py 直接跑）
 tests/test_tirith.py          内容级扫描回归测试（零依赖，python tests/test_tirith.py 直接跑）
 tests/test_gateway_approval.py 网关审批队列回归测试（零依赖，python tests/test_gateway_approval.py 直接跑）
-tests/test_server.py          HTTP 服务化回归测试（含 OpenAI 兼容组；零依赖，直接跑）
+tests/test_server.py          HTTP 服务化回归测试（含 OpenAI 兼容组与日志事件组；零依赖，直接跑）
+tests/test_server_logging.py  服务化日志回归测试（零依赖，python tests/test_server_logging.py 直接跑）
 tests/test_title_generator.py  LLM 标题回归测试（零依赖，直接跑）
 tests/test_terminal_output.py  终端输出清洗回归测试（零依赖，直接跑）
 tests/test_working_diff.py     working_diff 回归测试（零依赖，直接跑）
@@ -86,6 +87,10 @@ server.py                    HTTP 服务化：/chat + /chat/stream(SSE) + /appro
                              /sessions（两步式：POST /sessions 建会话 + /sessions/<id>/chat）+
                              /clarify/* + /skills /plugins /tools + OpenAI 兼容
                              （GET /v1/models + POST /v1/chat/completions）+ 静态托管 web/（零新依赖）
+server_logging.py            服务化日志：JSON Lines 结构化 + 大小轮转 + 脱敏 + 会话关联
+                             （对齐 hermes_logging.py 简化版；SERVER_LOG_PATH/MAX_MB/BACKUP_COUNT）
+server_ctl.ps1               服务控制脚本：start/stop/status/restart（后台启动 + PID +
+                             探活 + 进程树停止；UTF-8 带 BOM，PowerShell 5.1 必需）
 dashboard_auth.py            用户名密码登录 + 无状态 session cookie（scrypt 哈希 + HMAC 签名，
                              对齐 Hermes plugins/dashboard_auth/basic；附 hash-password CLI）
 web/                         前端静态站点（原生 HTML/CSS/JS，零构建）：index.html + login.html + app.js + style.css
@@ -635,8 +640,13 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
       （text/input_text/output_text 拼接、图片等非文本 part 静默跳过、递归/条数/
       长度上限）；请求体 5MB 上限（413）、非法 Content-Length 400、OpenAI 风格
       错误信封 `_openai_error`（400/403/413/500）、usage 按字符数估算
-    - 流式同步发自定义 `hermes.tool.progress` 事件（running/completed，对齐
-      Hermes）；响应带 `X-Hermes-Session-Id` 头；统一鉴权 + 审计
+    - 流式工具调用发标准 `delta.tool_calls` 帧（2026-08-12 增强：工具"开始"
+      事件触发时用事件里已脱敏的参数单帧发出 name+arguments，Open WebUI 等
+      客户端可直接显示"调用了什么工具、参数是什么"；Hermes 只发自定义
+      hermes.tool.progress，此为骨架有意超出 Hermes 的增强，对齐 OpenAI
+      标准 wire 格式）；工具/技能活动同步发自定义 `hermes.tool.progress`
+      事件（running/completed，对齐 Hermes）；响应带 `X-Hermes-Session-Id`
+      头；统一鉴权 + 审计
       （openai:chat / openai:models）
     - 简化（对齐 README 惯例）：单模型无 model_routes、`/v1/responses` 与
       `X-Hermes-Session-Key` 未做、请求里 tools/temperature 等参数不生效
@@ -644,6 +654,36 @@ MEMORY.md / USER.md         模型写入的核心记忆（§ 分隔，有占用�
       信封/会话推导与历史折入/SSE chunk+工具进度/header 安全门 403+400/413/
       鉴权 401/审计 openai:*），44 条断言全过；OpenAI SDK 端到端冒烟
       （非流式/流式/models）通过；全套 28 套回归通过
+51. **服务化日志 + 手动启动（运维线）**（2026-08-12，对齐 Hermes
+    `hermes_logging.py` 简化版；部署方式用户已定：手动启动）：
+    - `server_logging.py`：集中式 `setup_logging()`（幂等，force=True 重配）——
+      JSON Lines 结构化日志 + RotatingFileHandler 大小轮转（默认 5MB / 3 份）
+      + 脱敏格式器（所有字符串字段落盘前过 `redact_sensitive_text(force=True)`，
+      对齐 Hermes RedactingFormatter）+ 会话关联（`set_session_context` /
+      `clear_session_context`，thread-local，对齐 Hermes 同名函数）；Windows
+      单进程场景用标准库轮转（Hermes 多进程换 concurrent-log-handler，骨架
+      单进程不需要）
+    - 事件：`server.start` / `server.stop`（host/port/pid）、`turn.end`
+      （session_id / duration_ms / reply_chars / tools）、`chat.error` /
+      `chat_stream.error` / `openai_chat.error` / `openai_chat_stream.error`
+      （异常路径带 session_id，脱敏后落盘）
+    - 环境变量三同步：`SERVER_LOG_PATH`（默认 logs/server.log，相对项目根）、
+      `SERVER_LOG_MAX_MB`（默认 5，下限 1）、`SERVER_LOG_BACKUP_COUNT`
+      （默认 3）；.env / .env.example / README 环境变量表已同步
+    - `server_ctl.ps1 start|stop|status|restart`（Windows 手动启动）：
+      后台启动（隐藏窗口 + stdout/stderr 重定向到 logs/server.out.log /
+      server.err.log + PID 写 server.pid）、启动前检查重复实例与端口占用
+      （netstat 解析，比 Get-NetTCPConnection 稳）、启动后探活确认（进程退出
+      则打印 err 日志尾部）、stop 按进程树 taskkill /T（pid 文件误删时按端口
+      兜底，确认进程退出后才清理 pid 文件）、status 显示 PID/启动时间/地址；
+      已实测 start/status/restart/stop 全流程（health 200 + 端口干净释放）
+    - 坑与规避：Windows PowerShell 5.1 必须 UTF-8 带 BOM 才能解析中文注释
+      （无 BOM 按 GBK 解码会语法错乱）；环境同时存在 Path/PATH 时 Start-Process
+      抛 "Item has already been added"（脚本开头去重）；`$PID` 是 PowerShell
+      只读自动变量不能当变量名
+    - 测试：`tests/test_server_logging.py` 新增（20 条断言：JSON 格式/轮转/
+      脱敏/会话上下文/幂等与 force/环境变量）；test_server.py 新增日志事件组
+      （/chat 后 turn.end 带 session_id/耗时/回复长度）；全套 29 套回归通过
 
 ## 运行方式
 
@@ -808,9 +848,15 @@ python demo_file_tools.py
   模型列表、/v1/chat/completions 非流式标准响应（chatcmpl-/choices/usage/
   finish_reason）+ content parts 数组归一化、OpenAI 错误信封（缺 messages/
   无用户消息/非法 JSON）、会话推导稳定性与首请求历史折入、SSE chunk
-  （role/content/finish/[DONE]/hermes.tool.progress）、X-Hermes-Session-Id
+  （role/content 逐段/finish/[DONE]/标准 delta.tool_calls 帧 + 参数脱敏/
+  hermes.tool.progress）、X-Hermes-Session-Id
   安全门（未配 token 403/非法与超长 id 400/配 token 放行）、请求体 5MB 上限 413、
   /v1 统一鉴权 401、审计 openai:chat / openai:models 与 403/413/401 记录
+- 回归测试脚本 `tests/test_server_logging.py`（新增，2026-08-12）：JSON Lines
+  格式（字段齐全/自定义字段）、大小轮转（.1 备份）、脱敏（sk- 不打明文）、
+  会话上下文（set/clear）、setup 幂等与 force 重配、环境变量配置（路径/阈值/
+  备份数），20 条断言；test_server.py 新增日志事件组（/chat 后 turn.end 带
+  session_id/耗时/回复长度）
 
 ## 已知限制 / 下一步候选
 
@@ -844,12 +890,12 @@ python demo_file_tools.py
 
 ## 待办模块（Roadmap，未排期）
 
-按"推荐顺序"排列（2026-08-12 汇总；OpenAI 兼容接口已于 2026-08-12 完成，
-其余均未排期）：
+按"推荐顺序"排列（2026-08-12 汇总；OpenAI 兼容接口与运维线"手动启动 + 日志
+轮转"已于 2026-08-12 完成，其余均未排期）：
 
-- **运维：服务化日志 + 进程守护**：结构化日志 + Windows 部署（服务 /
-  Task Scheduler / 手动），**需先定部署方式再动**。Hermes 参照：systemd /
-  gateway daemon
+- **运维：Windows 服务化 / Task Scheduler（可选，未排期）**：手动启动 +
+  结构化日志 + 轮转已完成（见 51）；如需开机自启/崩溃自动拉起再排
+  Task Scheduler 或注册 Windows 服务。Hermes 参照：systemd / gateway daemon
 - **MCP（Model Context Protocol）**：连外部工具/数据源。Hermes 参照：
   `hermes_cli/mcp_config.py` + `mcp_picker.py` + `optional-mcps/` +
   `tools/mcp_tool.py` + `mcp_serve.py`；骨架接入点：TOOLS 动态注册 + run_tool
@@ -883,9 +929,11 @@ cron 审批（用户取消）
   后台/常驻终端（46）、会话导出（47）、clarify 中途问用户（48）、两步式会话 API（49）
 - 审批线已完成（cron 审批按用户要求取消，见上）
 - OpenAI 兼容接口已完成（50）：/v1/models + /v1/chat/completions（非流式 + SSE）
+- 运维线"手动启动 + 结构化日志 + 轮转"已完成（51）；Task Scheduler /
+  Windows 服务未做（需长期驻留时再排）
 - 文件工具剩余：文件锁、跨 profile 检查（单代理低价值，暂不做）
 - Skills 剩余：技能 hub 同步（明确暂不做）
-- 下一步待办见上方"待办模块"：运维 → MCP → 多代理 → ACP → 小件
+- 下一步待办见上方"待办模块"：MCP → 多代理 → ACP → 小件（运维剩余可选）
 - 中断接线：REPL Ctrl+C 已完成（36）；一次性 /chat 无法感知断连（保持现状）
 
 ## 给新会话的起始指令（可直接粘贴）
@@ -893,16 +941,20 @@ cron 审批（用户取消）
 > 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
 > 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
 > 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里（2026-08-12）：1~50 全部完成——最近一批（40~49）是
+> 我们上次停在这里（2026-08-12）：1~51 全部完成——最近一批（40~49）是
 > LLM 自动标题、终端输出清洗、working_diff 工具、网页工作区改动视图、
 > LLM 重试健壮性、REPL 斜杠命令、后台/常驻终端、会话导出、clarify 中途问用户、
 > 两步式会话 API（POST /sessions 先建后聊，/chat 保留为兼容旧接口）；
 > 第 50 项是 **OpenAI 兼容接口**（GET /v1/models + POST /v1/chat/completions，
 > 非流式 + SSE，会话按 system+首条用户消息推导 api-<digest>，X-Hermes-Session-Id
-> 续接需 SERVER_AUTH_TOKEN）；
-> 全套 28 套回归通过 + OpenAI SDK 端到端冒烟通过。
-> 下一步候选（详见"待办模块"）：**运维日志/进程守护**（需先定部署方式）
-> → MCP → 多代理/委派 → ACP → 大结果落盘/网站策略/澄清增强等小件。
+> 续接需 SERVER_AUTH_TOKEN），流式含标准 delta.tool_calls 帧（工具调用对
+> Open WebUI 可见、参数脱敏）；
+> 第 51 项是 **运维线：服务化日志 + 手动启动**（server_logging.py JSON Lines +
+> 轮转 + 脱敏 + 会话关联；server_ctl.ps1 start/stop/status/restart，部署方式
+> 用户已定为手动启动；Task Scheduler / Windows 服务未做）。
+> 全套 29 套回归通过 + OpenAI SDK 端到端冒烟通过 + server_ctl 全流程实测。
+> 下一步候选（详见"待办模块"）：**MCP** → 多代理/委派 → ACP → 大结果落盘/
+> 网站策略/澄清增强等小件（运维剩余 Task Scheduler / Windows 服务可选）。
 > cron 审批已取消；文件锁/跨 profile、Skills hub、多外部 memory provider 明确暂不做。
 
 ## 发版检查记录（2026-08-10，release-check 技能）

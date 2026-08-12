@@ -5,5 +5,7 @@ USER.md
 sessions.db
 approval_allowlist.json
 audit.log
+logs/
+server.pid
 providers/keyword/memory.json
 providers/vector/vectors.json

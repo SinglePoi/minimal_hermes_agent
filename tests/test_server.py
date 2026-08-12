@@ -39,6 +39,7 @@ for stream in (sys.stdout, sys.stderr):
 
 import minimal_agent  # noqa: E402
 import clarify  # noqa: E402
+import server_logging  # noqa: E402
 from approval import check_dangerous_command, register_gateway_notify  # noqa: E402
 from server import AgentServer, _Server  # noqa: E402
 
@@ -176,6 +177,9 @@ class ServerFixture:
                 "DASHBOARD_SESSION_TTL_SECONDS",
                 "DASHBOARD_COOKIE_SECURE",
                 "TITLE_GENERATION_ENABLED",
+                "SERVER_LOG_PATH",
+                "SERVER_LOG_MAX_MB",
+                "SERVER_LOG_BACKUP_COUNT",
             )
         }
         os.environ.pop("SERVER_AUTH_TOKEN", None)
@@ -194,6 +198,9 @@ class ServerFixture:
         self.tmp = tempfile.TemporaryDirectory()
         # 审计默认落到临时目录，避免测试污染项目根目录的 audit.log
         os.environ["AUDIT_LOG_PATH"] = str(Path(self.tmp.name) / "audit.log")
+        # 服务化日志同样落到临时目录，并重配 logger（force 清掉上一个 fixture 的 handler）
+        os.environ["SERVER_LOG_PATH"] = str(Path(self.tmp.name) / "server.log")
+        server_logging.setup_logging(force=True)
         minimal_agent.SESSION_DB = Path(self.tmp.name) / "sessions.db"
         self.app = AgentServer(client=client or FakeClient())
         self.server = _Server(("127.0.0.1", 0), self.app)
@@ -209,6 +216,7 @@ class ServerFixture:
         self.server.shutdown()
         self.server.server_close()
         self.app.shutdown()
+        server_logging.shutdown_logging()
         self.tmp.cleanup()
         minimal_agent.SESSION_DB = Path(ROOT) / "sessions.db"
         for key, value in self._env_backup.items():
@@ -1639,6 +1647,9 @@ def test_openai_chat_stream() -> None:
             '"delta": {"content": "完"}' in body
             and '"delta": {"content": "成了"}' in body,
         )
+        check("流式含标准 tool_calls 帧", '"delta": {"tool_calls": [' in body)
+        check("工具调用帧带工具名", '"name": "get_current_time"' in body)
+        check("工具调用帧带参数", '"arguments": "{}"' in body)
         check("流式含 finish_reason stop", '"finish_reason": "stop"' in body)
         check("流式含 usage", '"usage"' in body)
         check("流式含 [DONE]", "data: [DONE]" in body)
@@ -1649,6 +1660,63 @@ def test_openai_chat_stream() -> None:
             and '"status": "completed"' in body,
         )
         check("流式会话头为 api-", session_header.startswith("api-"))
+    finally:
+        fx.close()
+
+
+def test_openai_stream_tool_call_redacted() -> None:
+    """OpenAI 流式：标准 tool_calls 帧里的参数已脱敏（sk- 密钥不打明文）。"""
+    tool_call_chunk = StreamChunk(
+        StreamDelta(
+            tool_calls=[
+                SimpleNamespace(
+                    index=0,
+                    id="call_sec",
+                    type="function",
+                    function=SimpleNamespace(name="terminal", arguments=""),
+                )
+            ]
+        )
+    )
+    args_chunk = StreamChunk(
+        StreamDelta(
+            tool_calls=[
+                SimpleNamespace(
+                    index=0,
+                    id=None,
+                    type=None,
+                    function=SimpleNamespace(
+                        name=None,
+                        arguments='{"command":"echo sk-abc1234567890"}',
+                    ),
+                )
+            ]
+        )
+    )
+    batches = [
+        [tool_call_chunk, args_chunk],
+        [StreamChunk(StreamDelta(content="完成"))],
+    ]
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=StreamCompletions(batches))
+    )
+    fx = ServerFixture(client=client)
+    try:
+        payload = json.dumps(
+            {"stream": True, "messages": [{"role": "user", "content": "执行"}]},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{fx.base}/v1/chat/completions", data=payload, method="POST"
+        )
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        check("工具调用帧含 terminal", '"name": "terminal"' in body)
+        check("工具调用帧含参数键", '"arguments"' in body)
+        # arguments 是字符串值，序列化后引号转义为 \"，所以查裸 *** 即可
+        check("工具调用帧参数已脱敏", "***" in body)
+        check("工具调用帧不含明文密钥", "sk-abc1234567890" not in body)
     finally:
         fx.close()
 
@@ -1744,6 +1812,40 @@ def test_openai_session_header_and_limits() -> None:
         fx.close()
 
 
+def test_server_log_events() -> None:
+    """服务化日志：/chat 轮次结束写一条 turn.end（session_id/耗时/回复长度）。"""
+    fx = ServerFixture()
+    try:
+        reply = http_json(
+            "POST", f"{fx.base}/chat",
+            {"message": "你好", "session_id": "sess-log"},
+        )
+        check("日志轮次正常完成", reply.get("reply") == "你好，我是助手")
+        log_file = Path(fx.tmp.name) / "server.log"
+        entries = [
+            json.loads(line)
+            for line in log_file.read_text(encoding="utf-8").strip().splitlines()
+            if line.strip()
+        ]
+        turns = [e for e in entries if e.get("event") == "turn.end"]
+        check("日志含 turn.end", len(turns) >= 1)
+        check(
+            "turn.end 带会话 id",
+            any(e.get("session_id") == "sess-log" for e in turns),
+        )
+        check(
+            "turn.end 带耗时与回复长度",
+            any(
+                isinstance(e.get("duration_ms"), int)
+                and isinstance(e.get("reply_chars"), int)
+                and e.get("reply_chars", 0) >= 0
+                for e in turns
+            ),
+        )
+    finally:
+        fx.close()
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== HTTP 服务化回归测试 ==")
@@ -1771,7 +1873,9 @@ def main() -> None:
         test_openai_chat_completions,
         test_openai_chat_derived_session_and_seed,
         test_openai_chat_stream,
+        test_openai_stream_tool_call_redacted,
         test_openai_session_header_and_limits,
+        test_server_log_events,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

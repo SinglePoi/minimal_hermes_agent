@@ -31,6 +31,13 @@ HTTP 服务化 + gateway 审批通知（为前端铺路，对齐 Hermes dashboar
     GET  /working_diff           工作区 git 改动（stat + diff + untracked；mode/paths 查询参数）
     GET  /sessions/<id>/export   导出会话（?format=md|html，默认 md，附件下载）
 
+服务化日志（运维线：手动启动模式，对齐 Hermes hermes_logging.py 简化版）：
+    - server_logging.py：JSON Lines 结构化日志 + 大小轮转 + 脱敏 + 会话关联；
+      服务生命周期与轮次事件写 logs/server.log（SERVER_LOG_PATH / MAX_MB /
+      BACKUP_COUNT 可配，见 README 环境变量表）
+    - server_ctl.ps1 start|stop|status|restart：后台启动（隐藏窗口 + 输出重定向
+      + server.pid）、按进程树停止、探活；与手动前台运行 python server.py 等价
+
 审批流程（对齐 Hermes 的网关队列）：
     - /chat 请求里的 agent 线程在危险命令处通过 approval.py 的网关队列阻塞等待
       （register_gateway_notify + _await_gateway_decision + resolve_gateway_approval）
@@ -44,6 +51,7 @@ resolve 与 /chat 可以同时进行）。
 import hashlib
 import json
 import hmac
+import logging
 import os
 import re
 import secrets
@@ -71,6 +79,8 @@ import working_diff  # noqa: E402
 import process_registry  # noqa: E402
 import session_export  # noqa: E402
 import clarify  # noqa: E402
+import server_logging  # noqa: E402
+from server_logging import log_event  # noqa: E402
 from approval import (  # noqa: E402
     list_pending_approvals,
     register_gateway_notify,
@@ -78,6 +88,8 @@ from approval import (  # noqa: E402
     unregister_gateway_notify,
 )
 from memory_manager import SyncWorker, list_provider_plugins  # noqa: E402
+
+logger = server_logging.get_logger()
 
 # 前端静态资源目录（对齐 Hermes web/ 的命名；本骨架用原生 HTML/CSS/JS，
 # 零构建、零新依赖，由 server.py 直接托管，与 API 同源避免跨域）
@@ -412,37 +424,58 @@ class AgentServer:
     def handle_message(self, session_id: str, state: dict, message: str) -> tuple[str, list, list]:
         """处理一条消息，返回 (最终回答, 过程事件, 当前任务清单)。"""
         events: list[dict[str, Any]] = []
-        with state["lock"]:
-            turn_count, turns_since_memory, persisted_count = minimal_agent.process_turn(
-                self.client,
-                state["messages"],
-                self.tools,
-                self.manager,
-                session_id,
-                message,
-                state["turn_count"],
-                state["turns_since_memory"],
-                self.review_worker,
-                state["persisted_count"],
-                events,
-            )
-            state["turn_count"] = turn_count
-            state["turns_since_memory"] = turns_since_memory
-            state["persisted_count"] = persisted_count
-            last = state["messages"][-1] if state["messages"] else {}
-            reply = last.get("content", "") if last.get("role") == "assistant" else ""
-            if reply:
-                thread = title_generator.maybe_auto_title(
+        turn_started = time.monotonic()
+        server_logging.set_session_context(session_id)
+        try:
+            with state["lock"]:
+                turn_count, turns_since_memory, persisted_count = minimal_agent.process_turn(
+                    self.client,
+                    state["messages"],
+                    self.tools,
+                    self.manager,
                     session_id,
                     message,
-                    reply,
-                    client=self.client,
-                    conversation_history=state["messages"],
+                    state["turn_count"],
+                    state["turns_since_memory"],
+                    self.review_worker,
+                    state["persisted_count"],
+                    events,
                 )
-                if thread is not None:
-                    self._title_threads.append(thread)
-            todos = minimal_agent.get_todo_store(session_id).read()
-            return reply, events, todos
+                state["turn_count"] = turn_count
+                state["turns_since_memory"] = turns_since_memory
+                state["persisted_count"] = persisted_count
+                last = state["messages"][-1] if state["messages"] else {}
+                reply = last.get("content", "") if last.get("role") == "assistant" else ""
+                if reply:
+                    thread = title_generator.maybe_auto_title(
+                        session_id,
+                        message,
+                        reply,
+                        client=self.client,
+                        conversation_history=state["messages"],
+                    )
+                    if thread is not None:
+                        self._title_threads.append(thread)
+                todos = minimal_agent.get_todo_store(session_id).read()
+        finally:
+            server_logging.clear_session_context()
+        self._log_turn_end(session_id, events, reply, turn_started)
+        return reply, events, todos
+
+    def _log_turn_end(self, session_id: str, events: list, reply: str, turn_started: float) -> None:
+        """轮次结束后写一条结构化日志（turn.end：耗时/回复长度/用到的工具）。"""
+        log_event(
+            logger,
+            "turn.end",
+            session_id=session_id,
+            duration_ms=int((time.monotonic() - turn_started) * 1000),
+            reply_chars=len(reply),
+            tools=[
+                ev.get("name", "")
+                for ev in events
+                if ev.get("type") in ("tool", "skill")
+            ],
+        )
 
     def shutdown(self) -> None:
         """排空后台任务、注销所有网关回调。"""
@@ -484,39 +517,45 @@ class AgentServer:
         interrupt_event 供调用方在客户端断开时置位，中断本轮工具执行（对齐 Hermes interrupt）。
         """
         events: list[dict[str, Any]] = []
-        with state["lock"]:
-            turn_count, turns_since_memory, persisted_count = minimal_agent.process_turn(
-                self.client,
-                state["messages"],
-                self.tools,
-                self.manager,
-                session_id,
-                message,
-                state["turn_count"],
-                state["turns_since_memory"],
-                self.review_worker,
-                state["persisted_count"],
-                events,
-                sink=emit_event,
-                on_token=emit_token,
-                interrupt_event=interrupt_event,
-            )
-            state["turn_count"] = turn_count
-            state["turns_since_memory"] = turns_since_memory
-            state["persisted_count"] = persisted_count
-            last = state["messages"][-1] if state["messages"] else {}
-            reply = last.get("content", "") if last.get("role") == "assistant" else ""
-            if reply:
-                thread = title_generator.maybe_auto_title(
+        turn_started = time.monotonic()
+        server_logging.set_session_context(session_id)
+        try:
+            with state["lock"]:
+                turn_count, turns_since_memory, persisted_count = minimal_agent.process_turn(
+                    self.client,
+                    state["messages"],
+                    self.tools,
+                    self.manager,
                     session_id,
                     message,
-                    reply,
-                    client=self.client,
-                    conversation_history=state["messages"],
+                    state["turn_count"],
+                    state["turns_since_memory"],
+                    self.review_worker,
+                    state["persisted_count"],
+                    events,
+                    sink=emit_event,
+                    on_token=emit_token,
+                    interrupt_event=interrupt_event,
                 )
-                if thread is not None:
-                    self._title_threads.append(thread)
-            return reply
+                state["turn_count"] = turn_count
+                state["turns_since_memory"] = turns_since_memory
+                state["persisted_count"] = persisted_count
+                last = state["messages"][-1] if state["messages"] else {}
+                reply = last.get("content", "") if last.get("role") == "assistant" else ""
+                if reply:
+                    thread = title_generator.maybe_auto_title(
+                        session_id,
+                        message,
+                        reply,
+                        client=self.client,
+                        conversation_history=state["messages"],
+                    )
+                    if thread is not None:
+                        self._title_threads.append(thread)
+        finally:
+            server_logging.clear_session_context()
+        self._log_turn_end(session_id, events, reply, turn_started)
+        return reply
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -895,6 +934,13 @@ class _Handler(BaseHTTPRequestHandler):
                 session_id, state, message
             )
         except Exception as exc:
+            log_event(
+                logger,
+                "chat.error",
+                level=logging.ERROR,
+                session_id=session_id,
+                error=str(exc),
+            )
             self._send_json(500, {"error": str(exc)})
             return
         self._send_json(
@@ -938,6 +984,13 @@ class _Handler(BaseHTTPRequestHandler):
                 interrupt_event=interrupt_event,
             )
         except Exception as exc:
+            log_event(
+                logger,
+                "chat_stream.error",
+                level=logging.ERROR,
+                session_id=session_id,
+                error=str(exc),
+            )
             self._sse("error", {"error": str(exc)})
             reply = ""
         self._sse("message", {"reply": reply, "session_id": session_id})
@@ -1050,6 +1103,13 @@ class _Handler(BaseHTTPRequestHandler):
                 session_id, state, user_message
             )
         except Exception as exc:
+            log_event(
+                logger,
+                "openai_chat.error",
+                level=logging.ERROR,
+                session_id=session_id,
+                error=str(exc),
+            )
             self._send_json(500, _openai_error(str(exc), err_type="server_error"))
             return
         finally:
@@ -1111,8 +1171,10 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             write_chunk(base_chunk({"role": "assistant"}))
             interrupt_event = threading.Event()
+            tool_call_seq = 0  # 标准 OpenAI delta.tool_calls 的 index 序号
 
             def emit_activity(ev: dict) -> None:
+                nonlocal tool_call_seq
                 # 工具/技能进度：result 为空 = 开始，非空 = 完成（对齐 Hermes
                 # hermes.tool.progress 的 running/completed 生命周期）
                 if ev.get("type") in ("tool", "skill"):
@@ -1125,6 +1187,30 @@ class _Handler(BaseHTTPRequestHandler):
                             "status": status,
                         },
                     )
+                    # 标准 OpenAI delta.tool_calls 帧：让 Open WebUI 等客户端能
+                    # 显示"调用了什么工具、参数是什么"（Hermes 只发自定义进度
+                    # 事件，此为骨架的有意增强；参数用事件里已脱敏的版本，
+                    # 单帧携带完整参数，无需客户端跨帧拼接）
+                    if not ev.get("result"):
+                        if not write_chunk(
+                            base_chunk(
+                                {
+                                    "tool_calls": [
+                                        {
+                                            "index": tool_call_seq,
+                                            "id": f"call_{ev.get('id', 0)}",
+                                            "type": "function",
+                                            "function": {
+                                                "name": ev.get("name", ""),
+                                                "arguments": ev.get("args", ""),
+                                            },
+                                        }
+                                    ]
+                                }
+                            )
+                        ):
+                            interrupt_event.set()
+                        tool_call_seq += 1
                 if not self._sse("activity", ev):
                     interrupt_event.set()
 
@@ -1148,6 +1234,13 @@ class _Handler(BaseHTTPRequestHandler):
                 _restore_openai_system(state, inserted)
         except Exception as exc:
             # 流中途崩溃：发 error finish chunk 再收尾，客户端拿到明确失败而非断流
+            log_event(
+                logger,
+                "openai_chat_stream.error",
+                level=logging.ERROR,
+                session_id=session_id,
+                error=str(exc),
+            )
             write_chunk(base_chunk({}, finish_reason="error"))
             self._sse_done()
             return
@@ -1450,7 +1543,9 @@ def run_server(
     client=None,
     memory_manager=None,
 ) -> None:
-    """启动服务（Ctrl+C 停止）。"""
+    """启动服务（Ctrl+C 停止）；先初始化结构化日志，再起 HTTP 服务。"""
+    server_logging.setup_logging()
+    log_event(logger, "server.start", host=host, port=port, pid=os.getpid())
     app = AgentServer(client=client, memory_manager=memory_manager)
     server = _Server((host, port), app)
     try:
@@ -1461,6 +1556,8 @@ def run_server(
     finally:
         app.shutdown()
         server.server_close()
+        log_event(logger, "server.stop", host=host, port=port)
+        server_logging.shutdown_logging()
         print("服务已停止")
 
 
