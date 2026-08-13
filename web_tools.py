@@ -20,6 +20,8 @@ import re
 import urllib.parse
 import urllib.request
 
+import website_policy
+
 _BING_URL = "https://cn.bing.com/search"
 _DDG_URL = "https://html.duckduckgo.com/html/"
 _TIMEOUT_SECONDS = 8
@@ -145,6 +147,14 @@ def _format_results(query: str, results: list[tuple[str, str, str]], limit: int)
     return "\n".join(lines)
 
 
+def _filter_allowed_results(results: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    """按网站策略过滤搜索结果，去掉命中禁访名单的链接。"""
+    return [
+        item for item in results
+        if website_policy.check_website_access(item[1]) is None
+    ]
+
+
 def web_search(query: str, limit: int = 5) -> str:
     """联网搜索：必应 RSS 优先、DuckDuckGo 兜底，返回标题/链接/摘要。
 
@@ -166,7 +176,9 @@ def web_search(query: str, limit: int = 5) -> str:
             errors.append(f"{source} {exc}")
             continue
         if results:
-            return _format_results(query, results, limit)
+            allowed = _filter_allowed_results(results)
+            if allowed:
+                return _format_results(query, allowed, limit)
     if errors:
         return "搜索失败：" + "；".join(errors)
     return f"关键词：{query}\n未找到相关结果"
@@ -190,6 +202,12 @@ def web_fetch(url: str, max_chars: int = 4000) -> str:
     url = (url or "").strip()
     if not _is_allowed_url(url):
         return f"拒绝访问：仅允许 http/https 公网地址（{url}）"
+    blocked = website_policy.check_website_access(url)
+    if blocked:
+        return (
+            f"拒绝访问：网站策略禁止访问 {blocked['host']}"
+            f"（命中规则 {blocked['rule']}）"
+        )
     try:
         max_chars = max(200, min(int(max_chars), 20000))
     except (TypeError, ValueError):

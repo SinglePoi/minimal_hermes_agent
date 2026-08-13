@@ -447,6 +447,14 @@
       `TOOL_RESULT_TURN_BUDGET_CHARS`（默认 200000）、
       `TOOL_RESULT_PREVIEW_CHARS`（默认 1500）、
       `TOOL_RESULT_STORAGE_DIR`（默认系统临时目录）
+49. **网站访问策略 website_policy**（2026-08-13，对齐 Hermes
+    `tools/website_policy.py` 简化版）：
+    - `website_policy.py`：环境变量驱动的禁访域名名单——`WEBSITE_POLICY_ENABLED`
+      （默认 false）、`WEBSITE_POLICY_DENY`（`;` 分隔，支持 `*.domain.com` 通配）
+    - 域名归一化（小写 / 去末尾点 / 去 www. 前缀）与匹配语义对齐 Hermes
+      （精确、子域、通配）；策略关闭或解析异常时 fail-open
+    - 接入 `web_tools.py`：`web_fetch` 在发起请求前拒绝命中域名，
+      `web_search` 过滤结果中的命中链接
 
 ## 你需要准备的
 
@@ -606,6 +614,8 @@ python server.py                 # 默认 127.0.0.1:8000
 | `TOOL_RESULT_TURN_BUDGET_CHARS` | 单轮工具结果总预算（字符数），超限后从最大结果开始落盘 | `200000` |
 | `TOOL_RESULT_PREVIEW_CHARS` | 落盘后保留在上下文里的预览字符数 | `1500` |
 | `TOOL_RESULT_STORAGE_DIR` | 落盘目录（相对项目根目录或绝对路径；留空 = 系统临时目录） | 系统临时目录 |
+| `WEBSITE_POLICY_ENABLED` | 网站访问策略开关（开启后 web_search/web_fetch 拒绝命中名单的域名） | `false` |
+| `WEBSITE_POLICY_DENY` | 禁访域名名单（`;` 分隔，支持 `*.domain.com` 通配；空 = 不额外拦截） | 空 |
 
 > 鉴权与审计：`SERVER_AUTH_TOKEN` 是生产密钥，只从环境变量注入；前端 401 时会弹出
 > token 输入框并自动重试，token 只存浏览器 localStorage。审计日志与 Hermes 的
@@ -1088,6 +1098,7 @@ python server.py
 | 手动启动 `server_ctl.ps1` | Hermes systemd / gateway daemon（Windows 手动模式：后台启动 + PID + 探活 + 进程树停止；Task Scheduler / Windows 服务未做，留待长期驻留需要） |
 | MCP 客户端 `mcp_client.py` | `tools/mcp_tool.py` + `hermes_cli/mcp_config.py`（stdio JSON-RPC 2.0：initialize/tools/list/tools/call、`mcp__` 前缀命名、安全环境过滤、`${VAR}` 插值、supports_parallel_tool_calls；骨架简化：仅 stdio、无自动重连/sampling/HTTP-SSE） |
 | 工具结果落盘 `tool_result_storage.py` | `tools/tool_result_storage.py`（maybe_persist_tool_result / enforce_turn_budget；骨架简化：直接 Path.write_text 写本地目录，无 sandbox env.execute） |
+| 网站策略 `website_policy.py` | `tools/website_policy.py`（check_website_access / 域名归一化 + fnmatch；骨架简化：环境变量名单，无 config.yaml / shared_files） |
 
 骨架当前简化掉（或有意不做）的工业级细节：文件锁、注入威胁扫描、外部漂移检测、
 会话压缩后的 lineage 去重（压缩黑洞处理）、Skills 的 hub/组织同步/插件命名空间、
@@ -1106,9 +1117,9 @@ REPL 斜杠命令/后台终端/会话导出/clarify/两步式会话 API/OpenAI �
   服务化+前端/鉴权审计登录/会话删除标题 fork/联网/时间工具/turn budget/中断语义/
   LLM 自动标题/终端输出清洗/working_diff+网页工作区视图/LLM 重试/REPL 斜杠命令/
   后台终端/会话导出/clarify 中途问用户/两步式会话 API/OpenAI 兼容接口/
-  服务化日志+手动启动/MCP 客户端/工具结果落盘
+  服务化日志+手动启动/MCP 客户端/工具结果落盘/网站策略
   （详见 README 功能列表）
-- 待办（详见 HANDOFF"待办模块"）：多代理/委派 → ACP → 网站策略/
-  澄清增强等小件（运维剩余 Task Scheduler / Windows 服务可选）
+- 待办（详见 HANDOFF"待办模块"）：多代理/委派 → ACP → 澄清增强等小件
+  （运维剩余 Task Scheduler / Windows 服务可选）
 - 明确暂不做：cron 审批（用户取消）、文件锁/跨 profile、Skills hub 同步、
   多外部 memory provider 同时挂载
