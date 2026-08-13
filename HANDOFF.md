@@ -946,7 +946,7 @@ python demo_file_tools.py
 ## 待办模块（Roadmap，未排期）
 
 按"推荐顺序"排列（2026-08-12 汇总；OpenAI 兼容接口、运维线"手动启动 + 日志
-轮转"、MCP 客户端已于 2026-08-12 完成，其余均未排期）：
+轮转"、MCP 客户端已于 2026-08-12 完成，工具结果落盘已于 2026-08-13 完成，其余均未排期）：
 
 - **运维：Windows 服务化 / Task Scheduler（可选，未排期）**：手动启动 +
   结构化日志 + 轮转已完成（见 51）；如需开机自启/崩溃自动拉起再排
@@ -959,8 +959,6 @@ python demo_file_tools.py
 - **ACP（Agent Client Protocol）**：被 VS Code / Zed / JetBrains 等编辑器
   客户端调用。Hermes 参照：`acp_adapter/` + `hermes acp` 子命令；
   骨架接入点：独立 adapter 模块 + CLI 子命令
-- **大结果落盘 tool_result_storage**：超大工具输出写盘 + 截断 + 引用，
-  防撑爆上下文（Hermes：`tools/tool_result_storage.py` / `hook_output_spill.py`）
 - **网站策略 website_policy**：web_fetch/web_search 遵守用户可配域名块名单
   （Hermes：`tools/website_policy.py`）
 - **澄清增强**：补 Hermes 细节——提问发送失败返回哨兵让模型自选默认值、
@@ -987,9 +985,13 @@ cron 审批（用户取消）
   Windows 服务未做（需长期驻留时再排）
 - MCP 客户端已完成（52）：stdio JSON-RPC，工具注册 + run_tool 分发 + 并行
   白名单 + 退出清理；HTTP/SSE 传输、sampling 未做
+- 工具结果落盘已完成（53）：`tool_result_storage.py` 单结果落盘 + 单轮聚合
+  预算，已接入 tool_dispatch；read_file 固定不落盘；环境变量三同步
+  （`TOOL_RESULT_STORAGE_*`）；hook_output_spill 未做（骨架无 shell hook）
 - 文件工具剩余：文件锁、跨 profile 检查（单代理低价值，暂不做）
 - Skills 剩余：技能 hub 同步（明确暂不做）
-- 下一步待办见上方"待办模块"：多代理/委派 → ACP → 小件（运维/MCP 增强可选）
+- 下一步待办见上方"待办模块"：多代理/委派 → ACP → 网站策略/澄清增强等小件
+  （运维 Task Scheduler / MCP 增强可选）
 - 中断接线：REPL Ctrl+C 已完成（36）；一次性 /chat 无法感知断连（保持现状）
 
 ## 给新会话的起始指令（可直接粘贴）
@@ -1011,9 +1013,12 @@ cron 审批（用户取消）
 > 第 52 项是 **MCP 客户端**（mcp_client.py：stdio JSON-RPC，工具注册进 TOOLS、
 > mcp__ 前缀命名、安全环境过滤 + ${VAR} 插值 + 截断脱敏 + 超时兜底；配置
 > mcp_servers.json，HTTP/SSE 传输与 sampling 未做）。
+> 第 53 项是 **工具结果落盘**（tool_result_storage.py：单结果超阈值写盘 + 预览，
+> 单轮总预算超限从最大结果开始溢写；read_file 固定不落盘；已接入
+> tool_dispatch 回填与聚合预算；hook_output_spill 未做）。
 > 全套 30 套回归通过 + OpenAI SDK 端到端冒烟通过 + server_ctl 全流程实测。
-> 下一步候选（详见"待办模块"）：**多代理/委派** → ACP → 大结果落盘/网站策略/
-> 澄清增强等小件（运维 Task Scheduler / MCP 增强可选）。
+> 下一步候选（详见"待办模块"）：**多代理/委派** → ACP → 网站策略/澄清增强
+> 等小件（运维 Task Scheduler / MCP 增强可选）。
 > cron 审批已取消；文件锁/跨 profile、Skills hub、多外部 memory provider 明确暂不做。
 
 ## 发版检查记录（2026-08-10，release-check 技能）

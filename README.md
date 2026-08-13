@@ -432,6 +432,21 @@
     - 未做（Hermes 有）：HTTP / StreamableHTTP / SSE 传输、自动重连、sampling
     - 注意：中文 Windows 下自研 Python MCP 服务器需自己
       `reconfigure(encoding="utf-8")`（MCP 规范要求 UTF-8；测试假服务器已示范）
+48. **工具结果落盘（大结果防撑爆上下文）**（2026-08-13，对齐 Hermes
+    `tools/tool_result_storage.py` 简化版）：
+    - `tool_result_storage.py`：补齐三层防线中的第二、三层——单工具结果超过
+      阈值（默认 100000 字符）时把完整内容写到结果目录，上下文只保留
+      `<persisted-output>` 预览 + 文件路径，模型需要时用 `read_file` 分段读回；
+      单轮所有工具结果合计超过预算（默认 200000 字符）时，从最大的未落盘
+      结果开始逐个溢写到磁盘
+    - 写盘失败自动回退内联截断，不抛异常；`read_file` 固定不落盘（避免
+      「读回→再落盘」死循环）；已接入 tool_dispatch 的单结果回填与单轮聚合
+      预算两个环节
+    - 环境变量三同步：`TOOL_RESULT_STORAGE_ENABLED`（默认 true）、
+      `TOOL_RESULT_MAX_CHARS`（默认 100000）、
+      `TOOL_RESULT_TURN_BUDGET_CHARS`（默认 200000）、
+      `TOOL_RESULT_PREVIEW_CHARS`（默认 1500）、
+      `TOOL_RESULT_STORAGE_DIR`（默认系统临时目录）
 
 ## 你需要准备的
 
@@ -586,6 +601,11 @@ python server.py                 # 默认 127.0.0.1:8000
 | `SERVER_LOG_MAX_MB` | 单个日志文件轮转阈值（MB） | `5` |
 | `SERVER_LOG_BACKUP_COUNT` | 保留的轮转备份份数 | `3` |
 | `MCP_SERVERS_PATH` | MCP 服务器配置路径（JSON；留空 = 禁用 MCP） | `mcp_servers.json` |
+| `TOOL_RESULT_STORAGE_ENABLED` | 工具结果落盘开关（`0`/`off` = 关闭） | `true` |
+| `TOOL_RESULT_MAX_CHARS` | 单工具结果落盘阈值（字符数） | `100000` |
+| `TOOL_RESULT_TURN_BUDGET_CHARS` | 单轮工具结果总预算（字符数），超限后从最大结果开始落盘 | `200000` |
+| `TOOL_RESULT_PREVIEW_CHARS` | 落盘后保留在上下文里的预览字符数 | `1500` |
+| `TOOL_RESULT_STORAGE_DIR` | 落盘目录（相对项目根目录或绝对路径；留空 = 系统临时目录） | 系统临时目录 |
 
 > 鉴权与审计：`SERVER_AUTH_TOKEN` 是生产密钥，只从环境变量注入；前端 401 时会弹出
 > token 输入框并自动重试，token 只存浏览器 localStorage。审计日志与 Hermes 的
@@ -1067,6 +1087,7 @@ python server.py
 | 服务化日志 `server_logging.py` | `hermes_logging.py`（setup_logging / RotatingFileHandler / RedactingFormatter / set_session_context；骨架简化：JSON Lines 单文件、单进程用标准库轮转） |
 | 手动启动 `server_ctl.ps1` | Hermes systemd / gateway daemon（Windows 手动模式：后台启动 + PID + 探活 + 进程树停止；Task Scheduler / Windows 服务未做，留待长期驻留需要） |
 | MCP 客户端 `mcp_client.py` | `tools/mcp_tool.py` + `hermes_cli/mcp_config.py`（stdio JSON-RPC 2.0：initialize/tools/list/tools/call、`mcp__` 前缀命名、安全环境过滤、`${VAR}` 插值、supports_parallel_tool_calls；骨架简化：仅 stdio、无自动重连/sampling/HTTP-SSE） |
+| 工具结果落盘 `tool_result_storage.py` | `tools/tool_result_storage.py`（maybe_persist_tool_result / enforce_turn_budget；骨架简化：直接 Path.write_text 写本地目录，无 sandbox env.execute） |
 
 骨架当前简化掉（或有意不做）的工业级细节：文件锁、注入威胁扫描、外部漂移检测、
 会话压缩后的 lineage 去重（压缩黑洞处理）、Skills 的 hub/组织同步/插件命名空间、
@@ -1085,9 +1106,9 @@ REPL 斜杠命令/后台终端/会话导出/clarify/两步式会话 API/OpenAI �
   服务化+前端/鉴权审计登录/会话删除标题 fork/联网/时间工具/turn budget/中断语义/
   LLM 自动标题/终端输出清洗/working_diff+网页工作区视图/LLM 重试/REPL 斜杠命令/
   后台终端/会话导出/clarify 中途问用户/两步式会话 API/OpenAI 兼容接口/
-  服务化日志+手动启动/MCP 客户端
+  服务化日志+手动启动/MCP 客户端/工具结果落盘
   （详见 README 功能列表）
-- 待办（详见 HANDOFF"待办模块"）：多代理/委派 → ACP → 大结果落盘/网站策略/
+- 待办（详见 HANDOFF"待办模块"）：多代理/委派 → ACP → 网站策略/
   澄清增强等小件（运维剩余 Task Scheduler / Windows 服务可选）
 - 明确暂不做：cron 审批（用户取消）、文件锁/跨 profile、Skills hub 同步、
   多外部 memory provider 同时挂载

@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import mcp_client  # noqa: E402
+import tool_result_storage  # noqa: E402
 
 # 对齐 Hermes run_agent._MAX_TOOL_WORKERS
 MAX_TOOL_WORKERS = 8
@@ -284,11 +285,19 @@ def _safe_run(tc: Any, run_one: Callable[[Any], str]) -> str:
 
 
 def _append_tool_result(tc: Any, messages: list[dict], content: str) -> None:
-    """按原始顺序把工具结果回填进消息历史（对齐 Hermes 的逐条回填）。"""
+    """按原始顺序把工具结果回填进消息历史（对齐 Hermes 的逐条回填）。
+
+    回填前先执行第二层单结果落盘：超阈值的结果写盘并把上下文内容替换为
+    <persisted-output> 预览块，避免大输出直接撑爆上下文窗口。
+    """
     messages.append({
         "role": "tool",
         "tool_call_id": tool_call_id(tc),
-        "content": content,
+        "content": tool_result_storage.maybe_persist_tool_result(
+            content,
+            tool_name=tool_name(tc),
+            tool_use_id=tool_call_id(tc),
+        ),
     })
 
 
@@ -363,9 +372,16 @@ def execute_tool_calls_segmented(
     interrupt_event 置位时：未执行的调用跳过并回填 cancelled 结果，进行中的并行段
     取消 pending future（对齐 Hermes 的 pre-flight 检查 + 等待轮询 + 3s 优雅退出）。
     """
+    start = len(messages)
+
+    def _enforce_budget() -> None:
+        """回填结束后对本次新增的 tool 消息执行单轮聚合预算（第三层）。"""
+        tool_result_storage.enforce_turn_budget(messages[start:])
+
     if interrupt_event is not None and interrupt_event.is_set():
         for tc in tool_calls:
             _append_tool_result(tc, messages, _cancelled_result())
+        _enforce_budget()
         return
     for kind, calls in _plan_tool_batch_segments(tool_calls):
         if interrupt_event is not None and interrupt_event.is_set():
@@ -382,3 +398,4 @@ def execute_tool_calls_segmented(
                     _append_tool_result(tc, messages, _cancelled_result())
                     continue
                 _append_tool_result(tc, messages, _safe_run(tc, run_one))
+    _enforce_budget()
