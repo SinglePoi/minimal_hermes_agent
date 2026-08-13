@@ -75,6 +75,9 @@ const inputEl = $("input");
 const sendBtn = $("btn-send");
 const viewTitle = $("view-title");
 const conversationPane = $("conversation-pane");
+const contextPanel = $("context-panel");
+const sourcesById = {};
+const outputsById = {};
 
 /* 工作区视图注册表：已归档 / 插件（MCP+记忆插件+技能+工具合并）/ 工作区改动 */
 const VIEWS = {
@@ -93,11 +96,17 @@ const VIEWS = {
     label: "工作区改动",
     load: refreshWorkingDiff,
   },
+  delegation: {
+    viewId: "delegation-view",
+    label: "委派任务",
+    load: renderDelegationList,
+  },
 };
 const NAV_BUTTONS = {
   archived: "btn-archived",
   plugins: "btn-plugins",
   wdiff: "btn-working-diff",
+  delegation: "btn-delegation",
 };
 
 /* ---------- 工具函数 ---------- */
@@ -187,6 +196,7 @@ function showThread() {
   conversationPane.classList.remove("hidden");
   conversationPane.classList.add("grow");
   conversationPane.classList.remove("fill");
+  contextPanel.classList.remove("hidden");
   hideAllViews();
   viewTitle.textContent = state.sessionTitle || "会话";
   state.hasMessages = true;
@@ -199,6 +209,7 @@ function showHome() {
   conversationPane.classList.remove("hidden");
   conversationPane.classList.remove("grow");
   conversationPane.classList.add("fill");
+  contextPanel.classList.add("hidden");
   hideAllViews();
   viewTitle.textContent = "新对话";
   state.hasMessages = false;
@@ -462,6 +473,8 @@ function renderReplayTray(events) {
   });
   events.forEach((ev) => {
     if (ev.type === "todo") return;  // todo 事件走常驻清单卡片，不进托盘
+    if (ev.type === "delegate") return;  // 委派任务走专用任务板
+    if (ev.type === "tool" && ev.name === "delegate_task") return;  // 顶层委派不重复展示
     const built = buildActivityItem(ev);
     if (built) body.appendChild(built.item);
   });
@@ -485,33 +498,232 @@ function setThinking(on) {
   }
 }
 
-const todoPanel = $("todo-panel");
-const TODO_MARKS = { pending: "[ ]", in_progress: "[>]", completed: "[x]", cancelled: "[~]" };
+const delegationById = {};
+const TODO_ICONS = { pending: "○", in_progress: "◐", completed: "✓", cancelled: "✕" };
 
 function renderTodoPanel(todos) {
-  todoPanel.textContent = "";
+  const box = $("task-list");
+  if (!box) return;
+  box.textContent = "";
   if (!todos || !todos.length) {
-    todoPanel.classList.add("hidden");
+    const empty = document.createElement("div");
+    empty.className = "context-empty";
+    empty.textContent = "暂无任务";
+    box.appendChild(empty);
     return;
   }
-  const head = document.createElement("div");
-  head.className = "todo-panel-head";
-  head.textContent = "📋 任务清单";
-  const body = document.createElement("div");
-  body.className = "todo-panel-body";
   todos.forEach((t) => {
     const row = document.createElement("div");
     row.className = "todo-item";
     const mark = document.createElement("span");
-    mark.className = "todo-mark";
-    mark.textContent = TODO_MARKS[t.status] || "[?]";
+    mark.className = "todo-mark " + (t.status || "pending");
+    mark.textContent = TODO_ICONS[t.status] || "○";
     const label = document.createElement("span");
     label.textContent = t.content;
     row.append(mark, label);
-    body.appendChild(row);
+    box.appendChild(row);
   });
-  todoPanel.append(head, body);
-  todoPanel.classList.remove("hidden");
+}
+
+function renderDelegationList() {
+  const box = $("delegation-list");
+  if (!box) return;
+  box.textContent = "";
+  const entries = Object.values(delegationById);
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "session-empty";
+    empty.textContent = "暂无委派任务";
+    box.appendChild(empty);
+    return;
+  }
+  entries.forEach((d) => {
+    const item = document.createElement("div");
+    item.className = "delegation-item";
+    const left = document.createElement("div");
+    left.className = "delegation-left";
+    const icon = document.createElement("span");
+    icon.className = "delegation-icon";
+    if (d.status === "running") {
+      icon.classList.add("spinning");
+      icon.textContent = "◌";
+    } else if (d.status === "completed") {
+      icon.textContent = "✓";
+    } else {
+      icon.textContent = "✕";
+    }
+    const title = document.createElement("span");
+    title.className = "delegation-item-title";
+    const goal = d.goal || "委派任务";
+    title.textContent = goal.length > 24 ? goal.slice(0, 24) + "…" : goal;
+    left.append(icon, title);
+    const model = document.createElement("span");
+    model.className = "delegation-model";
+    model.textContent = d.model || d.agent || "子代理";
+    item.append(left, model);
+    box.appendChild(item);
+  });
+}
+
+function handleDelegationEvent(ev) {
+  let payload = {};
+  try {
+    payload = JSON.parse(ev.result || "{}");
+  } catch (e) {
+    payload = {};
+  }
+  const id = ev.delegation_id || "unknown";
+  const current = delegationById[id] || {};
+  delegationById[id] = {
+    goal: ev.name || current.goal || "",
+    agent: payload.agent || current.agent || "子代理",
+    model: payload.model || current.model || "",
+    status: payload.status || current.status || "running",
+    duration_ms: payload.duration_ms || current.duration_ms || 0,
+    result: payload.result || current.result || "",
+  };
+  renderDelegationList();
+}
+
+function parseEventArgs(args) {
+  if (!args) return {};
+  if (typeof args === "object") return args;
+  try {
+    return JSON.parse(args);
+  } catch (e) {
+    return {};
+  }
+}
+
+function renderSources() {
+  const box = $("source-list");
+  if (!box) return;
+  box.textContent = "";
+  const entries = Object.values(sourcesById);
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "context-empty";
+    empty.textContent = "暂无来源";
+    box.appendChild(empty);
+    return;
+  }
+  entries.forEach((s) => {
+    const item = document.createElement("div");
+    item.className = "context-item";
+    const title = document.createElement("div");
+    title.textContent = s.label || s.url || s.name || "来源";
+    item.appendChild(title);
+    if (s.meta) {
+      const meta = document.createElement("div");
+      meta.className = "context-item-muted";
+      meta.textContent = s.meta;
+      item.appendChild(meta);
+    }
+    box.appendChild(item);
+  });
+}
+
+function addSource(entry) {
+  const key = entry.key || entry.url || entry.name;
+  if (!key) return;
+  sourcesById[key] = entry;
+  renderSources();
+}
+
+function renderOutputs() {
+  const box = $("output-list");
+  if (!box) return;
+  box.textContent = "";
+  const entries = Object.values(outputsById);
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "context-empty";
+    empty.textContent = "暂无输出";
+    box.appendChild(empty);
+    return;
+  }
+  entries.forEach((o) => {
+    const item = document.createElement("div");
+    item.className = "context-item";
+    const title = document.createElement("div");
+    title.textContent = o.path || "输出文件";
+    item.appendChild(title);
+    if (o.action) {
+      const meta = document.createElement("div");
+      meta.className = "context-item-muted";
+      meta.textContent = o.action;
+      item.appendChild(meta);
+    }
+    box.appendChild(item);
+  });
+}
+
+function addOutput(entry) {
+  const key = entry.path || entry.key;
+  if (!key) return;
+  outputsById[key] = entry;
+  renderOutputs();
+}
+
+function renderEnvironment(data) {
+  const box = $("env-info");
+  if (!box) return;
+  box.textContent = "";
+  if (!data || data.success === false) {
+    const empty = document.createElement("div");
+    empty.className = "context-empty";
+    empty.textContent = "环境信息加载失败";
+    box.appendChild(empty);
+    return;
+  }
+  const summary = data.summary || {};
+  const row = document.createElement("div");
+  row.className = "context-item context-row";
+  const label = document.createElement("span");
+  label.className = "context-label";
+  label.textContent = "变更";
+  const delta = document.createElement("span");
+  delta.className = "context-delta";
+  const add = document.createElement("span");
+  add.className = "context-add";
+  add.textContent = "+" + (summary.additions || 0);
+  const del = document.createElement("span");
+  del.className = "context-del";
+  del.textContent = "-" + (summary.deletions || 0);
+  delta.append(add, del);
+  row.append(label, delta);
+  box.appendChild(row);
+}
+
+async function refreshContextPanel() {
+  try {
+    const data = await httpJson("GET", API.workingDiff + "?mode=working");
+    renderEnvironment(data);
+  } catch (e) {
+    renderEnvironment({ success: false });
+  }
+}
+
+function collectContextEvent(ev) {
+  if (ev.type === "source") {
+    addSource({
+      key: "src-" + (ev.id !== undefined ? ev.id : (ev.name || "") + (ev.args || "")),
+      name: ev.name,
+      label: ev.name || "来源",
+      meta: (ev.result || "").slice(0, 120),
+    });
+    return;
+  }
+  if (ev.type === "tool") {
+    const args = parseEventArgs(ev.args);
+    if (ev.name === "web_fetch" && args.url) {
+      addSource({ key: "web-" + args.url, url: args.url, label: args.url, meta: "网页抓取" });
+    } else if (ev.name === "web_search" && args.query) {
+      addSource({ key: "search-" + args.query, name: args.query, label: "搜索：" + args.query, meta: "网页搜索" });
+    } else if ((ev.name === "write_file" || ev.name === "patch") && args.path) {
+      addOutput({ path: args.path, action: ev.name });
+    }
+  }
 }
 
 function handleActivityEvent(ev, tray) {
@@ -525,6 +737,16 @@ function handleActivityEvent(ev, tray) {
     }
     return;
   }
+  // 委派任务走专用任务板；顶层 delegate_task 的工具活动不再进托盘（避免重复）
+  if (ev.type === "delegate") {
+    handleDelegationEvent(ev);
+    return;
+  }
+  if (ev.type === "tool" && ev.name === "delegate_task") {
+    return;
+  }
+  collectContextEvent(ev);
+  if (ev.type === "source") return;  // 来源只在右侧面板汇总，不进活动托盘
   renderActivity(ev, tray);
 }
 
@@ -939,6 +1161,7 @@ function showView(name) {
   conversationPane.classList.add("hidden");
   conversationPane.classList.remove("grow");
   conversationPane.classList.remove("fill");
+  contextPanel.classList.add("hidden");
   hideAllViews();
   $(v.viewId).classList.remove("hidden");
   $(NAV_BUTTONS[name]).classList.add("active");
@@ -1351,6 +1574,12 @@ async function switchSession(id, title) {
   saveSession(id);
   chatEl.querySelectorAll(".msg-row, .msg.thinking, .activity, .activity-tray").forEach((el) => el.remove());
   Object.keys(activityById).forEach((k) => delete activityById[k]);
+  Object.keys(delegationById).forEach((k) => delete delegationById[k]);
+  Object.keys(sourcesById).forEach((k) => delete sourcesById[k]);
+  Object.keys(outputsById).forEach((k) => delete outputsById[k]);
+  renderDelegationList();
+  renderSources();
+  renderOutputs();
   currentTray = null;
 
   try {
@@ -1383,6 +1612,12 @@ async function switchSession(id, title) {
           renderReplayTray(eventsByMsg[m.id]);
         }
       });
+      // 历史委派任务还原到任务板（按 delegation_id 合并 started/completed 事件）
+      (data.events || []).forEach((ev) => {
+        if (ev.type === "delegate") handleDelegationEvent(ev);
+        collectContextEvent(ev);
+      });
+      refreshContextPanel();
     }
     renderTodoPanel(data.todos || []);
   } catch (e) {
@@ -1701,6 +1936,12 @@ async function sendMessage() {
       const created = await httpJson("POST", API.createSession, {});
       state.sessionId = created.session_id;
       saveSession(state.sessionId);
+      Object.keys(delegationById).forEach((k) => delete delegationById[k]);
+      Object.keys(sourcesById).forEach((k) => delete sourcesById[k]);
+      Object.keys(outputsById).forEach((k) => delete outputsById[k]);
+      renderDelegationList();
+      renderSources();
+      renderOutputs();
     } catch (e) {
       appendMessage("error", "创建会话失败：" + e.message);
       return;
@@ -1754,6 +1995,7 @@ async function sendMessage() {
       pollApprovals();
     }
     loadSessionList();
+    refreshContextPanel();
   }
 }
 
@@ -1770,6 +2012,12 @@ function newSession() {
   saveSession("");
   chatEl.querySelectorAll(".msg-row, .msg.thinking, .activity, .activity-tray").forEach((el) => el.remove());
   Object.keys(activityById).forEach((k) => delete activityById[k]);
+  Object.keys(delegationById).forEach((k) => delete delegationById[k]);
+  Object.keys(sourcesById).forEach((k) => delete sourcesById[k]);
+  Object.keys(outputsById).forEach((k) => delete outputsById[k]);
+  renderDelegationList();
+  renderSources();
+  renderOutputs();
   currentTray = null;
   renderTodoPanel([]);
   stopPolling();
@@ -1817,6 +2065,7 @@ function bindEvents() {
   $("btn-archived").addEventListener("click", () => toggleView("archived"));
   $("btn-plugins").addEventListener("click", () => toggleView("plugins"));
   $("btn-working-diff").addEventListener("click", () => toggleView("wdiff"));
+  $("btn-delegation").addEventListener("click", () => toggleView("delegation"));
   document.querySelectorAll(".plugin-tab").forEach((btn) => {
     btn.addEventListener("click", () => switchPluginTab(btn.dataset.tab));
   });

@@ -29,6 +29,7 @@
         <button id="btn-archived" class="btn side-nav-btn" type="button">已归档</button>
         <button id="btn-plugins" class="btn side-nav-btn" type="button">插件</button>
         <button id="btn-working-diff" class="btn side-nav-btn" type="button">工作区</button>
+        <button id="btn-delegation" class="btn side-nav-btn" type="button">委派</button>
       </div>
 
       <div class="side-section">
@@ -129,9 +130,6 @@
           <!-- 会话线程（首条消息后显示） -->
           <section class="thread hidden" id="chat" aria-live="polite"></section>
 
-          <!-- 任务清单面板（todo 工具，常驻展示当前会话任务） -->
-          <div id="todo-panel" class="todo-panel hidden"></div>
-
           <!-- 输入框（融入对话块） -->
           <footer class="composer">
             <div class="composer-box">
@@ -151,6 +149,26 @@
             </div>
           </footer>
         </div>
+
+        <!-- 右侧上下文面板：环境信息 / 任务列表 / 引用来源 / 输出 -->
+        <aside id="context-panel" class="context-panel hidden">
+          <section class="context-section">
+            <div class="context-head">环境信息</div>
+            <div id="env-info" class="context-body"></div>
+          </section>
+          <section class="context-section">
+            <div class="context-head">任务列表</div>
+            <div id="task-list" class="context-body"></div>
+          </section>
+          <section class="context-section">
+            <div class="context-head">引用来源</div>
+            <div id="source-list" class="context-body"></div>
+          </section>
+          <section class="context-section">
+            <div class="context-head">输出</div>
+            <div id="output-list" class="context-body"></div>
+          </section>
+        </aside>
 
         <!-- 工作区视图：已归档 / 插件（MCP+记忆插件+技能+工具合并）/ 工作区改动 -->
         <section class="workspace-view hidden" id="archived-view">
@@ -181,6 +199,9 @@
               <div class="workspace-list" id="tools-list"></div>
             </div>
           </div>
+        </section>
+        <section class="workspace-view hidden" id="delegation-view">
+          <div class="workspace-list" id="delegation-list"></div>
         </section>
         <section class="workspace-view hidden" id="working-diff-view">
           <div class="workspace-view-head">

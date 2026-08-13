@@ -947,13 +947,14 @@ python demo_file_tools.py
 
 按"推荐顺序"排列（2026-08-12 汇总；OpenAI 兼容接口、运维线"手动启动 + 日志
 轮转"、MCP 客户端已于 2026-08-12 完成，工具结果落盘与网站策略已于 2026-08-13
-完成，其余均未排期）：
+完成，多代理/委派最小切片已于 2026-08-13 完成，其余均未排期）：
 
 - **运维：Windows 服务化 / Task Scheduler（可选，未排期）**：手动启动 +
   结构化日志 + 轮转已完成（见 51）；如需开机自启/崩溃自动拉起再排
   Task Scheduler 或注册 Windows 服务。Hermes 参照：systemd / gateway daemon
-- **多代理/委派（架构级）**：delegate_tool + 子代理 + 会话路由；做它之前
-  "文件锁/跨 profile"才真正有用（可一并补 `tools/file_state.py` 思路）
+- **多代理/委派增强（可选）**：同步单层 delegate_task 已完成（55）；如需
+  异步后台子代理、批量 fan-out、多级委派、checkpoint 再排。Hermes 参照：
+  `tools/async_delegation.py` + `delegate_tool.py` 其余部分
 - **MCP 增强（可选）**：stdio 已完成（52）；如需 HTTP/StreamableHTTP/SSE
   传输、自动重连、sampling、resources/prompts 工具再排。Hermes 参照：
   `tools/mcp_tool.py`（其余部分）+ `mcp_serve.py`
@@ -990,40 +991,36 @@ cron 审批（用户取消）
 - 网站策略已完成（54）：`website_policy.py` 环境变量驱动的禁访域名名单，
   已接入 web_fetch（请求前拒绝）与 web_search（过滤结果）；域名归一化 +
   fnmatch 匹配对齐 Hermes，关闭/异常时 fail-open
+- 多代理/委派最小切片已完成（55）：`delegate_tool.py` 同步单层
+  `delegate_task`；子代理独立上下文跑 Agent Loop，剔除
+  delegate_task/clarify/memory/todo，manager=None；线程 + interrupt_event
+  超时（默认 120s）；结果走工具结果落盘回传；网页侧栏新增「委派」视图
+  （delegation_id 合并 started/completed 事件，展示任务标题/执行模型/状态图标）。
+  异步/批量/多级/checkpoint 未做
+- 网页前端追加（2026-08-13，未提交）：右侧上下文面板——环境信息仅显示
+  「变更 +X/-Y」、任务列表（○/◐/✓/✕ 状态图标）、引用来源（memory/web）、
+  输出（write_file/patch）；任务列表已从聊天区下方移除，委派任务保留在
+  侧栏「委派」视图
 - 文件工具剩余：文件锁、跨 profile 检查（单代理低价值，暂不做）
 - Skills 剩余：技能 hub 同步（明确暂不做）
-- 下一步待办见上方"待办模块"：多代理/委派 → ACP → 澄清增强等小件
-  （运维 Task Scheduler / MCP 增强可选）
+- 下一步待办见上方"待办模块"：ACP → 澄清增强等小件（运维 Task Scheduler /
+  MCP 增强可选；多代理异步/批量/多级增强可选）
 - 中断接线：REPL Ctrl+C 已完成（36）；一次性 /chat 无法感知断连（保持现状）
 
 ## 给新会话的起始指令（可直接粘贴）
 
-> 请先阅读 `C:\Users\Administrator\Documents\Codex\2026-08-03\ru\outputs\minimal_agent\HANDOFF.md`
-> 和该目录的 `README.md`，了解这个迷你 Agent 骨架的进度与约定。
-> 之后所有代码决策与改动一律参考 `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 我们上次停在这里（2026-08-12）：1~52 全部完成——最近一批（40~49）是
-> LLM 自动标题、终端输出清洗、working_diff 工具、网页工作区改动视图、
-> LLM 重试健壮性、REPL 斜杠命令、后台/常驻终端、会话导出、clarify 中途问用户、
-> 两步式会话 API（POST /sessions 先建后聊，/chat 保留为兼容旧接口）；
-> 第 50 项是 **OpenAI 兼容接口**（GET /v1/models + POST /v1/chat/completions，
-> 非流式 + SSE，会话按 system+首条用户消息推导 api-<digest>，X-Hermes-Session-Id
-> 续接需 SERVER_AUTH_TOKEN），流式含标准 delta.tool_calls 帧（工具调用对
-> Open WebUI 可见、参数脱敏）；
-> 第 51 项是 **运维线：服务化日志 + 手动启动**（server_logging.py JSON Lines +
-> 轮转 + 脱敏 + 会话关联；server_ctl.ps1 start/stop/status/restart，部署方式
-> 用户已定为手动启动；Task Scheduler / Windows 服务未做）。
-> 第 52 项是 **MCP 客户端**（mcp_client.py：stdio JSON-RPC，工具注册进 TOOLS、
-> mcp__ 前缀命名、安全环境过滤 + ${VAR} 插值 + 截断脱敏 + 超时兜底；配置
-> mcp_servers.json，HTTP/SSE 传输与 sampling 未做）。
-> 第 53 项是 **工具结果落盘**（tool_result_storage.py：单结果超阈值写盘 + 预览，
-> 单轮总预算超限从最大结果开始溢写；read_file 固定不落盘；已接入
-> tool_dispatch 回填与聚合预算；hook_output_spill 未做）。
-> 第 54 项是 **网站策略**（website_policy.py：环境变量驱动的禁访域名名单，
-> web_fetch 请求前拒绝、web_search 过滤结果；域名归一化 + fnmatch 匹配）。
-> 全套 30 套回归通过 + OpenAI SDK 端到端冒烟通过 + server_ctl 全流程实测。
-> 下一步候选（详见"待办模块"）：**多代理/委派** → ACP → 澄清增强等小件
-> （运维 Task Scheduler / MCP 增强可选）。
-> cron 审批已取消；文件锁/跨 profile、Skills hub、多外部 memory provider 明确暂不做。
+> 请先阅读 `D:\chatbot\minimal_agent\HANDOFF.md` 和该目录的 `README.md`，
+> 了解这个迷你 Agent 骨架的进度与约定。所有代码决策与改动一律参考
+> `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
+> 上次停在这里（2026-08-13）：1~52 全部完成；53=工具结果落盘，54=网站策略，
+> 55=多代理/委派最小切片（delegate_tool.py 同步单层 delegate_task）。
+> 另追加网页前端：侧栏「委派」视图 + 右侧上下文面板（环境信息仅“变更 +X/-Y”、
+> 任务列表（○/◐/✓/✕ 图标）、引用来源（memory/web）、输出（write_file/patch））。
+> 注意：这批改动尚未 git 提交；工作区还有未跟踪的 `build/` 目录（测试产物），
+> 新会话先确认是否保留。
+> 下一步候选（详见“待办模块”）：ACP → 澄清增强等小件；多代理异步/批量/多级、
+> MCP 增强、运维 Task Scheduler 可选。cron 审批已取消；文件锁/跨 profile、
+> Skills hub、多外部 memory provider 明确暂不做。
 
 ## 发版检查记录（2026-08-10，release-check 技能）
 

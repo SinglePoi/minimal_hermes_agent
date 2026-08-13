@@ -75,6 +75,7 @@ from todo_tool import (
     render_todo_lines,
     todo_tool,
 )
+import delegate_tool
 from file_tools import (
     patch_file_tool,
     read_file_tool,
@@ -381,6 +382,9 @@ def _db_conn() -> sqlite3.Connection:
     ev_cols = [r[1] for r in conn.execute("PRAGMA table_info(events)")]
     if "duration_ms" not in ev_cols:
         conn.execute("ALTER TABLE events ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    if "delegation_id" not in ev_cols:
+        conn.execute("ALTER TABLE events ADD COLUMN delegation_id TEXT NOT NULL DEFAULT ''")
         conn.commit()
     # 归档标记（对齐 Hermes sessions.archived）：软标记，不删数据；
     # 旧库首次访问时补列迁移
@@ -808,8 +812,8 @@ def persist_events(
                 continue
             conn.execute(
                 "INSERT INTO events "
-                "(session_id, user_message_id, type, name, args, result, duration_ms) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(session_id, user_message_id, type, name, args, result, duration_ms, delegation_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     int(user_message_id),
@@ -818,6 +822,7 @@ def persist_events(
                     str(ev.get("args") or "")[:2000],
                     str(ev.get("result") or "")[:2000],
                     int(duration_ms),
+                    str(ev.get("delegation_id") or "")[:64],
                 ),
             )
         conn.commit()
@@ -830,7 +835,7 @@ def load_session_events(session_id: str) -> list[dict[str, Any]]:
     conn = _db_conn()
     try:
         rows = conn.execute(
-            "SELECT user_message_id, type, name, args, result, duration_ms FROM events "
+            "SELECT user_message_id, type, name, args, result, duration_ms, delegation_id FROM events "
             "WHERE session_id=? ORDER BY user_message_id, id",
             (session_id,),
         ).fetchall()
@@ -844,6 +849,7 @@ def load_session_events(session_id: str) -> list[dict[str, Any]]:
             "args": r[3],
             "result": r[4],
             "duration_ms": r[5],
+            "delegation_id": r[6],
         }
         for r in rows
     ]
@@ -1447,6 +1453,7 @@ TOOLS = [
         "type": "function",
         "function": TODO_SCHEMA,
     },
+    delegate_tool.DELEGATE_TASK_SCHEMA,
 ]
 
 
@@ -1684,12 +1691,68 @@ def run_tool(
     client=None,
     interrupt_event: Any = None,
     available_tools: set[str] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    events: list[dict[str, Any]] | None = None,
+    sink: Any = None,
 ) -> str:
     """根据工具名找到对应函数并执行。以后加新工具就在这里加一行。
 
     available_tools 传给 skills_list 做条件激活过滤（对齐 Hermes：技能列表
     按当前可用工具集展示）；None 时显示全部（向后兼容）。
     """
+    if name == "delegate_task":
+        delegation_id = f"delegate-{uuid.uuid4().hex[:12]}"
+        goal = str(args.get("goal") or "").strip()
+        context = str(args.get("context") or "").strip()
+
+        def _emit_delegate(status: str, result_text: str = "", duration_ms: int = 0) -> None:
+            """发一条委派生命周期事件（started/completed/failed/timeout）。"""
+            if events is None and sink is None:
+                return
+            _record_event(
+                events,
+                sink,
+                {
+                    "type": "delegate",
+                    "name": goal[:200],
+                    "args": context[:2000],
+                    "result": json.dumps(
+                        {
+                            "status": status,
+                            "agent": "子代理",
+                            "model": MODEL,
+                            "result": result_text[:1200],
+                            "duration_ms": int(duration_ms),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "delegation_id": delegation_id,
+                },
+            )
+
+        started = time.monotonic()
+        _emit_delegate("running")
+        raw = delegate_tool.delegate_task_tool(
+            args,
+            client=client,
+            tools=tools or [],
+            session_key=session_key,
+            interrupt_event=interrupt_event,
+            run_agent_turn=run_agent_turn,
+        )
+        duration_ms = int((time.monotonic() - started) * 1000)
+        try:
+            data = json.loads(raw or "{}")
+        except Exception:
+            data = {}
+        if data.get("success"):
+            status = "completed"
+            result_text = str(data.get("result") or "")
+        else:
+            status = data.get("status") or "failed"
+            result_text = str(data.get("error") or "")
+        _emit_delegate(status, result_text, duration_ms)
+        return raw
     if name == "get_current_time":
         return get_current_time()
     if name == "memory":
@@ -2055,6 +2118,9 @@ def run_agent_turn(
                     name, args, manager, session_key, client,
                     interrupt_event=interrupt_event,
                     available_tools={tool_name(t) for t in tools},
+                    tools=tools,
+                    events=events,
+                    sink=sink,
                 )
 
             def on_segment(kind: str, calls: list) -> None:

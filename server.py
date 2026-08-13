@@ -866,6 +866,14 @@ class _Handler(BaseHTTPRequestHandler):
                 # 附带按文件拆分的记录，供前端"右侧目录 + 左侧逐文件 diff"渲染
                 result["files"] = working_diff.parse_diff_files(result.get("diff", ""))
                 result["summary"] = working_diff.summarize_files(result["files"])
+                result["cwd"] = os.getcwd()
+                try:
+                    _, branch = working_diff._run(
+                        ["branch", "--show-current"], os.getcwd(), timeout=5
+                    )
+                    result["branch"] = branch.strip()
+                except Exception:
+                    result["branch"] = ""
                 self._send_json(200, result)
             return
         if parsed.path.startswith("/sessions/") and parsed.path.endswith("/export"):

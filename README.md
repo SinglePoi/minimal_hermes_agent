@@ -122,7 +122,8 @@
     - 输入框（2026-08-12 重做）：输入区 + 功能栏同处一个**深色圆角输入卡**
       （输入区在上、功能栏在下：左侧 Enter/Shift+Enter 提示，右侧**圆形纯图标
       发送按钮**，发送中禁用变灰；聚焦整卡描边）；对话容器（消息 + 输入卡）
-      限宽 860px **居左**，右侧留白给后续【环境信息】卡片（首页不参与该容器）
+      限宽 860px **居左**；右侧常驻上下文面板（环境信息仅“变更 +X/-Y” /
+      任务列表 / 引用来源 / 输出文件），首页不参与该容器
     - 对话：`POST /chat` 发消息、渲染 Markdown 子集（代码块/行内代码/加粗/
       斜体/列表，先转义再包标签防 XSS）、建议卡片一键发送、会话 ID 自动生成并
       持久化到 localStorage、可粘贴旧会话 ID 恢复、新对话按钮
@@ -455,6 +456,20 @@
       （精确、子域、通配）；策略关闭或解析异常时 fail-open
     - 接入 `web_tools.py`：`web_fetch` 在发起请求前拒绝命中域名，
       `web_search` 过滤结果中的命中链接
+50. **多代理/委派最小切片 delegate_task**（2026-08-13，对齐 Hermes
+    `tools/delegate_tool.py` 核心语义，简化版）：
+    - 新增 `delegate_task` 工具：父代理把自包含子任务交给子代理，子代理在
+      独立上下文里跑一轮 Agent Loop，返回最终答案
+    - 子代理工具集剔除 `delegate_task` / `clarify` / `memory` / `todo`
+      （防递归、打扰用户、写共享记忆、污染父任务清单）；子代理 manager
+      置 None，不触发外部记忆同步
+    - 超时用线程 + `interrupt_event`（默认 120s，`DELEGATE_TIMEOUT_SECONDS`
+      可调），超时中断子代理并返回 timeout
+    - 子代理结果作为普通工具结果回传，自动复用大结果落盘
+    - 网页侧栏新增「委派」视图：按 `delegation_id` 合并 started/completed
+      事件，列表展示任务标题 / 执行模型 / 状态图标（运行中转圈/完成✓/失败✕），
+      切换会话后可重放
+    - 未做（Hermes 有）：异步后台子代理、批量 fan-out、多级委派、checkpoint
 
 ## 你需要准备的
 
@@ -616,6 +631,7 @@ python server.py                 # 默认 127.0.0.1:8000
 | `TOOL_RESULT_STORAGE_DIR` | 落盘目录（相对项目根目录或绝对路径；留空 = 系统临时目录） | 系统临时目录 |
 | `WEBSITE_POLICY_ENABLED` | 网站访问策略开关（开启后 web_search/web_fetch 拒绝命中名单的域名） | `false` |
 | `WEBSITE_POLICY_DENY` | 禁访域名名单（`;` 分隔，支持 `*.domain.com` 通配；空 = 不额外拦截） | 空 |
+| `DELEGATE_TIMEOUT_SECONDS` | delegate_task 子代理同步运行超时秒数（超时后中断子代理） | `120` |
 
 > 鉴权与审计：`SERVER_AUTH_TOKEN` 是生产密钥，只从环境变量注入；前端 401 时会弹出
 > token 输入框并自动重试，token 只存浏览器 localStorage。审计日志与 Hermes 的
@@ -1099,6 +1115,7 @@ python server.py
 | MCP 客户端 `mcp_client.py` | `tools/mcp_tool.py` + `hermes_cli/mcp_config.py`（stdio JSON-RPC 2.0：initialize/tools/list/tools/call、`mcp__` 前缀命名、安全环境过滤、`${VAR}` 插值、supports_parallel_tool_calls；骨架简化：仅 stdio、无自动重连/sampling/HTTP-SSE） |
 | 工具结果落盘 `tool_result_storage.py` | `tools/tool_result_storage.py`（maybe_persist_tool_result / enforce_turn_budget；骨架简化：直接 Path.write_text 写本地目录，无 sandbox env.execute） |
 | 网站策略 `website_policy.py` | `tools/website_policy.py`（check_website_access / 域名归一化 + fnmatch；骨架简化：环境变量名单，无 config.yaml / shared_files） |
+| 多代理/委派 `delegate_tool.py` | `tools/delegate_tool.py`（delegate_task 核心语义、DELEGATE_BLOCKED_TOOLS；骨架简化：仅同步单层子代理，无 async_delegation / 批量 / 多级 / checkpoint） |
 
 骨架当前简化掉（或有意不做）的工业级细节：文件锁、注入威胁扫描、外部漂移检测、
 会话压缩后的 lineage 去重（压缩黑洞处理）、Skills 的 hub/组织同步/插件命名空间、
@@ -1117,9 +1134,9 @@ REPL 斜杠命令/后台终端/会话导出/clarify/两步式会话 API/OpenAI �
   服务化+前端/鉴权审计登录/会话删除标题 fork/联网/时间工具/turn budget/中断语义/
   LLM 自动标题/终端输出清洗/working_diff+网页工作区视图/LLM 重试/REPL 斜杠命令/
   后台终端/会话导出/clarify 中途问用户/两步式会话 API/OpenAI 兼容接口/
-  服务化日志+手动启动/MCP 客户端/工具结果落盘/网站策略
+  服务化日志+手动启动/MCP 客户端/工具结果落盘/网站策略/多代理委派最小切片
   （详见 README 功能列表）
-- 待办（详见 HANDOFF"待办模块"）：多代理/委派 → ACP → 澄清增强等小件
-  （运维剩余 Task Scheduler / Windows 服务可选）
+- 待办（详见 HANDOFF"待办模块"）：ACP → 澄清增强等小件（运维剩余
+  Task Scheduler / Windows 服务可选；多代理异步/批量/多级增强可选）
 - 明确暂不做：cron 审批（用户取消）、文件锁/跨 profile、Skills hub 同步、
   多外部 memory provider 同时挂载
