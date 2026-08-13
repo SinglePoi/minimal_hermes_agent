@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Agent · 通用对话</title>
+  <title>Agent · 智能体控制台</title>
   <link rel="stylesheet" href="/web/style.css">
 </head>
 <body>
@@ -20,7 +20,7 @@
         </div>
         <div class="brand-text">
           <h1>Agent</h1>
-          <p class="subtitle">Hermes 风格 · 通用助手</p>
+          <p class="subtitle">Hermes 架构 · 通用智能体终端</p>
         </div>
       </div>
 
@@ -38,7 +38,13 @@
 
       <div class="sidebar-footer">
         <div class="user-card hidden" id="user-card">
-          <div class="user-avatar" aria-hidden="true">👤</div>
+          <div class="user-avatar" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/>
+              <circle cx="12" cy="7" r="4"/>
+            </svg>
+          </div>
           <div class="user-meta">
             <div class="user-name" id="user-name">未登录</div>
             <div class="user-actions">
@@ -56,29 +62,62 @@
         <!-- 顶部标题栏（融入右侧玻璃块：会话/视图标题） -->
         <header class="topbar">
           <div class="view-title" id="view-title">新对话</div>
+          <button id="btn-export-session" class="icon-btn hidden" type="button"
+                  title="导出会话" aria-label="导出会话">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
+                 stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 15V3"/>
+              <path d="m7 8 5-5 5 5"/>
+              <path d="M5 21h14"/>
+            </svg>
+          </button>
         </header>
 
         <!-- 首页：hero + 建议卡片（参考 Codex 首页布局） -->
         <section class="home" id="home">
           <div class="hero">
             <h2>今天想构建什么？</h2>
-            <p>一个对齐 Hermes 架构的通用 Agent —— 代码、文件、终端、记忆，随叫随到。</p>
+            <p>接入 Hermes 架构的通用智能体终端 —— 代码、文件、终端、记忆，随叫随到。</p>
           </div>
           <div class="suggestions" id="suggestions">
             <button class="suggestion" type="button" data-prompt="看看这个仓库的结构">
-              <span class="sug-icon" aria-hidden="true">📁</span>
+              <span class="sug-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                     stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>
+                </svg>
+              </span>
               <span class="sug-label">看看这个仓库的结构</span>
             </button>
             <button class="suggestion" type="button" data-prompt="找出项目里还有哪些待办或 TODO">
-              <span class="sug-icon" aria-hidden="true">✅</span>
+              <span class="sug-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                     stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m9 11 3 3L22 4"/>
+                  <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+                </svg>
+              </span>
               <span class="sug-label">找出项目里还有哪些待办或 TODO</span>
             </button>
             <button class="suggestion" type="button" data-prompt="帮我写一段 Python 脚本">
-              <span class="sug-icon" aria-hidden="true">🐍</span>
+              <span class="sug-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                     stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m16 18 6-6-6-6"/>
+                  <path d="m8 6-6 6 6 6"/>
+                </svg>
+              </span>
               <span class="sug-label">帮我写一段 Python 脚本</span>
             </button>
             <button class="suggestion" type="button" data-prompt="回顾一下最近的会话里聊过什么">
-              <span class="sug-icon" aria-hidden="true">🕘</span>
+              <span class="sug-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                     stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="10"/>
+                  <path d="M12 6v6l4 2"/>
+                </svg>
+              </span>
               <span class="sug-label">回顾一下最近的会话里聊过什么</span>
             </button>
           </div>
@@ -115,22 +154,18 @@
 
         <!-- 工作区视图：已归档 / 插件（MCP+记忆插件+技能+工具合并）/ 工作区改动 -->
         <section class="workspace-view hidden" id="archived-view">
-          <div class="workspace-view-head">
-            <span class="view-title">已归档</span>
-            <button id="btn-archived-back" class="btn ghost" type="button">← 返回对话</button>
-          </div>
           <div class="workspace-list" id="archived-list"></div>
         </section>
         <section class="workspace-view hidden" id="plugins-view">
-          <div class="workspace-view-head">
-            <span class="view-title">插件</span>
-            <button id="btn-plugins-back" class="btn ghost" type="button">← 返回对话</button>
-          </div>
           <div class="plugin-tabs" role="tablist">
             <button class="plugin-tab active" type="button" data-tab="mcp" role="tab" aria-selected="true">MCP 服务器</button>
             <button class="plugin-tab" type="button" data-tab="plugins" role="tab" aria-selected="false">记忆插件</button>
             <button class="plugin-tab" type="button" data-tab="skills" role="tab" aria-selected="false">技能</button>
             <button class="plugin-tab" type="button" data-tab="tools" role="tab" aria-selected="false">工具</button>
+          </div>
+          <div class="plugin-heading">
+            <h2 id="plugin-title">MCP 服务器</h2>
+            <p id="plugin-desc">通过 Model Context Protocol 接入的外部工具服务器。</p>
           </div>
           <div class="plugin-panels">
             <div class="plugin-panel" id="panel-mcp">
@@ -149,14 +184,14 @@
         </section>
         <section class="workspace-view hidden" id="working-diff-view">
           <div class="workspace-view-head">
-            <span class="view-title">工作区改动</span>
-            <div class="wdiff-modes">
-              <button id="btn-wdiff-working" class="btn mode-btn active" type="button">未暂存</button>
-              <button id="btn-wdiff-staged" class="btn mode-btn" type="button">已暂存</button>
-              <button id="btn-wdiff-all" class="btn mode-btn" type="button">全部</button>
+            <div class="workspace-view-tools">
+              <div class="wdiff-modes">
+                <button id="btn-wdiff-working" class="btn mode-btn active" type="button">未暂存</button>
+                <button id="btn-wdiff-staged" class="btn mode-btn" type="button">已暂存</button>
+                <button id="btn-wdiff-all" class="btn mode-btn" type="button">全部</button>
+              </div>
+              <button id="btn-working-diff-refresh" class="btn ghost" type="button">刷新</button>
             </div>
-            <button id="btn-working-diff-refresh" class="btn ghost" type="button">刷新</button>
-            <button id="btn-working-diff-back" class="btn ghost" type="button">← 返回对话</button>
           </div>
           <!-- 左：具体 diff（红绿标注）；右：改动文件目录 -->
           <div class="wdiff-panes">
@@ -176,7 +211,15 @@
   <div id="approval-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="approval-title">
     <div class="approval-card">
       <div class="approval-head">
-        <h2 id="approval-title">⚠️ 危险命令需要批准</h2>
+        <h2 id="approval-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="m21.73 18-8-14a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/>
+            <path d="M12 9v4"/>
+            <path d="M12 17h.01"/>
+          </svg>
+          危险命令需要批准
+        </h2>
         <span id="approval-queue" class="badge hidden"></span>
       </div>
       <p class="field-label">原因</p>
@@ -205,7 +248,15 @@
   <div id="clarify-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="clarify-title">
     <div class="approval-card">
       <div class="approval-head">
-        <h2 id="clarify-title">❓ 需要你确认</h2>
+        <h2 id="clarify-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+            <path d="M12 17h.01"/>
+          </svg>
+          需要你确认
+        </h2>
         <span id="clarify-queue" class="badge hidden"></span>
       </div>
       <p id="clarify-question" class="approval-desc"></p>
@@ -223,7 +274,13 @@
   <div id="token-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="token-title">
     <div class="approval-card">
       <div class="approval-head">
-        <h2 id="token-title">🔑 需要访问令牌</h2>
+        <h2 id="token-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="m21 2-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777Zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/>
+          </svg>
+          需要访问令牌
+        </h2>
       </div>
       <p class="field-label">Token（需与服务器 SERVER_AUTH_TOKEN 一致）</p>
       <input id="token-input" class="token-input" type="password" placeholder="粘贴访问令牌"

@@ -34,6 +34,25 @@ const STORAGE_KEY = "agent.session";
 const AUTH_TOKEN_KEY = "agent.auth.token";
 const POLL_INTERVAL_MS = 800;
 
+const PLUGIN_TAB_META = {
+  mcp: {
+    title: "MCP 服务器",
+    desc: "通过 Model Context Protocol 接入的外部工具服务器。",
+  },
+  plugins: {
+    title: "记忆插件",
+    desc: "已启用的记忆 provider 插件。",
+  },
+  skills: {
+    title: "技能",
+    desc: "按需加载的 SKILL 技能包。",
+  },
+  tools: {
+    title: "工具",
+    desc: "当前 Agent 可调用的内置与扩展工具。",
+  },
+};
+
 const state = {
   sessionId: "",
   sessionTitle: "",
@@ -43,6 +62,7 @@ const state = {
   abort: null,
   queueCount: 0,
   pendingItem: null,
+  pendingKey: "",
   clarifyItem: null,
   hasMessages: false,
   loginAvailable: false,
@@ -156,6 +176,11 @@ function renderMarkdown(text) {
 
 /* ---------- 视图切换（首页 ↔ 会话线程） ---------- */
 
+function updateHeaderActions() {
+  const btn = $("btn-export-session");
+  if (btn) btn.classList.toggle("hidden", !state.sessionId || !state.hasMessages);
+}
+
 function showThread() {
   homeEl.classList.add("hidden");
   chatEl.classList.remove("hidden");
@@ -165,6 +190,7 @@ function showThread() {
   hideAllViews();
   viewTitle.textContent = state.sessionTitle || "会话";
   state.hasMessages = true;
+  updateHeaderActions();
 }
 
 function showHome() {
@@ -176,10 +202,82 @@ function showHome() {
   hideAllViews();
   viewTitle.textContent = "新对话";
   state.hasMessages = false;
+  updateHeaderActions();
+}
+
+function fallbackCopyText(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (e) {
+    ok = false;
+  }
+  ta.remove();
+  return ok;
+}
+
+async function copyMessageText(messageEl) {
+  const text = (messageEl.textContent || "").trim();
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    if (!fallbackCopyText(text)) {
+      appendMessage("error", "复制失败：" + e.message);
+    }
+  }
+}
+
+function addMessageActions(messageEl, row) {
+  const actions = document.createElement("div");
+  actions.className = "msg-actions";
+
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "icon-btn";
+  copyBtn.title = "复制";
+  copyBtn.setAttribute("aria-label", "复制消息");
+  copyBtn.innerHTML =
+    '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ' +
+    'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" ' +
+    'stroke-linejoin="round" aria-hidden="true">' +
+    '<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/>' +
+    '<path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>' +
+    "</svg>";
+  copyBtn.addEventListener("click", () => copyMessageText(messageEl));
+
+  const forkBtn = document.createElement("button");
+  forkBtn.type = "button";
+  forkBtn.className = "icon-btn";
+  forkBtn.title = "分支";
+  forkBtn.setAttribute("aria-label", "分支当前会话");
+  forkBtn.innerHTML =
+    '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ' +
+    'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" ' +
+    'stroke-linejoin="round" aria-hidden="true">' +
+    '<circle cx="6" cy="6" r="2"/><circle cx="6" cy="18" r="2"/>' +
+    '<circle cx="18" cy="6" r="2"/><path d="M6 8v8"/>' +
+    '<path d="M18 8a6 6 0 0 1-6 6H6"/>' +
+    "</svg>";
+  forkBtn.addEventListener("click", () => {
+    if (state.sessionId) forkSession(state.sessionId);
+  });
+
+  actions.append(copyBtn, forkBtn);
+  row.appendChild(actions);
 }
 
 function appendMessage(role, text) {
   if (!state.hasMessages) showThread();
+  const row = document.createElement("div");
+  row.className = "msg-row";
   const div = document.createElement("div");
   div.className = "msg " + role;
   if (role === "assistant") {
@@ -187,7 +285,11 @@ function appendMessage(role, text) {
   } else {
     div.textContent = text;
   }
-  chatEl.appendChild(div);
+  row.appendChild(div);
+  if (role === "assistant") {
+    addMessageActions(div, row);
+  }
+  chatEl.appendChild(row);
   chatEl.scrollTop = chatEl.scrollHeight;
   return div;
 }
@@ -221,7 +323,15 @@ function beginActivityTray() {
   body.className = "activity-tray-body";
   tray.append(head, body);
   const started = performance.now();
+  let finalized = false;
+  let durationMs = 0;
   const renderHead = () => {
+    if (finalized) {
+      head.textContent = tray.classList.contains("collapsed")
+        ? trayDoneText(durationMs)
+        : fmtElapsed(durationMs);
+      return;
+    }
     head.textContent = fmtElapsed(performance.now() - started);
   };
   head.addEventListener("click", () => {
@@ -229,11 +339,19 @@ function beginActivityTray() {
     renderHead();
   });
   const timer = setInterval(() => {
-    if (!tray.classList.contains("collapsed")) renderHead();
-  }, 500);
+    if (!tray.classList.contains("collapsed") && !finalized) renderHead();
+  }, 100);
   chatEl.appendChild(tray);
+  // 思考提示放在活动托盘下方、助手消息的位置，而不是托盘上方
+  const thinking = chatEl.querySelector(".msg.thinking");
+  if (thinking) chatEl.insertBefore(thinking, tray.nextSibling);
   chatEl.scrollTop = chatEl.scrollHeight;
-  const handle = { tray, body, events, head, timer, started, token };
+  const markFinalized = (ms) => {
+    finalized = true;
+    durationMs = ms;
+    renderHead();
+  };
+  const handle = { tray, body, events, head, timer, started, token, markFinalized };
   currentTray = handle;
   renderHead();
   return handle;
@@ -246,7 +364,7 @@ function finalizeTray(tray) {
     tray.tray.remove();  // 本轮没有活动，不显示空盒子
   } else {
     tray.tray.classList.add("collapsed");  // 最终回答出来后收拢成一行时间
-    tray.head.textContent = trayDoneText(performance.now() - tray.started);
+    tray.markFinalized(performance.now() - tray.started);
   }
   if (currentTray === tray) currentTray = null;
 }
@@ -357,7 +475,7 @@ function setThinking(on) {
     if (!chatEl.querySelector(".msg.thinking")) {
       const div = document.createElement("div");
       div.className = "msg thinking";
-      div.textContent = "思考中";
+      div.textContent = "【正在思考】";
       chatEl.appendChild(div);
       chatEl.scrollTop = chatEl.scrollHeight;
     }
@@ -620,23 +738,7 @@ function renderSessionList(list) {
       else archiveSession(s.session_id);
     });
 
-    const fork = document.createElement("button");
-    fork.type = "button";
-    fork.className = "session-item-action";
-    fork.textContent = "分支";
-    fork.addEventListener("click", (e) => {
-      e.stopPropagation();
-      forkSession(s.session_id);
-    });
-    const exportBtn = document.createElement("button");
-    exportBtn.type = "button";
-    exportBtn.className = "session-item-action";
-    exportBtn.textContent = "导出";
-    exportBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      exportSession(s.session_id);
-    });
-    item.append(action, fork, exportBtn);
+    item.append(action);
 
     item.addEventListener(
       "click",
@@ -941,6 +1043,14 @@ async function refreshPluginsList() {
   }
 }
 
+function updatePluginHeading(name) {
+  const meta = PLUGIN_TAB_META[name] || PLUGIN_TAB_META.mcp;
+  const title = $("plugin-title");
+  const desc = $("plugin-desc");
+  if (title) title.textContent = meta.title;
+  if (desc) desc.textContent = meta.desc;
+}
+
 function switchPluginTab(name) {
   /* 插件页标签切换：MCP / 记忆插件 / 技能 / 工具 */
   document.querySelectorAll(".plugin-tab").forEach((btn) => {
@@ -951,6 +1061,7 @@ function switchPluginTab(name) {
   ["mcp", "plugins", "skills", "tools"].forEach((key) => {
     $("panel-" + key).classList.toggle("hidden", key !== name);
   });
+  updatePluginHeading(name);
 }
 
 function renderMCPList(list) {
@@ -1230,6 +1341,7 @@ async function switchSession(id, title) {
   }
   stopPolling();
   state.pendingItem = null;
+  state.pendingKey = "";
   state.clarifyItem = null;
   $("approval-overlay").classList.add("hidden");
   $("clarify-overlay").classList.add("hidden");
@@ -1237,7 +1349,7 @@ async function switchSession(id, title) {
   state.sessionId = id;
   state.sessionTitle = title || "会话";
   saveSession(id);
-  chatEl.querySelectorAll(".msg, .activity, .activity-tray").forEach((el) => el.remove());
+  chatEl.querySelectorAll(".msg-row, .msg.thinking, .activity, .activity-tray").forEach((el) => el.remove());
   Object.keys(activityById).forEach((k) => delete activityById[k]);
   currentTray = null;
 
@@ -1286,14 +1398,25 @@ async function switchSession(id, title) {
 
 function renderPending(items) {
   state.queueCount = items.length;
-  state.pendingItem = items.length ? items[0] : null;
+  const item = items.length ? items[0] : null;
+  const nextKey = item ? JSON.stringify(item) : "";
 
-  if (!state.pendingItem) {
+  if (!item) {
+    state.pendingItem = null;
+    state.pendingKey = "";
     $("approval-overlay").classList.add("hidden");
     return;
   }
 
-  const item = state.pendingItem;
+  // 轮询时不要每次都清掉拒绝框：用户可能刚点了“拒绝”，正在填理由。
+  // 只有切换到下一条待审批命令时才重置拒绝框，避免 800ms 轮询打断操作。
+  if (nextKey !== state.pendingKey) {
+    state.pendingKey = nextKey;
+    $("deny-box").classList.add("hidden");
+    $("deny-reason").value = "";
+  }
+
+  state.pendingItem = item;
   $("approval-desc").textContent = item.description || "未知";
   $("approval-cmd").textContent = item.command || "";
   const allowPermanent = item.allow_permanent !== false;
@@ -1311,8 +1434,6 @@ function renderPending(items) {
   $("approval-queue").classList.toggle("hidden", state.queueCount <= 1);
   $("approval-queue").textContent = "队列 " + state.queueCount;
 
-  $("deny-box").classList.add("hidden");
-  $("deny-reason").value = "";
   $("approval-overlay").classList.remove("hidden");
 }
 
@@ -1363,6 +1484,10 @@ async function resolveApproval(choice) {
       choice,
       ...(reason ? { reason } : {}),
     });
+    // 这条审批已提交；若队列里还有下一条，pollApprovals 会按新 key 重置拒绝框。
+    $("deny-box").classList.add("hidden");
+    $("deny-reason").value = "";
+    state.pendingKey = "";
     // 立即刷新一次，让弹窗反映最新队列
     await pollApprovals();
   } catch (e) {
@@ -1465,9 +1590,13 @@ async function readSse(resp, handlers) {
 }
 
 function createAssistantBubble() {
+  const row = document.createElement("div");
+  row.className = "msg-row";
   const div = document.createElement("div");
   div.className = "msg assistant";
-  chatEl.appendChild(div);
+  row.appendChild(div);
+  addMessageActions(div, row);
+  chatEl.appendChild(row);
   chatEl.scrollTop = chatEl.scrollHeight;
   return div;
 }
@@ -1501,14 +1630,24 @@ async function sendStreaming(body, retried) {
 
   // 活动托盘先于消息创建：思考和工具调用显示在消息上方
   const tray = beginActivityTray();
-  const bubble = createAssistantBubble();
-  setThinking(false);
+  let bubble = null;
   let replyText = "";
   let finalized = false;
-  const finalize = () => {
+  const showReply = () => {
+    setThinking(false);
+    if (!bubble) {
+      bubble = createAssistantBubble();
+    }
+    bubble.innerHTML = renderMarkdown(replyText || "(空回复)");
+  };
+  const finalize = (withMessage = true) => {
     if (finalized) return;
     finalized = true;
-    bubble.innerHTML = renderMarkdown(replyText || "(空回复)");
+    if (withMessage) {
+      showReply();
+    } else {
+      setThinking(false);
+    }
     finalizeTray(tray);  // 思考完成 → 活动收拢成一行摘要
     chatEl.scrollTop = chatEl.scrollHeight;
   };
@@ -1523,6 +1662,10 @@ async function sendStreaming(body, retried) {
     activity: (ev) => handleActivityEvent(ev, tray),
     token: (d) => {
       replyText += d.text || "";
+      if (!bubble) {
+        setThinking(false);
+        bubble = createAssistantBubble();
+      }
       bubble.textContent = replyText;
       chatEl.scrollTop = chatEl.scrollHeight;
     },
@@ -1535,7 +1678,11 @@ async function sendStreaming(body, retried) {
       finalize();
     },
     error: (d) => {
-      finalize();
+      if (bubble) {
+        finalize();
+      } else {
+        finalize(false);
+      }
       appendMessage("error", "请求失败：" + (d.error || "未知错误"));
     },
     done: () => finalize(),
@@ -1619,8 +1766,9 @@ function newSession() {
   state.sessionTitle = "";
   state.queueCount = 0;
   state.pendingItem = null;
+  state.pendingKey = "";
   saveSession("");
-  chatEl.querySelectorAll(".msg, .activity, .activity-tray").forEach((el) => el.remove());
+  chatEl.querySelectorAll(".msg-row, .msg.thinking, .activity, .activity-tray").forEach((el) => el.remove());
   Object.keys(activityById).forEach((k) => delete activityById[k]);
   currentTray = null;
   renderTodoPanel([]);
@@ -1672,13 +1820,13 @@ function bindEvents() {
   document.querySelectorAll(".plugin-tab").forEach((btn) => {
     btn.addEventListener("click", () => switchPluginTab(btn.dataset.tab));
   });
-  $("btn-archived-back").addEventListener("click", closeView);
-  $("btn-plugins-back").addEventListener("click", closeView);
-  $("btn-working-diff-back").addEventListener("click", closeView);
   $("btn-working-diff-refresh").addEventListener("click", refreshWorkingDiff);
   $("btn-wdiff-working").addEventListener("click", () => setWorkingDiffMode("working"));
   $("btn-wdiff-staged").addEventListener("click", () => setWorkingDiffMode("staged"));
   $("btn-wdiff-all").addEventListener("click", () => setWorkingDiffMode("all"));
+  $("btn-export-session").addEventListener("click", () => {
+    if (state.sessionId) exportSession(state.sessionId);
+  });
 
   // 审批按钮
   $("btn-once").addEventListener("click", () => resolveApproval("once"));
