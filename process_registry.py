@@ -8,6 +8,7 @@ terminal(background=true) 启动的进程在这里登记，供模型用 process 
 - wait：阻塞等到进程结束（带超时），拿完整输出；
 - kill：整棵树终止（Windows 用 taskkill /T，与 terminal 中断语义一致）；
 - shutdown_all：会话/服务退出时兜底清理，防止孤儿进程。
+- spawn_via_env：远程后端（Daytona）无本地 Popen 时，用线程 + cancel_fn 登记。
 
 简化掉的部分（Hermes 有）：JSON 检查点崩溃恢复、finished TTL 自动回收、
 gateway 会话级保护、notify_on_complete 通知。骨架按"会话内管理"处理：
@@ -43,6 +44,9 @@ class BackgroundProcess:
     stderr: list[str] = field(default_factory=list)
     proc: Any = None
     lock: Any = field(default_factory=threading.Lock)
+    # 远程后端（Daytona 等）没有本地 Popen：用 done Event + cancel_fn
+    done: Any = None
+    cancel_fn: Any = None
 
     def _append(self, buf: list[str], line: str) -> None:
         """往缓冲追加一行；超上限时从头部丢最旧的行。"""
@@ -170,6 +174,74 @@ def spawn(command: str, cwd: Optional[str] = None) -> dict[str, Any]:
     }
 
 
+def spawn_via_env(
+    command: str,
+    execute_fn,
+    cancel_fn=None,
+) -> dict[str, Any]:
+    """在远程环境（Daytona 等）后台执行命令（对齐 Hermes spawn_via_env 思路）。
+
+    execute_fn() 返回 {output, returncode, error?, cancelled?}；
+    cancel_fn() 用于 kill / shutdown（例如 sandbox.stop）。
+    """
+    session_id = _next_session_id()
+    done = threading.Event()
+    record = BackgroundProcess(
+        session_id=session_id,
+        command=command,
+        pid=0,
+        start_time=time.strftime("%Y-%m-%d %H:%M:%S"),
+        proc=None,
+        done=done,
+        cancel_fn=cancel_fn,
+    )
+
+    def _worker() -> None:
+        """在后台线程里跑远程 execute，把输出写入登记表。"""
+        try:
+            result = execute_fn() or {}
+            output = str(result.get("output") or "")
+            error = str(result.get("error") or "")
+            if output:
+                record._append(record.output, output)
+            if error:
+                record._append(record.stderr, error)
+            record.exit_code = int(
+                result.get("returncode") if result.get("returncode") is not None else 1
+            )
+            with record.lock:
+                if record.status == "running":
+                    record.status = (
+                        "killed" if result.get("cancelled") else "exited"
+                    )
+        except Exception as exc:
+            record._append(record.stderr, str(exc))
+            record.exit_code = -1
+            with record.lock:
+                if record.status == "running":
+                    record.status = "exited"
+        finally:
+            done.set()
+
+    threading.Thread(
+        target=_worker, daemon=True, name=f"bg-env-{session_id}"
+    ).start()
+    with _registry_lock:
+        _registry[session_id] = record
+    return {
+        "success": True,
+        "session_id": session_id,
+        "pid": 0,
+        "command": command,
+        "status": "running",
+        "backend": "remote",
+        "message": (
+            f"已在远程沙箱后台启动（{session_id}）。用 process(action=poll) 查状态、"
+            "process(action=wait) 等结束、process(action=kill) 终止。"
+        ),
+    }
+
+
 def _get(session_id: str) -> Optional[BackgroundProcess]:
     """按 session_id 取记录；不存在返回 None。"""
     with _registry_lock:
@@ -178,11 +250,17 @@ def _get(session_id: str) -> Optional[BackgroundProcess]:
 
 def _refresh_status(record: BackgroundProcess) -> None:
     """进程已结束时把状态刷成 exited（幂等）。"""
-    if record.status == "running" and record.proc is not None:
+    if record.status != "running":
+        return
+    if record.proc is not None:
         code = record.proc.poll()
         if code is not None:
             record.status = "exited"
             record.exit_code = code
+    elif record.done is not None and record.done.is_set():
+        # 远程 worker 线程已结束但尚未写入 status 的兜底
+        if record.status == "running":
+            record.status = "exited"
 
 
 def poll(session_id: str) -> dict[str, Any]:
@@ -202,7 +280,10 @@ def wait(session_id: str, timeout: int = 300) -> dict[str, Any]:
     if record is None:
         return {"success": False, "error": f"未知后台进程：{session_id}"}
     try:
-        record.proc.wait(timeout=max(1, int(timeout)))
+        if record.proc is not None:
+            record.proc.wait(timeout=max(1, int(timeout)))
+        elif record.done is not None:
+            record.done.wait(timeout=max(1, int(timeout)))
     except subprocess.TimeoutExpired:
         pass
     except Exception as exc:
@@ -220,11 +301,17 @@ def kill(session_id: str) -> dict[str, Any]:
     record = _get(session_id)
     if record is None:
         return {"success": False, "error": f"未知后台进程：{session_id}"}
-    if record.status == "running" and record.proc is not None:
-        _kill_tree(record.proc)
+    if record.status == "running":
+        if record.cancel_fn is not None:
+            try:
+                record.cancel_fn()
+            except Exception:
+                pass
+        elif record.proc is not None:
+            _kill_tree(record.proc)
         record.status = "killed"
-    elif record.status == "running":
-        record.status = "killed"
+        if record.done is not None:
+            record.done.set()
     return {
         "success": True,
         "session_id": session_id,
@@ -239,9 +326,17 @@ def shutdown_all() -> int:
         records = list(_registry.values())
     killed = 0
     for record in records:
-        if record.status == "running" and record.proc is not None:
-            _kill_tree(record.proc)
+        if record.status == "running":
+            if record.cancel_fn is not None:
+                try:
+                    record.cancel_fn()
+                except Exception:
+                    pass
+            elif record.proc is not None:
+                _kill_tree(record.proc)
             record.status = "killed"
+            if record.done is not None:
+                record.done.set()
             killed += 1
     with _registry_lock:
         _registry.clear()

@@ -4,3 +4,7 @@ rich>=13.0.0
 
 # 本地语义向量检索（可选，按需启用）：pip install sentence-transformers
 # sentence-transformers>=3.0.0
+
+# Daytona 云沙箱终端后端（可选，TERMINAL_ENV=daytona 时需要）：
+# pip install daytona
+# daytona>=0.155.0

@@ -806,6 +806,41 @@ body::before {
   animation: cursor-blink 1.1s steps(1) infinite;
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.terminal-badge {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  color: var(--muted);
+  background: rgba(15, 23, 42, 0.55);
+  white-space: nowrap;
+}
+
+.terminal-badge.daytona {
+  color: #a5f3fc;
+  border-color: rgba(34, 211, 238, 0.45);
+  box-shadow: 0 0 12px rgba(34, 211, 238, 0.12);
+}
+
+.terminal-badge.local {
+  color: #bbf7d0;
+  border-color: rgba(34, 197, 94, 0.35);
+}
+
+.terminal-badge.error {
+  color: #fecaca;
+  border-color: rgba(248, 113, 113, 0.45);
+}
+
 .icon-btn {
   display: inline-flex;
   align-items: center;
@@ -870,7 +905,7 @@ body::before {
   width: 100%;
 }
 
-/* 右侧上下文面板：环境信息 / 任务列表 / 引用来源 / 输出 */
+/* 右侧上下文面板：环境信息 / 任务列表 / 委派 / 引用来源 / 输出 */
 .context-panel {
   position: absolute;
   top: 60px;
@@ -1319,7 +1354,7 @@ body::before {
   color: #f87171;
 }
 
-/* 委派任务条目（侧栏「委派」视图：任务 + 执行模型 + 状态图标） */
+/* 委派任务条目（对话右侧「委派」卡片：任务 + 执行模型 + 状态图标） */
 .delegation-item {
   display: flex;
   align-items: center;
@@ -1336,6 +1371,7 @@ body::before {
   align-items: center;
   gap: 8px;
   min-width: 0;
+  flex: 1;
 }
 
 .delegation-icon {

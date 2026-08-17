@@ -8,6 +8,7 @@ run_tool 分发、shutdown_all 退出清理。零依赖，python tests/test_proc
 
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from process_registry import (  # noqa: E402
     process_tool,
     shutdown_all,
     spawn,
+    spawn_via_env,
     wait,
 )
 import minimal_agent  # noqa: E402
@@ -131,6 +133,39 @@ def test_run_terminal_background() -> None:
         kill(sid)
 
 
+def test_spawn_via_env() -> None:
+    """远程后端 spawn_via_env：线程执行 + wait 拿输出 + kill 调 cancel_fn。"""
+    cancelled = {"n": 0}
+
+    def execute_ok():
+        time.sleep(0.15)
+        return {"output": "hello-remote", "returncode": 0}
+
+    def cancel_fn():
+        cancelled["n"] += 1
+
+    res = spawn_via_env("echo remote", execute_ok, cancel_fn)
+    check("spawn_via_env 成功", res.get("success") is True)
+    sid = res["session_id"]
+    waited = wait(sid, timeout=5)
+    check("wait 拿到远程输出", "hello-remote" in (waited.get("output") or ""))
+    check("wait 后 exited", waited.get("status") == "exited")
+    check("远程 pid 为 0", waited.get("pid") == 0)
+
+    gate = threading.Event()
+
+    def execute_slow():
+        gate.wait(timeout=5)
+        return {"output": "late", "returncode": 0}
+
+    res2 = spawn_via_env("sleep", execute_slow, cancel_fn)
+    sid2 = res2["session_id"]
+    killed = kill(sid2)
+    gate.set()
+    check("kill 远程成功", killed.get("success") is True)
+    check("kill 调用 cancel_fn", cancelled["n"] >= 1)
+
+
 def test_shutdown_all() -> None:
     """shutdown_all：终止全部登记进程并清空注册表。"""
     res1 = spawn(_py_cmd("import time; time.sleep(30)"))
@@ -149,6 +184,7 @@ def main() -> None:
     test_unknown()
     test_process_tool()
     test_run_terminal_background()
+    test_spawn_via_env()
     test_shutdown_all()
     if _failures:
         print(f"\n{len(_failures)} 条断言失败：")

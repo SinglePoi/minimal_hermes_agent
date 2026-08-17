@@ -29,7 +29,6 @@
         <button id="btn-archived" class="btn side-nav-btn" type="button">已归档</button>
         <button id="btn-plugins" class="btn side-nav-btn" type="button">插件</button>
         <button id="btn-working-diff" class="btn side-nav-btn" type="button">工作区</button>
-        <button id="btn-delegation" class="btn side-nav-btn" type="button">委派</button>
       </div>
 
       <div class="side-section">
@@ -63,8 +62,10 @@
         <!-- 顶部标题栏（融入右侧玻璃块：会话/视图标题） -->
         <header class="topbar">
           <div class="view-title" id="view-title">新对话</div>
-          <button id="btn-export-session" class="icon-btn hidden" type="button"
-                  title="导出会话" aria-label="导出会话">
+          <div class="topbar-actions">
+            <span id="terminal-badge" class="terminal-badge" title="终端后端">终端 · …</span>
+            <button id="btn-export-session" class="icon-btn hidden" type="button"
+                    title="导出会话" aria-label="导出会话">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
                  stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
                  stroke-linejoin="round" aria-hidden="true">
@@ -73,13 +74,14 @@
               <path d="M5 21h14"/>
             </svg>
           </button>
+          </div>
         </header>
 
         <!-- 首页：hero + 建议卡片（参考 Codex 首页布局） -->
         <section class="home" id="home">
           <div class="hero">
             <h2>今天想构建什么？</h2>
-            <p>接入 Hermes 架构的通用智能体终端 —— 代码、文件、终端、记忆，随叫随到。</p>
+            <p>极简 Hermes 架构的通用智能体终端 —— 代码、文件、终端、记忆，随叫随到</p>
           </div>
           <div class="suggestions" id="suggestions">
             <button class="suggestion" type="button" data-prompt="看看这个仓库的结构">
@@ -101,15 +103,17 @@
               </span>
               <span class="sug-label">找出项目里还有哪些待办或 TODO</span>
             </button>
-            <button class="suggestion" type="button" data-prompt="帮我写一段 Python 脚本">
+            <button class="suggestion" type="button" data-prompt="用 terminal 执行 uname -a 和 whoami，并明确告诉我命令是在本机还是 Daytona 云沙箱里跑的">
               <span class="sug-icon" aria-hidden="true">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                      stroke-linecap="round" stroke-linejoin="round">
-                  <path d="m16 18 6-6-6-6"/>
-                  <path d="m8 6-6 6 6 6"/>
+                  <rect x="3" y="4" width="18" height="14" rx="2"/>
+                  <path d="M7 20h10"/>
+                  <path d="M8 8h.01"/>
+                  <path d="M12 8h8"/>
                 </svg>
               </span>
-              <span class="sug-label">帮我写一段 Python 脚本</span>
+              <span class="sug-label">在沙箱里跑 uname / whoami</span>
             </button>
             <button class="suggestion" type="button" data-prompt="回顾一下最近的会话里聊过什么">
               <span class="sug-icon" aria-hidden="true">
@@ -150,21 +154,25 @@
           </footer>
         </div>
 
-        <!-- 右侧上下文面板：环境信息 / 任务列表 / 引用来源 / 输出 -->
+        <!-- 右侧上下文面板：环境信息 / 任务列表 / 委派 / 引用来源 / 输出（空卡片不显示） -->
         <aside id="context-panel" class="context-panel hidden">
-          <section class="context-section">
+          <section class="context-section hidden" id="card-env">
             <div class="context-head">环境信息</div>
             <div id="env-info" class="context-body"></div>
           </section>
-          <section class="context-section">
+          <section class="context-section hidden" id="card-tasks">
             <div class="context-head">任务列表</div>
             <div id="task-list" class="context-body"></div>
           </section>
-          <section class="context-section">
+          <section class="context-section hidden" id="card-delegation">
+            <div class="context-head">委派</div>
+            <div id="delegation-list" class="context-body"></div>
+          </section>
+          <section class="context-section hidden" id="card-sources">
             <div class="context-head">引用来源</div>
             <div id="source-list" class="context-body"></div>
           </section>
-          <section class="context-section">
+          <section class="context-section hidden" id="card-outputs">
             <div class="context-head">输出</div>
             <div id="output-list" class="context-body"></div>
           </section>
@@ -199,9 +207,6 @@
               <div class="workspace-list" id="tools-list"></div>
             </div>
           </div>
-        </section>
-        <section class="workspace-view hidden" id="delegation-view">
-          <div class="workspace-list" id="delegation-list"></div>
         </section>
         <section class="workspace-view hidden" id="working-diff-view">
           <div class="workspace-view-head">

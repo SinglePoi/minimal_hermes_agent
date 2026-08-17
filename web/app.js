@@ -28,6 +28,7 @@ const API = {
   sessionExport: (id) => "/sessions/" + encodeURIComponent(id) + "/export?format=md",
   sessionDelete: (id) => "/sessions/" + encodeURIComponent(id),
   sessionFork: (id) => "/sessions/" + encodeURIComponent(id) + "/fork",
+  health: "/health",
 };
 
 const STORAGE_KEY = "agent.session";
@@ -66,6 +67,9 @@ const state = {
   clarifyItem: null,
   hasMessages: false,
   loginAvailable: false,
+  terminalHealth: null,
+  lastDiff: null,
+  lastSandbox: "",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -96,17 +100,11 @@ const VIEWS = {
     label: "工作区改动",
     load: refreshWorkingDiff,
   },
-  delegation: {
-    viewId: "delegation-view",
-    label: "委派任务",
-    load: renderDelegationList,
-  },
 };
 const NAV_BUTTONS = {
   archived: "btn-archived",
   plugins: "btn-plugins",
   wdiff: "btn-working-diff",
-  delegation: "btn-delegation",
 };
 
 /* ---------- 工具函数 ---------- */
@@ -196,11 +194,12 @@ function showThread() {
   conversationPane.classList.remove("hidden");
   conversationPane.classList.add("grow");
   conversationPane.classList.remove("fill");
-  contextPanel.classList.remove("hidden");
+  state.currentView = "";
   hideAllViews();
   viewTitle.textContent = state.sessionTitle || "会话";
   state.hasMessages = true;
   updateHeaderActions();
+  syncContextPanel();
 }
 
 function showHome() {
@@ -209,11 +208,26 @@ function showHome() {
   conversationPane.classList.remove("hidden");
   conversationPane.classList.remove("grow");
   conversationPane.classList.add("fill");
-  contextPanel.classList.add("hidden");
+  state.currentView = "";
   hideAllViews();
   viewTitle.textContent = "新对话";
   state.hasMessages = false;
   updateHeaderActions();
+  syncContextPanel();
+}
+
+function setCardVisible(id, visible) {
+  const el = $(id);
+  if (el) el.classList.toggle("hidden", !visible);
+  syncContextPanel();
+}
+
+function syncContextPanel() {
+  if (!contextPanel) return;
+  const inThread = state.hasMessages && !state.currentView;
+  const anyCard = Array.from(contextPanel.querySelectorAll(".context-section"))
+    .some((el) => !el.classList.contains("hidden"));
+  contextPanel.classList.toggle("hidden", !(inThread && anyCard));
 }
 
 function fallbackCopyText(text) {
@@ -380,6 +394,25 @@ function finalizeTray(tray) {
   if (currentTray === tray) currentTray = null;
 }
 
+function parseTerminalBackend(result) {
+  if (!result) return "";
+  try {
+    const data = JSON.parse(result);
+    return (data && data.backend) || "";
+  } catch (e) {
+    return /"backend"\s*:\s*"daytona"/.test(String(result)) ? "daytona" : "";
+  }
+}
+
+function activityTitle(ev) {
+  const type = ev.type || "tool";
+  let title = ev.name || type;
+  if (ev.name === "terminal" && parseTerminalBackend(ev.result) === "daytona") {
+    title += " · Daytona";
+  }
+  return title;
+}
+
 function buildActivityText(ev) {
   const type = ev.type || "tool";
   if (type === "note") {
@@ -414,9 +447,10 @@ function buildActivityItem(ev) {
   const detail = document.createElement("div");
   detail.className = "activity-tool-detail hidden";  // 默认收拢
   detail.textContent = buildActivityText(ev);
+  const stateRef = { ev };
   const render = () => {
     const open = !detail.classList.contains("hidden");
-    head.textContent = (open ? "▾ " : "▸ ") + (ev.name || type);
+    head.textContent = (open ? "▾ " : "▸ ") + activityTitle(stateRef.ev);
   };
   head.addEventListener("click", () => {
     detail.classList.toggle("hidden");
@@ -424,7 +458,7 @@ function buildActivityItem(ev) {
   });
   wrap.append(head, detail);
   render();
-  return { item: wrap, detail };
+  return { item: wrap, detail, render, stateRef };
 }
 
 function renderActivity(ev, tray) {
@@ -432,11 +466,13 @@ function renderActivity(ev, tray) {
   if (!tray || tray.token !== turnToken) return;
   const existing = ev.id !== undefined ? activityById[ev.id] : null;
   if (existing) {
+    if (existing.stateRef) existing.stateRef.ev = ev;
     if (existing.detail) {
       existing.detail.textContent = buildActivityText(ev);
     } else {
       existing.item.textContent = buildActivityText(ev);
     }
+    if (existing.render) existing.render();
     return;
   }
   const built = buildActivityItem(ev);
@@ -445,7 +481,12 @@ function renderActivity(ev, tray) {
   tray.events.push(ev);
   chatEl.scrollTop = chatEl.scrollHeight;
   if (ev.id !== undefined) {
-    activityById[ev.id] = { item: built.item, detail: built.detail || null };
+    activityById[ev.id] = {
+      item: built.item,
+      detail: built.detail || null,
+      render: built.render,
+      stateRef: built.stateRef,
+    };
   }
 }
 
@@ -506,10 +547,7 @@ function renderTodoPanel(todos) {
   if (!box) return;
   box.textContent = "";
   if (!todos || !todos.length) {
-    const empty = document.createElement("div");
-    empty.className = "context-empty";
-    empty.textContent = "暂无任务";
-    box.appendChild(empty);
+    setCardVisible("card-tasks", false);
     return;
   }
   todos.forEach((t) => {
@@ -523,6 +561,7 @@ function renderTodoPanel(todos) {
     row.append(mark, label);
     box.appendChild(row);
   });
+  setCardVisible("card-tasks", true);
 }
 
 function renderDelegationList() {
@@ -531,10 +570,7 @@ function renderDelegationList() {
   box.textContent = "";
   const entries = Object.values(delegationById);
   if (!entries.length) {
-    const empty = document.createElement("div");
-    empty.className = "session-empty";
-    empty.textContent = "暂无委派任务";
-    box.appendChild(empty);
+    setCardVisible("card-delegation", false);
     return;
   }
   entries.forEach((d) => {
@@ -563,6 +599,7 @@ function renderDelegationList() {
     item.append(left, model);
     box.appendChild(item);
   });
+  setCardVisible("card-delegation", true);
 }
 
 function handleDelegationEvent(ev) {
@@ -601,10 +638,7 @@ function renderSources() {
   box.textContent = "";
   const entries = Object.values(sourcesById);
   if (!entries.length) {
-    const empty = document.createElement("div");
-    empty.className = "context-empty";
-    empty.textContent = "暂无来源";
-    box.appendChild(empty);
+    setCardVisible("card-sources", false);
     return;
   }
   entries.forEach((s) => {
@@ -621,6 +655,7 @@ function renderSources() {
     }
     box.appendChild(item);
   });
+  setCardVisible("card-sources", true);
 }
 
 function addSource(entry) {
@@ -636,10 +671,7 @@ function renderOutputs() {
   box.textContent = "";
   const entries = Object.values(outputsById);
   if (!entries.length) {
-    const empty = document.createElement("div");
-    empty.className = "context-empty";
-    empty.textContent = "暂无输出";
-    box.appendChild(empty);
+    setCardVisible("card-outputs", false);
     return;
   }
   entries.forEach((o) => {
@@ -656,6 +688,7 @@ function renderOutputs() {
     }
     box.appendChild(item);
   });
+  setCardVisible("card-outputs", true);
 }
 
 function addOutput(entry) {
@@ -665,15 +698,92 @@ function addOutput(entry) {
   renderOutputs();
 }
 
+function terminalLabel(health) {
+  const env = (health && health.terminal_env) || "local";
+  if (env === "daytona") return "Daytona 云沙箱";
+  if (env === "local") return "本机";
+  return env;
+}
+
+function renderTerminalBadge() {
+  const badge = $("terminal-badge");
+  if (!badge) return;
+  const h = state.terminalHealth;
+  if (!h) {
+    badge.textContent = "终端 · …";
+    badge.className = "terminal-badge";
+    badge.title = "正在探测终端后端";
+    return;
+  }
+  const env = h.terminal_env || "local";
+  const ready = h.terminal_ready !== false;
+  badge.className = "terminal-badge " + (ready ? env : "error");
+  if (!ready) {
+    badge.textContent = "终端 · 未就绪";
+    badge.title = h.terminal_error || "终端后端未就绪";
+  } else if (env === "daytona") {
+    badge.textContent = "终端 · Daytona";
+    badge.title = "Daytona 云沙箱" + (h.terminal_image ? " · " + h.terminal_image : "");
+  } else {
+    badge.textContent = "终端 · 本机";
+    badge.title = "命令在本机执行，危险命令会走审批";
+  }
+}
+
+async function refreshTerminalHealth() {
+  try {
+    const resp = await fetch(API.health);
+    state.terminalHealth = await resp.json();
+  } catch (e) {
+    state.terminalHealth = {
+      ok: false,
+      terminal_env: "local",
+      terminal_ready: false,
+      terminal_error: "服务离线",
+    };
+  }
+  renderTerminalBadge();
+}
+
 function renderEnvironment(data) {
   const box = $("env-info");
   if (!box) return;
   box.textContent = "";
+  const h = state.terminalHealth || {};
+  const term = document.createElement("div");
+  term.className = "context-item context-row";
+  const tLabel = document.createElement("span");
+  tLabel.className = "context-label";
+  tLabel.textContent = "终端";
+  const tVal = document.createElement("span");
+  tVal.className = "context-item-muted";
+  const ready = !h.terminal_env || h.terminal_ready !== false;
+  tVal.textContent = terminalLabel(h) + (ready ? "" : " · 未就绪");
+  term.append(tLabel, tVal);
+  box.appendChild(term);
+  if (h.terminal_env === "daytona" && h.terminal_error) {
+    const err = document.createElement("div");
+    err.className = "context-empty";
+    err.textContent = h.terminal_error;
+    box.appendChild(err);
+  }
+  if (state.lastSandbox) {
+    const last = document.createElement("div");
+    last.className = "context-item";
+    const lastTitle = document.createElement("div");
+    lastTitle.textContent = "最近沙箱输出";
+    const lastMeta = document.createElement("div");
+    lastMeta.className = "context-item-muted";
+    lastMeta.textContent = state.lastSandbox;
+    last.append(lastTitle, lastMeta);
+    box.appendChild(last);
+  }
   if (!data || data.success === false) {
     const empty = document.createElement("div");
     empty.className = "context-empty";
-    empty.textContent = "环境信息加载失败";
+    empty.textContent = "工作区变更加载失败";
     box.appendChild(empty);
+    setCardVisible("card-env", true);
     return;
   }
   const summary = data.summary || {};
@@ -693,11 +803,14 @@ function renderEnvironment(data) {
   delta.append(add, del);
   row.append(label, delta);
   box.appendChild(row);
+  setCardVisible("card-env", true);
 }
 
 async function refreshContextPanel() {
+  await refreshTerminalHealth();
   try {
     const data = await httpJson("GET", API.workingDiff + "?mode=working");
+    state.lastDiff = data;
     renderEnvironment(data);
   } catch (e) {
     renderEnvironment({ success: false });
@@ -722,6 +835,17 @@ function collectContextEvent(ev) {
       addSource({ key: "search-" + args.query, name: args.query, label: "搜索：" + args.query, meta: "网页搜索" });
     } else if ((ev.name === "write_file" || ev.name === "patch") && args.path) {
       addOutput({ path: args.path, action: ev.name });
+    } else if (ev.name === "terminal") {
+      const backend = parseTerminalBackend(ev.result);
+      if (backend === "daytona") {
+        try {
+          const payload = JSON.parse(ev.result || "{}");
+          state.lastSandbox = String(payload.output || payload.error || "已执行").slice(0, 80);
+        } catch (e) {
+          state.lastSandbox = "已执行";
+        }
+        renderEnvironment(state.lastDiff || { success: true, summary: {} });
+      }
     }
   }
 }
@@ -1577,9 +1701,12 @@ async function switchSession(id, title) {
   Object.keys(delegationById).forEach((k) => delete delegationById[k]);
   Object.keys(sourcesById).forEach((k) => delete sourcesById[k]);
   Object.keys(outputsById).forEach((k) => delete outputsById[k]);
+  state.lastSandbox = "";
+  setCardVisible("card-env", false);
   renderDelegationList();
   renderSources();
   renderOutputs();
+  renderTodoPanel([]);
   currentTray = null;
 
   try {
@@ -1939,9 +2066,12 @@ async function sendMessage() {
       Object.keys(delegationById).forEach((k) => delete delegationById[k]);
       Object.keys(sourcesById).forEach((k) => delete sourcesById[k]);
       Object.keys(outputsById).forEach((k) => delete outputsById[k]);
+      state.lastSandbox = "";
+      setCardVisible("card-env", false);
       renderDelegationList();
       renderSources();
       renderOutputs();
+      renderTodoPanel([]);
     } catch (e) {
       appendMessage("error", "创建会话失败：" + e.message);
       return;
@@ -2015,6 +2145,8 @@ function newSession() {
   Object.keys(delegationById).forEach((k) => delete delegationById[k]);
   Object.keys(sourcesById).forEach((k) => delete sourcesById[k]);
   Object.keys(outputsById).forEach((k) => delete outputsById[k]);
+  state.lastSandbox = "";
+  setCardVisible("card-env", false);
   renderDelegationList();
   renderSources();
   renderOutputs();
@@ -2065,7 +2197,6 @@ function bindEvents() {
   $("btn-archived").addEventListener("click", () => toggleView("archived"));
   $("btn-plugins").addEventListener("click", () => toggleView("plugins"));
   $("btn-working-diff").addEventListener("click", () => toggleView("wdiff"));
-  $("btn-delegation").addEventListener("click", () => toggleView("delegation"));
   document.querySelectorAll(".plugin-tab").forEach((btn) => {
     btn.addEventListener("click", () => switchPluginTab(btn.dataset.tab));
   });
@@ -2159,6 +2290,7 @@ function init() {
   inputEl.disabled = false;
   updateSendState();
   inputEl.focus();
+  refreshTerminalHealth();
 }
 
 init();

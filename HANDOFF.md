@@ -47,6 +47,8 @@ skills/                     示例技能包：release-check（发版清单），
 file_tools.py               文件工具：read_file/write_file/search_files + patch（replace + V4A 双模式，
                             模糊匹配/陈旧检测/语法提示）+ 敏感路径保护（对齐 file_tools.py + patch_parser.py
                             + fuzzy_match.py）
+environments/               终端后端：factory（TERMINAL_ENV）+ daytona 云沙箱（对齐
+                            tools/environments/daytona.py，简化版）
 read_extract.py             文档抽取：.docx/.xlsx/.ipynb → 文本（zipfile+XML+JSON，零依赖，对齐
                             tools/read_extract.py；read_file 自动接入）
 todo_tool.py                todo 工具：会话级内存任务清单 + 压缩重注入 + 历史水合
@@ -97,6 +99,7 @@ tests/test_repl_commands.py    REPL 斜杠命令回归测试（零依赖，直�
 tests/test_process_registry.py 后台进程回归测试（零依赖，直接跑）
 tests/test_session_export.py   会话导出回归测试（零依赖，直接跑）
 tests/test_clarify.py          clarify 回归测试（零依赖，直接跑）
+tests/test_daytona.py          Daytona 终端后端回归测试（假 SDK，零依赖，直接跑）
 server.py                    HTTP 服务化：/chat + /chat/stream(SSE) + /approvals/* +
                              /sessions（两步式：POST /sessions 建会话 + /sessions/<id>/chat）+
                              /clarify/* + /skills /plugins /tools + OpenAI 兼容
@@ -924,6 +927,11 @@ python demo_file_tools.py
   不存在）、截断与脱敏、并行白名单（默认串行、声明后并行）、minimal_agent
   集成（run_tool 分发/get_tools/available_tool_names）；test_server.py 新增
   /tools 集成组（配置指向 tests/fake_mcp_server.py 后工具列表含 MCP 工具）
+- 回归测试脚本 `tests/test_daytona.py`（新增，2026-08-17）：TERMINAL_ENV 解析/
+  隔离判定/未知后端/缺密钥、审批跳过（daytona 连硬性禁止也放行）、假 SDK
+  创建/恢复/cleanup/HOME 解析/磁盘封顶/执行/中断、run_terminal 路由与
+  本机路径不受影响、系统提示词注入；`tests/test_approval.py` 新增隔离后端组；
+  `tests/test_process_registry.py` 新增 spawn_via_env 组
 
 ## 已知限制 / 下一步候选
 
@@ -1009,6 +1017,10 @@ cron 审批（用户取消）
   超时（默认 120s）；结果走工具结果落盘回传；网页侧栏新增「委派」视图
   （delegation_id 合并 started/completed 事件，展示任务标题/执行模型/状态图标）。
   异步/批量/多级/checkpoint 未做
+- Daytona 云沙箱终端后端已完成（56）：`environments/daytona.py` +
+  `TERMINAL_ENV=daytona` 把 `terminal` 路由到 Daytona 云沙箱；隔离后端跳过
+  危险命令审批；持久化 stop/恢复；中断 sandbox.stop；后台 spawn_via_env；
+  文件工具仍本机。未做 FileSync / 其余容器后端 / 文件工具进沙箱
 - 网页前端追加（2026-08-13，未提交）：右侧上下文面板——环境信息仅显示
   「变更 +X/-Y」、任务列表（○/◐/✓/✕ 状态图标）、引用来源（memory/web）、
   输出（write_file/patch）；任务列表已从聊天区下方移除，委派任务保留在
@@ -1024,8 +1036,8 @@ cron 审批（用户取消）
 > 请先阅读 `D:\chatbot\minimal_agent\HANDOFF.md` 和该目录的 `README.md`，
 > 了解这个迷你 Agent 骨架的进度与约定。所有代码决策与改动一律参考
 > `D:\space\hermes-agent-main` 的 Hermes 源码对齐。
-> 上次停在这里（2026-08-13）：1~52 全部完成；53=工具结果落盘，54=网站策略，
-> 55=多代理/委派最小切片（delegate_tool.py 同步单层 delegate_task）。
+> 上次停在这里（2026-08-17）：1~55 全部完成；56=Daytona 云沙箱终端后端
+> （`environments/`，`TERMINAL_ENV=local|daytona`）。
 > 另追加网页前端：侧栏「委派」视图 + 右侧上下文面板（环境信息仅“变更 +X/-Y”、
 > 任务列表（○/◐/✓/✕ 图标）、引用来源（memory/web）、输出（write_file/patch））。
 > 注意：这批改动尚未 git 提交；工作区还有未跟踪的 `build/` 目录（测试产物），

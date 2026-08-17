@@ -808,14 +808,25 @@ def _smart_approve(command: str, description: str, client) -> str:
         return "escalate"
 
 
+def should_skip_container_guards(env_type: str) -> bool:
+    """隔离容器后端是否跳过危险命令审批（对齐 Hermes _should_skip_container_guards）。
+
+    Daytona 等云沙箱本身就是安全边界，沙箱内的破坏性命令伤不到宿主机，
+    因此跳过审批（含硬性禁止）。骨架目前只有 daytona 属于隔离后端。
+    """
+    return (env_type or "").strip().lower() in {"daytona"}
+
+
 def check_dangerous_command(
     command: str,
     session_key: str,
     client=None,
+    env_type: str = "local",
 ) -> dict[str, Any]:
     """执行前统一审批门卫：检测 + 会话/永久审批 + 交互提示（对齐 Hermes）。
 
     顺序与 Hermes 一致：
+    0. 隔离容器后端（daytona）→ 直接放行（沙箱即安全边界）
     1. 硬性禁止地板（无条件阻止，不给“允许”选项）
     2. 永久允许列表精确/glob 匹配 → 直接放行
     3. 危险模式检测；未命中 → 放行
@@ -829,6 +840,10 @@ def check_dangerous_command(
 
     返回 dict：{"approved": bool, "message": str|None, ...}
     """
+    # 0. 隔离容器后端：沙箱即安全边界，跳过审批（对齐 Hermes）
+    if should_skip_container_guards(env_type):
+        return {"approved": True, "message": None, "skipped_container_guards": True}
+
     # 1. 硬性禁止
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:

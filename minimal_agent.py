@@ -76,6 +76,7 @@ from todo_tool import (
     todo_tool,
 )
 import delegate_tool
+import environments
 from file_tools import (
     patch_file_tool,
     read_file_tool,
@@ -166,7 +167,11 @@ SYSTEM_PROMPT = """你是「小助手」，一个乐于助人的 AI 助手。
     （新闻、资料、事实核查等）时用 web_search / web_fetch，不要用 terminal 模拟联网。
 13. 用 skill_view 加载技能后，如果返回里带 setup_needed 或 missing_required_*
     （技能缺少所需环境变量/命令，未就绪），要如实告诉用户缺什么、怎么补齐；
-    不要假装技能可用，也不要编造技能内容。"""
+    不要假装技能可用，也不要编造技能内容。
+14. terminal 工具的执行位置由 TERMINAL_ENV 决定：local（默认）在本机执行，
+    危险命令会先过审批；daytona 在 Daytona 云沙箱（Linux）中执行，沙箱即隔离
+    边界，危险命令审批会跳过。文件工具（read_file/write_file/patch）始终操作
+    本机工作区，不会自动同步进沙箱——要在沙箱里放文件请用 terminal 写入。"""
 
 
 def load_system_prompt() -> str:
@@ -286,6 +291,9 @@ def build_system_prompt(manager: MemoryManager | None = None) -> str:
         ext_block = manager.build_system_prompt()
         if ext_block:
             prompt += "\n\n" + ext_block
+    backend_block = environments.build_terminal_backend_prompt()
+    if backend_block:
+        prompt += "\n\n" + backend_block
     return prompt
 
 
@@ -1196,9 +1204,12 @@ TOOLS = [
         "function": {
             "name": "terminal",
             "description": (
-                "在本地机器上执行一条 shell 命令（Windows 下为系统默认 shell cmd；"
+                "执行一条 shell 命令。默认在本机执行（Windows 下为系统默认 shell cmd；"
                 "PowerShell 专属命令请写成 powershell -Command \"...\"）。"
-                "危险命令（删除、格式化、关机、SQL DROP 等）会先征求用户批准；"
+                "当 TERMINAL_ENV=daytona 时在 Daytona 云沙箱（Linux）中执行，"
+                "危险命令审批会跳过（沙箱即隔离边界）；文件工具仍操作本机，"
+                "要在沙箱里放文件请用本工具写入（cat/heredoc）。"
+                "危险命令（删除、格式化、关机、SQL DROP 等）在本机模式下会先征求用户批准；"
                 "返回 JSON，含 exit_code 与 output。"
                 "长任务（构建/安装/起服务等）设 background=true 转后台立即返回 "
                 "session_id，再用 process 工具 poll/wait/kill 管理，不阻塞对话。"
@@ -1339,6 +1350,7 @@ TOOLS = [
             "name": "read_file",
             "description": (
                 "分页读取文本文件（带行号）。敏感文件（.env、密钥、系统配置等）会拒绝读取。"
+                "配置了 WORKSPACE_ROOT 时只能读取该工作区内的文件。"
                 ".docx / .xlsx / .ipynb 文档会自动抽取成文本再分页返回。"
                 "参数 path 是文件路径，offset 起始行（默认 1），limit 每页行数（默认 200）。"
             ),
@@ -1360,6 +1372,7 @@ TOOLS = [
             "description": (
                 "写入文本文件（覆盖同名文件，自动创建父目录）。"
                 "敏感文件（.env、approval_allowlist.json、密钥、系统目录等）会拒绝写入。"
+                "配置了 WORKSPACE_ROOT 时只能写入该工作区内。"
             ),
             "parameters": {
                 "type": "object",
@@ -1379,7 +1392,7 @@ TOOLS = [
                 "修改文件。mode=replace（默认）：找到 old_string 换成 new_string，"
                 "支持模糊匹配兜底，old_string 必须唯一（除非 replace_all=true）。"
                 "mode=patch：V4A 补丁格式批量操作（*** Update/Add/Delete/Move File:），"
-                "先校验后应用。敏感文件（.env 等）与 .. 穿越路径一律拒绝。"
+                "先校验后应用。敏感文件（.env 等）、.. 穿越、以及 WORKSPACE_ROOT 之外的路径一律拒绝。"
             ),
             "parameters": {
                 "type": "object",
@@ -1402,6 +1415,7 @@ TOOLS = [
             "description": (
                 "在目录下递归搜索文件名或文件内容（大小写不敏感），返回匹配文件与命中行。"
                 "敏感文件（.env 等）与排除目录（.git、__pycache__ 等）会被跳过。"
+                "配置了 WORKSPACE_ROOT 时搜索起点必须在工作区内。"
             ),
             "parameters": {
                 "type": "object",
@@ -1594,6 +1608,39 @@ def _run_terminal_interruptible(
     )
 
 
+def _payload_from_daytona(result: dict[str, Any], command: str, approval: dict[str, Any]) -> str:
+    """把 Daytona execute 结果整理成 terminal 工具的 JSON 返回。"""
+    output = _clean_terminal_output(str(result.get("output") or ""), command).strip()
+    error = str(result.get("error") or "").strip()
+    if result.get("cancelled"):
+        return json.dumps(
+            {
+                "backend": "daytona",
+                "success": False,
+                "exit_code": -1,
+                "output": output,
+                "error": error or "命令被用户中断",
+                "status": "cancelled",
+            },
+            ensure_ascii=False,
+        )
+    code = int(result.get("returncode") if result.get("returncode") is not None else 1)
+    payload: dict[str, Any] = {
+        "backend": "daytona",
+        "success": code == 0 and not error,
+        "exit_code": code,
+        "output": output,
+    }
+    if error:
+        payload["error"] = error
+    if approval.get("user_approved"):
+        payload["approval"] = (
+            f"Command required approval ({approval.get('description', 'flagged')}) "
+            "and was approved by the user."
+        )
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def run_terminal(
     command: str,
     session_key: str,
@@ -1602,16 +1649,18 @@ def run_terminal(
     client=None,
     interrupt_event: Any = None,
 ) -> str:
-    """执行本地 shell 命令：先过审批门卫，再运行（对齐 Hermes terminal_tool）。
+    """执行 shell 命令：先过审批门卫，再在本机或 Daytona 沙箱运行。
 
-    审批逻辑在 approval.check_dangerous_command()：危险命令需用户批准
-    （once/session/always/deny），拒绝或超时返回 BLOCKED 消息且不执行。
-    client 供 APPROVAL_MODE=smart 时辅助 LLM 评估用（没有也能跑，落回人工审批）。
-    interrupt_event 置位时立即杀掉子进程并返回 cancelled（对齐 Hermes 线程级中断信号）。
-    返回结构与 Hermes terminal_tool 一致：JSON 的 output / exit_code / error 字段，
-    用户批准过则附带 approval 说明。
+    对齐 Hermes terminal_tool：TERMINAL_ENV 选择后端；隔离后端（daytona）
+    跳过危险命令审批。审批逻辑在 approval.check_dangerous_command()。
+    client 供 APPROVAL_MODE=smart 时辅助 LLM 评估用。
+    interrupt_event 置位时立即中断（本机杀进程树 / Daytona sandbox.stop）。
+    返回 JSON：output / exit_code / error，Daytona 额外带 backend=daytona。
     """
-    approval = check_dangerous_command(command, session_key, client=client)
+    env_type = environments.get_terminal_env()
+    approval = check_dangerous_command(
+        command, session_key, client=client, env_type=env_type
+    )
     if not approval.get("approved"):
         console.print(
             Panel(
@@ -1629,6 +1678,69 @@ def run_terminal(
             },
             ensure_ascii=False,
         )
+
+    if env_type != "local":
+        ready, err = environments.check_backend_ready(env_type)
+        if not ready:
+            return json.dumps(
+                {
+                    "success": False,
+                    "exit_code": -1,
+                    "output": "",
+                    "error": err,
+                    "backend": env_type,
+                },
+                ensure_ascii=False,
+            )
+        try:
+            env = environments.get_environment()
+        except Exception as exc:
+            return json.dumps(
+                {
+                    "success": False,
+                    "exit_code": -1,
+                    "output": "",
+                    "error": f"创建 {env_type} 沙箱失败：{exc}",
+                    "backend": env_type,
+                },
+                ensure_ascii=False,
+            )
+        if env is None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "exit_code": -1,
+                    "output": "",
+                    "error": f"终端后端 {env_type} 未创建成功",
+                    "backend": env_type,
+                },
+                ensure_ascii=False,
+            )
+        if background:
+            return json.dumps(
+                process_registry.spawn_via_env(
+                    command,
+                    execute_fn=lambda: env.execute(command, timeout=timeout),
+                    cancel_fn=env.cancel,
+                ),
+                ensure_ascii=False,
+            )
+        try:
+            result = env.execute(
+                command, timeout=timeout, interrupt_event=interrupt_event
+            )
+            return _payload_from_daytona(result, command, approval)
+        except Exception as exc:
+            return json.dumps(
+                {
+                    "success": False,
+                    "exit_code": -1,
+                    "output": "",
+                    "error": f"沙箱执行失败：{exc}",
+                    "backend": env_type,
+                },
+                ensure_ascii=False,
+            )
 
     # 后台模式：登记到 process_registry 立即返回 session_id，
     # 后续用 process 工具 poll/wait/kill 管理（对齐 Hermes terminal background=true）
@@ -2546,6 +2658,14 @@ def main():
         except Exception as exc:
             console.print(f"[yellow]⚠️ 加载 provider {provider_name} 失败：{exc}[/yellow]")
 
+    terminal_env = environments.get_terminal_env()
+    if terminal_env != "local":
+        ready, err = environments.check_backend_ready(terminal_env)
+        if ready:
+            console.print(f"[dim]🖥️ 终端后端：{terminal_env}（隔离沙箱，跳过危险命令审批）[/dim]")
+        else:
+            console.print(f"[yellow]⚠️ 终端后端 {terminal_env} 未就绪：{err}[/yellow]")
+
     # 恢复历史会话（对齐 Hermes 的 /resume：加载 conversation_history）
     messages: list[dict[str, Any]] = []
     if resume_id:
@@ -2727,6 +2847,8 @@ def main():
         console.print(f"[dim]🧹 已终止 {bg_killed} 个后台进程[/dim]")
     # MCP 子进程兜底清理（防退出后残留外部 MCP 服务器进程）
     mcp_client.shutdown_mcp()
+    # Daytona 等远程沙箱退出清理（持久化则 stop，否则 delete）
+    environments.cleanup_environments()
     console.print(
         f"\n[dim]会话已保存。下次用 --resume {repl_state.session_id} 继续对话。[/dim]"
     )

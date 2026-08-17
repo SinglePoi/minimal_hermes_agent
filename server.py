@@ -78,6 +78,7 @@ import skills  # noqa: E402
 import title_generator  # noqa: E402
 import working_diff  # noqa: E402
 import process_registry  # noqa: E402
+import environments  # noqa: E402
 import session_export  # noqa: E402
 import clarify  # noqa: E402
 import server_logging  # noqa: E402
@@ -489,6 +490,8 @@ class AgentServer:
         process_registry.shutdown_all()
         # MCP 子进程兜底清理：服务退出即终止外部 MCP 服务器进程（防孤儿）
         mcp_client.shutdown_mcp()
+        # Daytona 等远程沙箱退出清理
+        environments.cleanup_environments()
         for session_id in list(self.sessions):
             unregister_gateway_notify(session_id)
             clarify.unregister_clarify_notify(session_id)
@@ -726,7 +729,17 @@ class _Handler(BaseHTTPRequestHandler):
     def _handle_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/health":
-            self._send_json(200, {"ok": True})
+            env_type = environments.get_terminal_env()
+            ready, err = environments.check_backend_ready(env_type)
+            payload = {
+                "ok": True,
+                "terminal_env": env_type,
+                "terminal_ready": ready,
+                "terminal_error": err,
+            }
+            if env_type == "daytona":
+                payload["terminal_image"] = environments.get_daytona_config()["image"]
+            self._send_json(200, payload)
             return
         if parsed.path == "/login":
             self._serve_static("login.html")
@@ -1567,6 +1580,13 @@ def run_server(
     server = _Server((host, port), app)
     try:
         print(f"🌐 服务已启动：http://{host}:{port}（Ctrl+C 停止）")
+        terminal_env = environments.get_terminal_env()
+        if terminal_env != "local":
+            ready, err = environments.check_backend_ready(terminal_env)
+            if ready:
+                print(f"🖥️ 终端后端：{terminal_env}")
+            else:
+                print(f"⚠️ 终端后端 {terminal_env} 未就绪：{err}")
         server.serve_forever()
     except KeyboardInterrupt:
         pass

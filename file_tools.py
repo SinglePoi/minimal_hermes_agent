@@ -14,6 +14,9 @@
     - 文件工具侧由 _check_sensitive_path 拦：系统目录、.env、
       approval_allowlist.json（本骨架的安全策略文件）、~/.ssh、密钥文件、
       shell 启动文件、docker.sock——两侧都堵上才没有绕过路径
+    - WORKSPACE_ROOT（可选）：配置后 read/write/patch/search 只能落在该目录内
+      （相对路径也锚定到此根；出界用 Path.relative_to 拒绝，对齐 Hermes
+      context_references / file_tools 的 workspace 边界检查）
     - Hermes 对敏感文件读取用 agent/redact.py 做脱敏；骨架无脱敏模块，
       因此读 .env / 密钥类文件直接拒绝（更保守的简化，文档注明）
 
@@ -68,11 +71,56 @@ _USER_SENSITIVE_FILES = frozenset({
 })
 
 
-def _normalize_path(filepath: str) -> Path:
-    """把用户给的路径规范成绝对路径（展开 ~、统一大小写）。"""
-    expanded = Path(filepath).expanduser()
+def _workspace_root() -> Optional[Path]:
+    """读取 WORKSPACE_ROOT：已配置则返回规范化绝对路径，未配置返回 None。"""
+    raw = (os.environ.get("WORKSPACE_ROOT") or "").strip()
+    if not raw:
+        return None
+    expanded = Path(raw).expanduser()
     candidate = expanded if expanded.is_absolute() else Path.cwd() / expanded
     return Path(os.path.normcase(os.path.abspath(str(candidate))))
+
+
+def _canonical_path(path: Path) -> Path:
+    """绝对路径 + 解开符号链接 + 统一大小写（工作区边界比较用）。"""
+    return Path(os.path.normcase(os.path.realpath(str(path))))
+
+
+def _normalize_path(filepath: str) -> Path:
+    """把用户给的路径规范成绝对路径（展开 ~、统一大小写）。
+
+    相对路径：配置了 WORKSPACE_ROOT 时锚定到工作区根，否则跟进程 cwd
+    （对齐 Hermes file_tools 相对路径解析到 workspace/terminal cwd）。
+    """
+    expanded = Path(filepath).expanduser()
+    if expanded.is_absolute():
+        candidate = expanded
+    else:
+        base = _workspace_root() or Path.cwd()
+        candidate = base / expanded
+    return Path(os.path.normcase(os.path.abspath(str(candidate))))
+
+
+def _check_workspace_path(filepath: str) -> Optional[str]:
+    """WORKSPACE_ROOT 已配置时，路径必须落在工作区内；出界返回错误消息。
+
+    用 realpath + Path.relative_to 判定（对齐 Hermes），避免
+    ``workspace-evil`` 前缀误伤，也挡住工作区内符号链接指到区外。
+    未配置 WORKSPACE_ROOT 时不限制。
+    """
+    root = _workspace_root()
+    if root is None:
+        return None
+    resolved = _canonical_path(_normalize_path(filepath))
+    root_real = _canonical_path(root)
+    try:
+        resolved.relative_to(root_real)
+    except ValueError:
+        return (
+            f"Path is outside the allowed workspace: {filepath}\n"
+            f"Workspace root: {root_real}"
+        )
+    return None
 
 
 def _check_sensitive_path(filepath: str) -> Optional[str]:
@@ -138,6 +186,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 200) -> str:
     """
     offset = max(1, int(offset or 1))
     limit = max(1, min(int(limit or 200), 2000))
+    blocked = _check_workspace_path(path)
+    if blocked:
+        return _error(blocked)
     resolved = _normalize_path(path)
     if not resolved.is_file():
         return _error(f"文件不存在：{path}")
@@ -241,6 +292,9 @@ def write_file_tool(path: str, content: str) -> str:
 
     自动创建父目录；返回实际写入的绝对路径（resolved_path）。同名覆盖写入。
     """
+    blocked = _check_workspace_path(path)
+    if blocked:
+        return _error(blocked)
     sensitive = _check_sensitive_path(path)
     if sensitive:
         return _error(sensitive)
@@ -290,7 +344,10 @@ def patch_file_tool(
     if mode != "replace":
         return _error(f"未知 mode：{mode}（支持 replace / patch）")
 
-    # 1. 写操作先查"证件"：敏感路径一律拒绝
+    # 1. 写操作先查"证件"：工作区牢笼 + 敏感路径一律拒绝
+    blocked = _check_workspace_path(path)
+    if blocked:
+        return _error(blocked)
     sensitive = _check_sensitive_path(path)
     if sensitive:
         return _error(sensitive)
@@ -833,6 +890,9 @@ def _v4a_key(path: str) -> str:
 
 def _v4a_load(path: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """读取文件并归一化换行：返回 (LF 内容, BOM, 行尾) 或 (None, None, 错误)。"""
+    blocked = _check_workspace_path(path)
+    if blocked:
+        return None, None, blocked
     resolved = _normalize_path(path)
     if not resolved.is_file():
         return None, None, f"文件不存在：{path}"
@@ -848,6 +908,9 @@ def _v4a_load(path: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
 
 def _v4a_save(path: str, lf_content: str, had_bom: bool, file_ending: str) -> Optional[str]:
     """按原 BOM/行尾写回文件；写失败返回错误消息。"""
+    blocked = _check_workspace_path(path)
+    if blocked:
+        return blocked
     resolved = _normalize_path(path)
     content = lf_content.replace("\n", file_ending) if file_ending == "\r\n" else lf_content
     if had_bom:
@@ -1158,6 +1221,9 @@ def _patch_v4a(patch_content: str) -> str:
                 f"V4A patch header contains '..' traversal: {header!r}. "
                 "Use the agent's cwd-relative path (no '..') or an absolute path."
             )
+        blocked = _check_workspace_path(header)
+        if blocked:
+            return _error(blocked)
         sensitive = _check_sensitive_path(header)
         if sensitive:
             return _error(sensitive)
@@ -1197,6 +1263,9 @@ def search_files_tool(path: str, pattern: str) -> str:
     if not pattern:
         return _error("pattern 不能为空")
 
+    blocked = _check_workspace_path(path)
+    if blocked:
+        return _error(blocked)
     root = _normalize_path(path)
     if not root.exists():
         return _error(f"路径不存在：{path}")
@@ -1213,6 +1282,8 @@ def search_files_tool(path: str, pattern: str) -> str:
         if any(part in EXCLUDED_DIRS for part in rel.parts):
             continue
         if candidate.name in _SENSITIVE_FILE_NAMES or candidate.name in _USER_SENSITIVE_FILES:
+            continue
+        if _check_workspace_path(str(candidate)):
             continue
 
         name_hit = needle in candidate.name.lower()

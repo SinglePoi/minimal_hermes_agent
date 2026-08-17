@@ -65,6 +65,8 @@
     敏感检查再写）、`search_files`（文件名/内容递归搜索）；写 `.env`、
     `approval_allowlist.json`、`~/.ssh`、密钥文件、系统目录一律拒绝——与终端审批
     组成"配对门"，堵住绕过路径（对齐 Hermes `tools/file_tools.py` 的 `_check_sensitive_path`）；
+    可选 `WORKSPACE_ROOT`：配置后文件工具只能操作该目录（相对路径也锚定到此根，
+    出界用 `Path.relative_to` 拒绝，对齐 Hermes workspace 边界）；
     三个工具已接入并行规划器的路径重叠检测（写同一文件排队、读写同路径顺序）
 13. **敏感文本脱敏**：`redact.py` 对齐 Hermes `agent/redact.py`——sk-/ghp_/glpat- 等
     前缀密钥、`KEY=value`、JSON/YAML 配置、Authorization 头、JWT、私钥块、URL
@@ -476,6 +478,18 @@
       事件，列表展示任务标题 / 执行模型 / 状态图标（运行中转圈/完成✓/失败✕），
       切换会话后可重放
     - 未做（Hermes 有）：异步后台子代理、批量 fan-out、多级委派、checkpoint
+51. **Daytona 云沙箱终端后端**（2026-08-17，对齐 Hermes `tools/environments/daytona.py`
+    核心语义，简化版）：
+    - `TERMINAL_ENV=daytona` 时 `terminal` 在 Daytona 云沙箱（Linux）执行，
+      沙箱即隔离边界，危险命令审批跳过（含硬性禁止）；默认 `local` 行为不变
+    - 持久化：按 `agent-{task_id}` 恢复已有沙箱，退出时 stop 而非 delete
+      （`TERMINAL_CONTAINER_PERSISTENT=false` 则 delete）；磁盘超过 10 GiB 封顶
+    - 中断：`interrupt_event` 置位时 `sandbox.stop()`；后台 `background=true`
+      走 `spawn_via_env`，`process` 工具 poll/wait/kill 仍可用
+    - 文件工具（read_file/write_file/patch）仍操作本机，不自动同步进沙箱
+      （系统提示词会写明）；密钥 `DAYTONA_API_KEY` 只从环境变量注入
+    - 未做（Hermes 有）：FileSyncManager 凭据/技能同步、init_session 会话快照、
+      docker/ssh/modal 等其余后端
 
 ## 你需要准备的
 
@@ -583,7 +597,7 @@ python server.py                 # 默认 127.0.0.1:8000
 | `/clarify/resolve` | POST | `{"session_id", "clarify_id"?, "answer"}` 回答澄清问题 |
 | `/approvals/pending` | GET | `?session_id=xxx` → 当前待审批项 |
 | `/approvals/resolve` | POST | `{"session_id", "choice": "once\|session\|always\|deny", "reason"?}` |
-| `/health` | GET | 探活 |
+| `/health` | GET | 探活（含当前 `terminal_env`） |
 | `/login` | GET | 登录页（`web/login.html`，公开） |
 | `/api/auth/config` | GET | 登录可用性探测（公开，前端 401 时决定跳登录页还是弹 token 框） |
 | `/api/auth/login` | POST | `{"username", "password"}` → 成功种 HttpOnly session cookie |
@@ -638,6 +652,13 @@ python server.py                 # 默认 127.0.0.1:8000
 | `WEBSITE_POLICY_ENABLED` | 网站访问策略开关（开启后 web_search/web_fetch 拒绝命中名单的域名） | `false` |
 | `WEBSITE_POLICY_DENY` | 禁访域名名单（`;` 分隔，支持 `*.domain.com` 通配；空 = 不额外拦截） | 空 |
 | `DELEGATE_TIMEOUT_SECONDS` | delegate_task 子代理同步运行超时秒数（超时后中断子代理） | `120` |
+| `TERMINAL_ENV` | 终端后端：`local`（本机）/ `daytona`（Daytona 云沙箱） | `local` |
+| `DAYTONA_API_KEY` | Daytona API Key（`TERMINAL_ENV=daytona` 时必填） | 空 |
+| `TERMINAL_DAYTONA_IMAGE` | Daytona 沙箱镜像 | `nikolaik/python-nodejs:python3.11-nodejs20` |
+| `TERMINAL_CONTAINER_CPU` | 沙箱 CPU 核数 | `1` |
+| `TERMINAL_CONTAINER_MEMORY` | 沙箱内存（MB，会换算成 GiB） | `5120` |
+| `TERMINAL_CONTAINER_DISK` | 沙箱磁盘（MB，Daytona 上限 10 GiB） | `10240` |
+| `TERMINAL_CONTAINER_PERSISTENT` | 退出时 stop 保留文件系统（false 则 delete） | `true` |
 
 > 鉴权与审计：`SERVER_AUTH_TOKEN` 是生产密钥，只从环境变量注入；前端 401 时会弹出
 > token 输入框并自动重试，token 只存浏览器 localStorage。审计日志与 Hermes 的
@@ -813,6 +834,23 @@ python minimal_agent.py
 > `cmd /c` 与 `powershell` 前缀形式，本骨架按用户要求补上了裸命令拦截（安全加固，
 > 有意超出 Hermes 模式表）；`-EncodedCommand` 等混淆形式同样拦截。
 
+## 体验 Daytona 云沙箱
+
+把 `terminal` 从本机切到 [Daytona](https://daytona.io) 云沙箱（Linux），适合跑不信任代码
+或不想污染本机环境的命令。沙箱即隔离边界，危险命令审批会跳过。
+
+```powershell
+pip install daytona
+# 在 .env 里填：
+#   TERMINAL_ENV=daytona
+#   DAYTONA_API_KEY=你的key
+python minimal_agent.py "在沙箱里执行 uname -a 和 python --version"
+```
+
+退出时默认 stop 沙箱（文件系统保留，下次按 `agent-default` 恢复）；
+设 `TERMINAL_CONTAINER_PERSISTENT=false` 则 delete。文件工具仍操作本机工作区，
+要在沙箱里放文件请用 `terminal` 写入（cat/heredoc）。
+
 ## 跑回归测试
 
 审批模块带一套零依赖回归测试（纯 Python 断言，无需 pytest）：
@@ -835,6 +873,7 @@ python tests/test_server.py
 python tests/test_skills_preconditions.py
 python tests/test_read_extract.py
 python tests/test_todo_tool.py
+python tests/test_daytona.py
 ```
 
 覆盖危险/硬性模式检测、deny/session/always 审批分支、允许列表落盘重载、
@@ -1122,6 +1161,7 @@ python server.py
 | 工具结果落盘 `tool_result_storage.py` | `tools/tool_result_storage.py`（maybe_persist_tool_result / enforce_turn_budget；骨架简化：直接 Path.write_text 写本地目录，无 sandbox env.execute） |
 | 网站策略 `website_policy.py` | `tools/website_policy.py`（check_website_access / 域名归一化 + fnmatch；骨架简化：环境变量名单，无 config.yaml / shared_files） |
 | 多代理/委派 `delegate_tool.py` | `tools/delegate_tool.py`（delegate_task 核心语义、DELEGATE_BLOCKED_TOOLS；骨架简化：仅同步单层子代理，无 async_delegation / 批量 / 多级 / checkpoint） |
+| Daytona 终端后端 `environments/daytona.py` | `tools/environments/daytona.py` + `tools/terminal_tool.py` 的 `_create_environment` / `_should_skip_container_guards`（骨架简化：仅 local+daytona，无 FileSync / init_session / docker/ssh/modal） |
 
 骨架当前简化掉（或有意不做）的工业级细节：文件锁、注入威胁扫描、外部漂移检测、
 会话压缩后的 lineage 去重（压缩黑洞处理）、Skills 的 hub/组织同步/插件命名空间、
@@ -1140,7 +1180,8 @@ REPL 斜杠命令/后台终端/会话导出/clarify/两步式会话 API/OpenAI �
   服务化+前端/鉴权审计登录/会话删除标题 fork/联网/时间工具/turn budget/中断语义/
   LLM 自动标题/终端输出清洗/working_diff+网页工作区视图/LLM 重试/REPL 斜杠命令/
   后台终端/会话导出/clarify 中途问用户/两步式会话 API/OpenAI 兼容接口/
-  服务化日志+手动启动/MCP 客户端/工具结果落盘/网站策略/多代理委派最小切片
+  服务化日志+手动启动/MCP 客户端/工具结果落盘/网站策略/多代理委派最小切片/
+  Daytona 云沙箱终端后端
   （详见 README 功能列表）
 - 待办（详见 HANDOFF"待办模块"）：ACP → 澄清增强等小件（运维剩余
   Task Scheduler / Windows 服务可选；多代理异步/批量/多级增强可选）

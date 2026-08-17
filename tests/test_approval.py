@@ -237,6 +237,22 @@ def test_terminal_interrupt() -> None:
     check("运行中中断 -> cancelled", box.get("r", {}).get("status") == "cancelled")
 
 
+def test_skip_container_guards() -> None:
+    """隔离后端（daytona）跳过审批；local 硬性禁止仍拦截。"""
+    skipped = approval.check_dangerous_command(
+        "rm -rf /", "sess-dtn-skip", env_type="daytona"
+    )
+    check(
+        "daytona 跳过硬性禁止",
+        skipped.get("approved") is True
+        and skipped.get("skipped_container_guards") is True,
+    )
+    blocked = approval.check_dangerous_command(
+        "rm -rf /", "sess-local-skip", env_type="local"
+    )
+    check("local 硬性禁止仍拦截", blocked.get("approved") is False)
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果（失败时返回非零退出码）。"""
     print("== 危险命令审批回归测试 ==")
@@ -247,6 +263,7 @@ def main() -> None:
         test_terminal_tool,
         test_terminal_stdin_devnull,
         test_terminal_interrupt,
+        test_skip_container_guards,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

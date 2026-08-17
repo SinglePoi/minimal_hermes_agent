@@ -11,6 +11,7 @@
     - patch：replace 模式（唯一/多次/replace_all/已应用/CRLF）+ 模糊匹配兜底
     - V4A 补丁：Update/Add/Delete/Move、多 hunk 已应用跳过、校验失败零写入、
       .. 穿越/敏感路径拒绝、陈旧检测（对齐 Hermes patch_parser/fuzzy_match/file_state）
+    - WORKSPACE_ROOT：出界拒绝、相对路径锚定、未配置不限制
 """
 
 import json
@@ -30,6 +31,7 @@ for stream in (sys.stdout, sys.stderr):
 
 from file_tools import (  # noqa: E402
     _check_sensitive_path,
+    _check_workspace_path,
     _v4a_apply,
     _v4a_validate,
     fuzzy_find_and_replace,
@@ -40,6 +42,9 @@ from file_tools import (  # noqa: E402
     search_files_tool,
     write_file_tool,
 )
+
+# 现有用例在临时目录操作；测试进程内先拿掉开发者本机的 WORKSPACE_ROOT
+_SAVED_WORKSPACE_ROOT = os.environ.pop("WORKSPACE_ROOT", None)
 
 
 _failures: list[str] = []
@@ -431,6 +436,99 @@ def test_sensitive_path_checks() -> None:
         check(".bashrc 敏感", _check_sensitive_path("~/.bashrc") is not None)
 
 
+def test_workspace_root() -> None:
+    """WORKSPACE_ROOT：出界拒绝、相对路径锚定到工作区、未配置不限制。"""
+    old = os.environ.get("WORKSPACE_ROOT")
+    old_cwd = os.getcwd()
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            ws = base / "ws"
+            outside = base / "outside"
+            ws.mkdir()
+            outside.mkdir()
+            (ws / "ok.txt").write_text("inside\n", encoding="utf-8")
+            (outside / "secret.txt").write_text("leaked\n", encoding="utf-8")
+            os.environ["WORKSPACE_ROOT"] = str(ws)
+
+            data = json.loads(read_file_tool(str(ws / "ok.txt")))
+            check("工作区内可读", data["success"] is True and "inside" in data["content"])
+
+            data = json.loads(read_file_tool(str(outside / "secret.txt")))
+            check(
+                "工作区外 read 拒绝",
+                data["success"] is False
+                and "outside the allowed workspace" in data.get("error", ""),
+            )
+
+            data = json.loads(write_file_tool(str(outside / "x.txt"), "nope"))
+            check("工作区外 write 拒绝", data["success"] is False)
+            check("工作区外未落盘", not (outside / "x.txt").exists())
+
+            data = json.loads(write_file_tool(str(ws / "new.txt"), "ok"))
+            check(
+                "工作区内 write 允许",
+                data["success"] is True
+                and (ws / "new.txt").read_text(encoding="utf-8") == "ok",
+            )
+
+            data = json.loads(search_files_tool(str(outside), "leaked"))
+            check("工作区外 search 拒绝", data["success"] is False)
+
+            data = json.loads(search_files_tool(str(ws), "inside"))
+            check("工作区内 search 允许", data["success"] is True)
+
+            os.chdir(str(outside))
+            data = json.loads(read_file_tool("ok.txt"))
+            check("相对路径锚定工作区", data["success"] is True and "inside" in data["content"])
+
+            data = json.loads(read_file_tool(str(Path("..") / "outside" / "secret.txt")))
+            check("相对路径逃逸拒绝", data["success"] is False)
+            os.chdir(old_cwd)
+
+            data = json.loads(patch_file_tool(str(outside / "secret.txt"), "leaked", "changed"))
+            check("工作区外 patch 拒绝", data["success"] is False)
+
+            data = json.loads(patch_file_tool(
+                mode="patch",
+                patch=(
+                    "*** Begin Patch\n"
+                    f"*** Add File: {outside / 'evil.txt'}\n"
+                    "+x\n"
+                    "*** End Patch\n"
+                ),
+                path="", old_string="", new_string="",
+            ))
+            check(
+                "工作区外 V4A 拒绝",
+                data["success"] is False
+                and "outside the allowed workspace" in data.get("error", ""),
+            )
+            check("工作区外 V4A 未落盘", not (outside / "evil.txt").exists())
+
+            check(
+                "_check_workspace_path 出界有消息",
+                _check_workspace_path(str(outside / "secret.txt")) is not None,
+            )
+            check(
+                "_check_workspace_path 区内 None",
+                _check_workspace_path(str(ws / "ok.txt")) is None,
+            )
+
+            os.environ.pop("WORKSPACE_ROOT", None)
+            data = json.loads(read_file_tool(str(outside / "secret.txt")))
+            check(
+                "未配置 WORKSPACE_ROOT 不限制",
+                data["success"] is True and "leaked" in data["content"],
+            )
+    finally:
+        os.chdir(old_cwd)
+        if old is None:
+            os.environ.pop("WORKSPACE_ROOT", None)
+        else:
+            os.environ["WORKSPACE_ROOT"] = old
+
+
 def main() -> None:
     """依次运行全部测试并汇总结果。"""
     print("== 文件工具回归测试 ==")
@@ -446,6 +544,7 @@ def main() -> None:
         test_v4a_security,
         test_v4a_stale_detection,
         test_sensitive_path_checks,
+        test_workspace_root,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()
@@ -459,4 +558,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if _SAVED_WORKSPACE_ROOT is None:
+            os.environ.pop("WORKSPACE_ROOT", None)
+        else:
+            os.environ["WORKSPACE_ROOT"] = _SAVED_WORKSPACE_ROOT

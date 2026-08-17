@@ -236,6 +236,8 @@ def test_health_and_pending() -> None:
     try:
         health = http_json("GET", f"{fx.base}/health")
         check("/health 返回 ok", health.get("ok") is True)
+        check("/health 含 terminal_env", "terminal_env" in health)
+        check("/health 含 terminal_ready", isinstance(health.get("terminal_ready"), bool))
 
         pending = http_json("GET", f"{fx.base}/approvals/pending?session_id=s1")
         check("无挂起 -> 空列表", pending["pending"] == [])
@@ -315,6 +317,8 @@ def test_static_frontend() -> None:
         check("GET / 是 text/html", ctype.startswith("text/html"))
         index_body = body.decode("utf-8", errors="replace")
         check("首页包含页面标题", "今天想构建什么" in index_body)
+        check("首页含终端后端徽标", "terminal-badge" in index_body)
+        check("首页含 Daytona 试跑建议", "uname -a" in index_body)
         check("首页含工作区按钮", "btn-working-diff" in index_body)
         check("首页含澄清弹窗", "clarify-overlay" in index_body)
         check(
@@ -343,6 +347,7 @@ def test_static_frontend() -> None:
             and "switchPluginTab" in app_body
             and "mcp-list" in app_body,
         )
+        check("app.js 含 Daytona 终端徽标", "refreshTerminalHealth" in app_body)
 
         status, _, _ = http_get(f"{fx.base}/web/style.css")
         check("GET /web/style.css 返回 200", status == 200)
