@@ -5,7 +5,8 @@
     - local（默认）：本机 subprocess，走危险命令审批
     - daytona：Daytona 云沙箱（Linux），沙箱即隔离边界，跳过危险命令审批
 
-选择方式：环境变量 TERMINAL_ENV=local|daytona（对齐 Hermes TERMINAL_ENV）。
+选择方式：环境变量 TERMINAL_ENV=local|daytona 是进程默认（对齐 Hermes TERMINAL_ENV）；
+会话可覆盖（骨架的会话级手动切换），互不影响。
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ SUPPORTED_BACKENDS = frozenset({"local", "daytona"})
 DEFAULT_DAYTONA_IMAGE = "nikolaik/python-nodejs:python3.11-nodejs20"
 
 _env_lock = threading.Lock()
-_active_env: Any = None
+# 按 task_id 缓存沙箱：进程默认共用 "default"；会话显式选 daytona 时用会话 id
+_active_envs: dict[str, Any] = {}
 
 
 def _env_int(name: str, default: int, min_value: int = 0) -> int:
@@ -39,10 +41,26 @@ def _env_bool(name: str, default: bool = True) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def normalize_backend(name: Optional[str]) -> str:
+    """把后端名归一成小写；不支持的返回空串。"""
+    raw = (name or "").strip().lower()
+    return raw if raw in SUPPORTED_BACKENDS else ""
+
+
 def get_terminal_env() -> str:
-    """返回当前终端后端名（小写，默认 local）。"""
+    """返回进程默认终端后端名（小写，默认 local）。"""
     raw = (os.environ.get("TERMINAL_ENV", "local") or "local").strip().lower()
-    return raw or "local"
+    return raw if raw in SUPPORTED_BACKENDS else "local"
+
+
+def sandbox_task_id(session_id: str) -> str:
+    """把会话 id 收成 Daytona 沙箱名可用的 task_id。"""
+    raw = "".join(
+        ch if ch.isalnum() or ch in "._-" else "-"
+        for ch in (session_id or "").strip()
+    )
+    raw = raw.strip("-.") or "session"
+    return raw[:48]
 
 
 def is_isolated_backend(env_type: Optional[str] = None) -> bool:
@@ -95,9 +113,9 @@ def check_backend_ready(env_type: Optional[str] = None) -> tuple[bool, str]:
     return False, f"未实现的终端后端：{name}"
 
 
-def build_terminal_backend_prompt() -> str:
+def build_terminal_backend_prompt(env_type: Optional[str] = None) -> str:
     """注入系统提示词的终端后端说明（对齐 Hermes prompt_builder 的环境描述）。"""
-    env_type = get_terminal_env()
+    env_type = normalize_backend(env_type) or get_terminal_env()
     if env_type == "daytona":
         cfg = get_daytona_config()
         return (
@@ -117,23 +135,24 @@ def build_terminal_backend_prompt() -> str:
     return ""
 
 
-def get_environment():
-    """返回当前终端后端实例；local 返回 None（由 run_terminal 走本机 subprocess）。
+def get_environment(env_type: Optional[str] = None, task_id: Optional[str] = None):
+    """返回终端后端实例；local 返回 None（由 run_terminal 走本机 subprocess）。
 
-    Daytona 环境按进程单例缓存（对齐 Hermes 按 task_id 复用沙箱），
-    首次调用时创建/恢复沙箱。
+    Daytona 按 task_id 缓存（对齐 Hermes 按 task_id 复用沙箱）：
+    进程默认共用配置里的 task_id；会话显式选 daytona 时传入该会话的 id。
     """
-    global _active_env
-    env_type = get_terminal_env()
-    if env_type != "daytona":
+    resolved = normalize_backend(env_type) or get_terminal_env()
+    if resolved != "daytona":
         return None
+    cfg = get_daytona_config()
+    key = (task_id or cfg["task_id"] or "default").strip() or "default"
     with _env_lock:
-        if _active_env is not None:
-            return _active_env
+        cached = _active_envs.get(key)
+        if cached is not None:
+            return cached
         from environments.daytona import DaytonaEnvironment
 
-        cfg = get_daytona_config()
-        _active_env = DaytonaEnvironment(
+        env = DaytonaEnvironment(
             image=cfg["image"],
             cwd=cfg["cwd"],
             timeout=cfg["timeout"],
@@ -141,18 +160,32 @@ def get_environment():
             memory=cfg["memory"],
             disk=cfg["disk"],
             persistent_filesystem=cfg["persistent"],
-            task_id=cfg["task_id"],
+            task_id=key,
         )
-        return _active_env
+        _active_envs[key] = env
+        return env
+
+
+def release_environment(task_id: str) -> None:
+    """释放指定 task_id 的沙箱缓存（切换离 daytona 时调用；持久化则 stop）。"""
+    key = (task_id or "").strip()
+    if not key:
+        return
+    with _env_lock:
+        env = _active_envs.pop(key, None)
+    if env is not None:
+        try:
+            env.cleanup()
+        except Exception:
+            pass
 
 
 def cleanup_environments() -> None:
-    """进程退出时清理远程沙箱（持久化则 stop，否则 delete）。"""
-    global _active_env
+    """进程退出时清理全部远程沙箱（持久化则 stop，否则 delete）。"""
     with _env_lock:
-        env = _active_env
-        _active_env = None
-    if env is not None:
+        envs = list(_active_envs.values())
+        _active_envs.clear()
+    for env in envs:
         try:
             env.cleanup()
         except Exception:
@@ -161,6 +194,5 @@ def cleanup_environments() -> None:
 
 def reset_environment_cache() -> None:
     """测试用：丢弃缓存的环境实例（不调用 cleanup，避免碰到假 SDK）。"""
-    global _active_env
     with _env_lock:
-        _active_env = None
+        _active_envs.clear()

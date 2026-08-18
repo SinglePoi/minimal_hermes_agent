@@ -28,6 +28,7 @@ const API = {
   sessionExport: (id) => "/sessions/" + encodeURIComponent(id) + "/export?format=md",
   sessionDelete: (id) => "/sessions/" + encodeURIComponent(id),
   sessionFork: (id) => "/sessions/" + encodeURIComponent(id) + "/fork",
+  sessionTerminal: (id) => "/sessions/" + encodeURIComponent(id) + "/terminal",
   health: "/health",
 };
 
@@ -68,6 +69,7 @@ const state = {
   hasMessages: false,
   loginAvailable: false,
   terminalHealth: null,
+  sessionTerminalEnv: "",
   lastDiff: null,
   lastSandbox: "",
 };
@@ -699,10 +701,15 @@ function addOutput(entry) {
 }
 
 function terminalLabel(health) {
-  const env = (health && health.terminal_env) || "local";
+  const env = effectiveTerminalEnv(health);
   if (env === "daytona") return "Daytona 云沙箱";
   if (env === "local") return "本机";
   return env;
+}
+
+function effectiveTerminalEnv(health) {
+  if (state.sessionTerminalEnv) return state.sessionTerminalEnv;
+  return (health && health.terminal_env) || (state.terminalHealth && state.terminalHealth.terminal_env) || "local";
 }
 
 function renderTerminalBadge() {
@@ -713,20 +720,59 @@ function renderTerminalBadge() {
     badge.textContent = "终端 · …";
     badge.className = "terminal-badge";
     badge.title = "正在探测终端后端";
+    badge.disabled = true;
     return;
   }
-  const env = h.terminal_env || "local";
-  const ready = h.terminal_ready !== false;
-  badge.className = "terminal-badge " + (ready ? env : "error");
-  if (!ready) {
+  const env = effectiveTerminalEnv(h);
+  const ready = env === "local" ? true : h.terminal_ready !== false;
+  badge.disabled = !!state.inFlight;
+  badge.className = "terminal-badge " + (ready || env === "local" ? env : "error");
+  if (env === "daytona" && h.terminal_env === "daytona" && !ready) {
     badge.textContent = "终端 · 未就绪";
-    badge.title = h.terminal_error || "终端后端未就绪";
+    badge.title = h.terminal_error || "Daytona 未就绪";
   } else if (env === "daytona") {
     badge.textContent = "终端 · Daytona";
-    badge.title = "Daytona 云沙箱" + (h.terminal_image ? " · " + h.terminal_image : "");
+    badge.title = "本会话在 Daytona 云沙箱执行，点击切回本机";
   } else {
     badge.textContent = "终端 · 本机";
-    badge.title = "命令在本机执行，危险命令会走审批";
+    badge.title = "本会话在本机执行（危险命令会审批），点击切到 Daytona";
+  }
+}
+
+async function toggleTerminalBackend() {
+  if (state.inFlight) return;
+  const current = effectiveTerminalEnv();
+  const next = current === "daytona" ? "local" : "daytona";
+  if (next === "daytona") {
+    const ok = await showDialog({
+      title: "切换到 Daytona？",
+      desc: "本会话的 terminal 将在云沙箱执行，危险命令不再审批。文件工具仍改本机。需要 DAYTONA_API_KEY。",
+      okText: "切换",
+    });
+    if (!ok || !ok.ok) return;
+  }
+  if (!state.sessionId) {
+    try {
+      const created = await httpJson("POST", API.createSession, {});
+      state.sessionId = created.session_id;
+      saveSession(state.sessionId);
+    } catch (e) {
+      await showDialog({ title: "无法切换", desc: "创建会话失败：" + e.message, okText: "知道了" });
+      return;
+    }
+  }
+  try {
+    const data = await httpJson("POST", API.sessionTerminal(state.sessionId), { backend: next });
+    state.sessionTerminalEnv = data.terminal_env || next;
+    renderTerminalBadge();
+    renderEnvironment();
+    loadSessionList();
+  } catch (e) {
+    await showDialog({
+      title: "无法切换终端",
+      desc: e.message || "切换失败",
+      okText: "知道了",
+    });
   }
 }
 
@@ -755,13 +801,13 @@ function renderEnvironment(data) {
   const tLabel = document.createElement("span");
   tLabel.className = "context-label";
   tLabel.textContent = "终端";
+  const env = effectiveTerminalEnv(h);
   const tVal = document.createElement("span");
   tVal.className = "context-item-muted";
-  const ready = !h.terminal_env || h.terminal_ready !== false;
-  tVal.textContent = terminalLabel(h) + (ready ? "" : " · 未就绪");
+  tVal.textContent = terminalLabel(h);
   term.append(tLabel, tVal);
   box.appendChild(term);
-  if (h.terminal_env === "daytona" && h.terminal_error) {
+  if (env === "daytona" && h.terminal_env === "daytona" && h.terminal_error) {
     const err = document.createElement("div");
     err.className = "context-empty";
     err.textContent = h.terminal_error;
@@ -1136,6 +1182,10 @@ async function loadSessionList() {
     );
     if (current) {
       state.sessionTitle = current.title || current.preview || current.session_id;
+      if (current.terminal_env) {
+        state.sessionTerminalEnv = current.terminal_env;
+        renderTerminalBadge();
+      }
       if (state.hasMessages) {
         viewTitle.textContent = state.sessionTitle;
       }
@@ -1712,6 +1762,9 @@ async function switchSession(id, title) {
   try {
     const data = await httpJson("GET", API.sessionsMessages(id));
     const messages = data.messages || [];
+    state.sessionTerminalEnv = data.terminal_env || "";
+    renderTerminalBadge();
+    renderEnvironment();
     if (!messages.length) {
       showHome();
     } else {
@@ -2063,6 +2116,7 @@ async function sendMessage() {
       const created = await httpJson("POST", API.createSession, {});
       state.sessionId = created.session_id;
       saveSession(state.sessionId);
+      if (created.terminal_env) state.sessionTerminalEnv = created.terminal_env;
       Object.keys(delegationById).forEach((k) => delete delegationById[k]);
       Object.keys(sourcesById).forEach((k) => delete sourcesById[k]);
       Object.keys(outputsById).forEach((k) => delete outputsById[k]);
@@ -2085,6 +2139,7 @@ async function sendMessage() {
   appendMessage("user", text);
   setThinking(true);
   state.inFlight = true;
+  renderTerminalBadge();
   sendBtn.disabled = true;
   sendBtn.setAttribute("aria-label", "发送中");
   inputEl.disabled = true;
@@ -2115,6 +2170,7 @@ async function sendMessage() {
     }
   } finally {
     state.inFlight = false;
+    renderTerminalBadge();
     updateSendState();
     sendBtn.setAttribute("aria-label", "发送");
     inputEl.disabled = false;
@@ -2136,6 +2192,7 @@ function newSession() {
   }
   state.sessionId = "";
   state.sessionTitle = "";
+  state.sessionTerminalEnv = "";
   state.queueCount = 0;
   state.pendingItem = null;
   state.pendingKey = "";
@@ -2156,6 +2213,7 @@ function newSession() {
   $("approval-overlay").classList.add("hidden");
   showHome();
   loadSessionList();
+  renderTerminalBadge();
 }
 
 function autoResize() {
@@ -2207,6 +2265,7 @@ function bindEvents() {
   $("btn-export-session").addEventListener("click", () => {
     if (state.sessionId) exportSession(state.sessionId);
   });
+  $("terminal-badge").addEventListener("click", () => toggleTerminalBackend());
 
   // 审批按钮
   $("btn-once").addEventListener("click", () => resolveApproval("once"));

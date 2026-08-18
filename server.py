@@ -25,6 +25,7 @@ HTTP 服务化 + gateway 审批通知（为前端铺路，对齐 Hermes dashboar
     GET  /sessions          会话列表（按最后活跃倒序）
     GET  /sessions/<id>/messages  指定会话的历史消息（前端回显用）
     POST /sessions/<id>/archive  归档/取消归档；body: {"archived": true|false}
+    POST /sessions/<id>/terminal 切换该会话终端后端；body: {"backend": "local"|"daytona"}
     GET  /skills                 技能列表（name + description）
     GET  /plugins                记忆 provider 插件列表（name + description + active）
     GET  /tools                  可用工具列表（核心 TOOLS + provider 自带工具）
@@ -167,6 +168,8 @@ def _audit_action(path: str, method: str = "GET") -> str:
         return "clarify:pending"
     if path.startswith("/clarify/resolve"):
         return "clarify:resolve"
+    if path.startswith("/sessions/") and path.endswith("/terminal"):
+        return "sessions:terminal"
     if path.startswith("/sessions/") and path.endswith("/fork"):
         return "sessions:fork"
     if path.startswith("/sessions/") and path.endswith("/archive"):
@@ -397,7 +400,9 @@ class AgentServer:
             minimal_agent.hydrate_todo_store(messages, session_id)
         system_prompt = minimal_agent.load_session_prompt(session_id)
         if system_prompt is None:
-            system_prompt = minimal_agent.build_system_prompt(self.manager)
+            system_prompt = minimal_agent.build_system_prompt(
+                self.manager, session_key=session_id
+            )
             minimal_agent.save_session_prompt(session_id, system_prompt)
         messages.insert(0, {"role": "system", "content": system_prompt})
 
@@ -939,6 +944,9 @@ class _Handler(BaseHTTPRequestHandler):
                     "messages": messages,
                     "events": events,
                     "todos": todos,
+                    "terminal_env": minimal_agent.resolve_session_terminal_env(
+                        session_id
+                    ),
                 },
             )
             return
@@ -1347,7 +1355,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._audit_session_id = session_id
             if minimal_agent.load_session_prompt(session_id) is None:
                 system_prompt = minimal_agent.build_system_prompt(
-                    self.server.app.manager
+                    self.server.app.manager, session_key=session_id
                 )
                 minimal_agent.save_session_prompt(session_id, system_prompt)
             self._send_json(
@@ -1355,6 +1363,9 @@ class _Handler(BaseHTTPRequestHandler):
                 {
                     "session_id": session_id,
                     "title": minimal_agent.get_session_title(session_id),
+                    "terminal_env": minimal_agent.resolve_session_terminal_env(
+                        session_id
+                    ),
                 },
             )
             return
@@ -1412,6 +1423,49 @@ class _Handler(BaseHTTPRequestHandler):
             self._audit_session_id = session_id
             count = clarify.resolve_clarify(session_id, clarify_id, answer)
             self._send_json(200, {"resolved": count})
+            return
+        if parsed.path.startswith("/sessions/") and parsed.path.endswith("/terminal"):
+            session_id = unquote(parsed.path[len("/sessions/"):-len("/terminal")])
+            if not session_id or "/" in session_id:
+                self._send_json(404, {"error": "not found"})
+                return
+            self._audit_session_id = session_id
+            backend = body.get("backend") or body.get("terminal_env")
+            if not isinstance(backend, str) or not backend.strip():
+                self._send_json(
+                    400,
+                    {"error": "backend (local|daytona) required"},
+                )
+                return
+            state = self.server.app.sessions.get(session_id)
+            acquired = False
+            if state is not None:
+                acquired = state["lock"].acquire(blocking=False)
+                if not acquired:
+                    self._send_json(409, {"error": "session is busy"})
+                    return
+            try:
+                result = minimal_agent.set_session_terminal_env(
+                    session_id,
+                    backend,
+                    manager=self.server.app.manager,
+                    messages=None if state is None else state["messages"],
+                )
+            finally:
+                if acquired:
+                    state["lock"].release()
+            if not result.get("ok"):
+                code = result.get("code")
+                status = 404 if code == "not_found" else 409 if code == "busy_process" else 400
+                self._send_json(status, {"error": result.get("error") or "switch failed"})
+                return
+            self._send_json(
+                200,
+                {
+                    "session_id": session_id,
+                    "terminal_env": result.get("terminal_env"),
+                },
+            )
             return
         if parsed.path.startswith("/sessions/") and parsed.path.endswith("/archive"):
             session_id = unquote(parsed.path[len("/sessions/"):-len("/archive")])

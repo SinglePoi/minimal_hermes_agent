@@ -17,6 +17,7 @@ import enum
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -35,6 +36,7 @@ for stream in (sys.stdout, sys.stderr):
 import approval  # noqa: E402
 import environments  # noqa: E402
 import minimal_agent  # noqa: E402
+import process_registry  # noqa: E402
 from environments.daytona import DaytonaEnvironment  # noqa: E402
 
 
@@ -336,7 +338,7 @@ def test_run_terminal_routes() -> None:
         result="from-sandbox", exit_code=0
     )
 
-    def fake_get_environment():
+    def fake_get_environment(*_a, **_k):
         return fake_env
 
     original_get = environments.get_environment
@@ -397,6 +399,10 @@ def test_system_prompt_block() -> None:
         check("系统提示词已注入后端块", "Daytona" in prompt)
         os.environ["TERMINAL_ENV"] = "local"
         check("local 不注入后端块", environments.build_terminal_backend_prompt() == "")
+        check(
+            "显式 daytona 仍注入",
+            "Daytona" in environments.build_terminal_backend_prompt("daytona"),
+        )
     finally:
         if old is None:
             os.environ.pop("TERMINAL_ENV", None)
@@ -415,6 +421,94 @@ def test_terminal_schema_mentions_daytona() -> None:
     check("TOOLS 描述含 daytona", "daytona" in desc.lower())
 
 
+def test_session_override_routes() -> None:
+    """进程默认 local 时，会话覆盖 daytona 仍走沙箱；邻居会话不受影响。"""
+    old_env = os.environ.get("TERMINAL_ENV")
+    old_key = os.environ.get("DAYTONA_API_KEY")
+    original_db = minimal_agent.SESSION_DB
+    original_get = environments.get_environment
+    fake_env = _make_env()
+    fake_env._sandbox._exec_handler = lambda cmd, timeout: SimpleNamespace(
+        result="from-sandbox", exit_code=0
+    )
+    seen: dict = {}
+
+    def fake_get_environment(env_type=None, task_id=None):
+        seen["env_type"] = env_type
+        seen["task_id"] = task_id
+        return fake_env
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            minimal_agent.SESSION_DB = Path(tmpdir) / "sessions.db"
+            os.environ["TERMINAL_ENV"] = "local"
+            os.environ["DAYTONA_API_KEY"] = "test-key"
+            _install_fake_sdk()
+            environments.get_environment = fake_get_environment  # type: ignore
+            check(
+                "无覆盖跟随进程",
+                minimal_agent.resolve_session_terminal_env("sess-ov") == "local",
+            )
+            minimal_agent.save_session_prompt("sess-ov", "sys")
+            check(
+                "写入覆盖",
+                minimal_agent.save_session_terminal_env("sess-ov", "daytona") is True,
+            )
+            check(
+                "解析为 daytona",
+                minimal_agent.resolve_session_terminal_env("sess-ov") == "daytona",
+            )
+            raw = minimal_agent.run_terminal("echo hi", "sess-ov")
+            data = json.loads(raw)
+            check("覆盖走沙箱", data.get("backend") == "daytona")
+            check(
+                "沙箱 task_id 用会话",
+                seen.get("task_id") == environments.sandbox_task_id("sess-ov"),
+            )
+            raw_sib = minimal_agent.run_terminal("echo hello-sib", "sess-sib")
+            sib = json.loads(raw_sib)
+            check(
+                "邻居会话仍本机",
+                sib.get("backend") != "daytona"
+                and "hello-sib" in sib.get("output", ""),
+            )
+            bg = process_registry.spawn(
+                f'"{sys.executable}" -c "import time; time.sleep(30)"',
+                owner_key="sess-ov",
+            )
+            try:
+                blocked = minimal_agent.set_session_terminal_env("sess-ov", "local")
+                check(
+                    "后台进程阻止切换",
+                    blocked.get("ok") is False and blocked.get("code") == "busy_process",
+                )
+            finally:
+                process_registry.kill(bg["session_id"])
+            switched = minimal_agent.set_session_terminal_env("sess-ov", "local")
+            check("切回本机成功", switched.get("ok") is True)
+            check(
+                "切回后解析 local",
+                minimal_agent.resolve_session_terminal_env("sess-ov") == "local",
+            )
+            prompt = minimal_agent.load_session_prompt("sess-ov") or ""
+            check(
+                "切回后去掉终端后端块",
+                "## 终端后端" not in prompt,
+            )
+    finally:
+        environments.get_environment = original_get  # type: ignore
+        environments.reset_environment_cache()
+        minimal_agent.SESSION_DB = original_db
+        if old_env is None:
+            os.environ.pop("TERMINAL_ENV", None)
+        else:
+            os.environ["TERMINAL_ENV"] = old_env
+        if old_key is None:
+            os.environ.pop("DAYTONA_API_KEY", None)
+        else:
+            os.environ["DAYTONA_API_KEY"] = old_key
+
+
 def main() -> None:
     """跑全部断言。"""
     print("== Daytona 终端后端回归测试 ==")
@@ -431,6 +525,7 @@ def main() -> None:
         test_run_terminal_routes,
         test_system_prompt_block,
         test_terminal_schema_mentions_daytona,
+        test_session_override_routes,
     ):
         print(f"[{test_fn.__name__}]")
         test_fn()

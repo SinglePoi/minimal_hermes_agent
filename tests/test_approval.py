@@ -14,6 +14,7 @@ stdout/stderr 重配为 UTF-8。
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -155,6 +156,7 @@ def test_approval_gate_branches() -> None:
 
 def test_terminal_tool() -> None:
     """终端工具：安全命令执行成功；危险命令被拒绝时返回 BLOCKED 且不执行。"""
+    os.environ["TERMINAL_ENV"] = "local"
     result = json.loads(run_terminal("echo hello-approval", "sess-term-safe"))
     check("terminal 安全命令 -> 退出码 0 且含输出",
           result["exit_code"] == 0 and "hello-approval" in result["output"])
@@ -176,6 +178,7 @@ def test_terminal_tool() -> None:
 
 def test_terminal_stdin_devnull() -> None:
     """终端工具：subprocess 必须带 stdin=DEVNULL，防止交互式命令（date/time）无限等待。"""
+    os.environ["TERMINAL_ENV"] = "local"
     captured: dict = {}
 
     class FakeProc:

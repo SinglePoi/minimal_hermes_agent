@@ -341,6 +341,8 @@ def test_static_frontend() -> None:
         check("app.js 含会话导出逻辑", "sessionExport" in app_body)
         check("app.js 含中途提问逻辑", "clarifyPending" in app_body)
         check("app.js 两步式创建会话", "createSession" in app_body)
+        check("app.js 含会话终端切换", "toggleTerminalBackend" in app_body)
+        check("app.js 含 terminal 端点", "sessionTerminal" in app_body)
         check(
             "app.js 含 MCP 渲染与标签切换",
             "renderMCPList" in app_body
@@ -383,6 +385,7 @@ def test_sessions_endpoint() -> None:
         sess = next(s for s in sessions["sessions"] if s["session_id"] == "sess-list")
         check("列表含消息数", sess["message_count"] >= 2)
         check("列表含最后用户消息预览", "你好" in sess["preview"])
+        check("列表含终端后端", sess.get("terminal_env") in ("local", "daytona"))
 
         history = http_json("GET", f"{fx.base}/sessions/sess-list/messages")
         check(
@@ -394,6 +397,10 @@ def test_sessions_endpoint() -> None:
             any(m["role"] == "assistant" for m in history["messages"]),
         )
         check("历史消息带时间戳", all("created_at" in m for m in history["messages"]))
+        check(
+            "历史含终端后端",
+            history.get("terminal_env") in ("local", "daytona"),
+        )
 
         missing = http_json("GET", f"{fx.base}/sessions/nope/messages")
         check("不存在会话 -> 空消息列表", missing["messages"] == [])
@@ -1460,6 +1467,92 @@ def test_sessions_create_chat_endpoint() -> None:
         fx.close()
 
 
+def test_session_terminal_endpoint() -> None:
+    """会话级终端后端切换：校验、未就绪、忙、提示词重建。"""
+    import urllib.error
+
+    old_env = os.environ.get("TERMINAL_ENV")
+    old_key = os.environ.get("DAYTONA_API_KEY")
+    fx = ServerFixture()
+    try:
+        os.environ["TERMINAL_ENV"] = "local"
+        os.environ.pop("DAYTONA_API_KEY", None)
+        created = http_json("POST", f"{fx.base}/sessions", {"id": "sess-term"})
+        check("创建含 terminal_env", created.get("terminal_env") in ("local", "daytona"))
+
+        same = http_json(
+            "POST",
+            f"{fx.base}/sessions/sess-term/terminal",
+            {"backend": created.get("terminal_env") or "local"},
+        )
+        check("同后端幂等", same.get("terminal_env") == (created.get("terminal_env") or "local"))
+
+        try:
+            http_json(
+                "POST",
+                f"{fx.base}/sessions/sess-term/terminal",
+                {"backend": "docker"},
+            )
+            check("未知后端 -> 400", False)
+        except urllib.error.HTTPError as exc:
+            check("未知后端 -> 400", exc.code == 400)
+
+        try:
+            http_json(
+                "POST",
+                f"{fx.base}/sessions/sess-term/terminal",
+                {"backend": "daytona"},
+            )
+            check("Daytona 未就绪 -> 400", False)
+        except urllib.error.HTTPError as exc:
+            check("Daytona 未就绪 -> 400", exc.code == 400)
+
+        try:
+            http_json(
+                "POST",
+                f"{fx.base}/sessions/ghost-term/terminal",
+                {"backend": "local"},
+            )
+            check("未知会话 -> 404", False)
+        except urllib.error.HTTPError as exc:
+            check("未知会话 -> 404", exc.code == 404)
+
+        state = fx.app.get_session("sess-term")
+        state["lock"].acquire()
+        try:
+            try:
+                http_json(
+                    "POST",
+                    f"{fx.base}/sessions/sess-term/terminal",
+                    {"backend": "local"},
+                )
+                check("会话忙 -> 409", False)
+            except urllib.error.HTTPError as exc:
+                check("会话忙 -> 409", exc.code == 409)
+        finally:
+            state["lock"].release()
+
+        log_file = Path(fx.tmp.name) / "audit.log"
+        entries = [
+            json.loads(line)
+            for line in log_file.read_text(encoding="utf-8").strip().splitlines()
+        ]
+        check(
+            "审计 sessions:terminal",
+            any(e.get("action") == "sessions:terminal" for e in entries),
+        )
+    finally:
+        fx.close()
+        if old_env is None:
+            os.environ.pop("TERMINAL_ENV", None)
+        else:
+            os.environ["TERMINAL_ENV"] = old_env
+        if old_key is None:
+            os.environ.pop("DAYTONA_API_KEY", None)
+        else:
+            os.environ["DAYTONA_API_KEY"] = old_key
+
+
 def test_openai_models_endpoint() -> None:
     """GET /v1/models：OpenAI 风格模型列表（Open WebUI / LibreChat 发现用）。"""
     fx = ServerFixture()
@@ -1952,6 +2045,7 @@ def main() -> None:
         test_session_export_endpoint,
         test_clarify_endpoint,
         test_sessions_create_chat_endpoint,
+        test_session_terminal_endpoint,
         test_openai_models_endpoint,
         test_openai_chat_completions,
         test_openai_chat_derived_session_and_seed,

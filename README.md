@@ -481,7 +481,9 @@
 51. **Daytona 云沙箱终端后端**（2026-08-17，对齐 Hermes `tools/environments/daytona.py`
     核心语义，简化版）：
     - `TERMINAL_ENV=daytona` 时 `terminal` 在 Daytona 云沙箱（Linux）执行，
-      沙箱即隔离边界，危险命令审批跳过（含硬性禁止）；默认 `local` 行为不变
+      沙箱即隔离边界，危险命令审批跳过（含硬性禁止）；默认 `local` 行为不变。
+      Web 上可按会话点右上角「终端」徽标在本机 / Daytona 之间切换
+      （`POST /sessions/<id>/terminal`），不必重启进程
     - 持久化：按 `agent-{task_id}` 恢复已有沙箱，退出时 stop 而非 delete
       （`TERMINAL_CONTAINER_PERSISTENT=false` 则 delete）；磁盘超过 10 GiB 封顶
     - 中断：`interrupt_event` 置位时 `sandbox.stop()`；后台 `background=true`
@@ -579,7 +581,7 @@ python server.py                 # 默认 127.0.0.1:8000
 | `/web/*` | GET | 前端静态资源（app.js / style.css） |
 | `/sessions` | GET | 会话列表（按最后活跃倒序；`?include_archived=1` 含归档） |
 | `/sessions/<id>/messages` | GET | 指定会话的历史消息（前端回显） |
-| `/sessions/<id>/archive` | POST | 归档/取消归档：`{"archived": true\|false}` |
+| `/sessions/<id>/terminal` | POST | 切换该会话终端后端：`{"backend": "local"\|"daytona"}`；会话忙或有后台进程 409 |
 | `/sessions/<id>` | DELETE | 删除**已归档**会话（含消息与全文索引）；未归档 400，未知 404，进行中 409 |
 | `/sessions/<id>` | PATCH | 设置会话标题：`{"title": "..."}`（空串清除） |
 | `/sessions/<id>/fork` | POST | 复制会话历史开新会话（含系统提示词与全文索引）；未知 404，id 冲突 409 |
@@ -839,11 +841,16 @@ python minimal_agent.py
 把 `terminal` 从本机切到 [Daytona](https://daytona.io) 云沙箱（Linux），适合跑不信任代码
 或不想污染本机环境的命令。沙箱即隔离边界，危险命令审批会跳过。
 
+进程默认仍由 `TERMINAL_ENV` 决定（不设则本机）。Web 控制台可点右上角「终端 · 本机」
+徽标，只把**当前会话**切到 Daytona（需要已配置 `DAYTONA_API_KEY`）；有后台进程或
+对话进行中时会拒绝切换。
+
 ```powershell
 pip install daytona
 # 在 .env 里填：
-#   TERMINAL_ENV=daytona
 #   DAYTONA_API_KEY=你的key
+# 可选：整进程默认走沙箱
+#   TERMINAL_ENV=daytona
 python minimal_agent.py "在沙箱里执行 uname -a 和 python --version"
 ```
 

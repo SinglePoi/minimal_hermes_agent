@@ -7,6 +7,7 @@ run_tool 分发、shutdown_all 退出清理。零依赖，python tests/test_proc
 """
 
 import json
+import os
 import sys
 import threading
 import time
@@ -92,6 +93,18 @@ def test_kill() -> None:
         kill(sid)
 
 
+def test_has_running_owner() -> None:
+    """has_running 只统计指定聊天会话的后台进程。"""
+    res = spawn(_py_cmd("import time; time.sleep(30)"), owner_key="chat-a")
+    sid = res["session_id"]
+    try:
+        check("本会话有运行中进程", process_registry.has_running("chat-a") is True)
+        check("其他会话没有", process_registry.has_running("chat-b") is False)
+        check("空 owner 不误报", process_registry.has_running("") is False)
+    finally:
+        kill(sid)
+
+
 def test_unknown() -> None:
     """未知 session_id：poll/kill 返回可读错误。"""
     check("未知 poll 报错", poll("proc-nope").get("success") is False)
@@ -114,6 +127,7 @@ def test_process_tool() -> None:
 
 def test_run_terminal_background() -> None:
     """run_terminal(background=true) → run_tool process：端到端接线。"""
+    os.environ["TERMINAL_ENV"] = "local"
     raw = minimal_agent.run_terminal(
         _py_cmd("import time; print('bg'); time.sleep(0.5)"),
         session_key="bg-test",
@@ -181,6 +195,7 @@ def main() -> None:
     test_spawn_poll_wait()
     test_wait_timeout()
     test_kill()
+    test_has_running_owner()
     test_unknown()
     test_process_tool()
     test_run_terminal_background()

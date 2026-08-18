@@ -823,6 +823,16 @@ body::before {
   color: var(--muted);
   background: rgba(15, 23, 42, 0.55);
   white-space: nowrap;
+  cursor: pointer;
+}
+
+.terminal-badge:hover:not(:disabled) {
+  filter: brightness(1.15);
+}
+
+.terminal-badge:disabled {
+  cursor: default;
+  opacity: 0.7;
 }
 
 .terminal-badge.daytona {

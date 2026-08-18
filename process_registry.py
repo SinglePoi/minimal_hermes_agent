@@ -38,6 +38,7 @@ class BackgroundProcess:
     command: str
     pid: int
     start_time: str
+    owner_key: str = ""  # 聊天会话 id，供切换终端后端时禁止热切换
     status: str = "running"  # running | exited | killed
     exit_code: Optional[int] = None
     output: list[str] = field(default_factory=list)
@@ -119,7 +120,7 @@ def _reader_thread(proc, attr: str, buf: list[str], proc_ref) -> None:
             pass
 
 
-def spawn(command: str, cwd: Optional[str] = None) -> dict[str, Any]:
+def spawn(command: str, cwd: Optional[str] = None, owner_key: str = "") -> dict[str, Any]:
     """后台启动一条命令并登记；返回 session_id / pid / 状态。"""
     session_id = _next_session_id()
     try:
@@ -144,6 +145,7 @@ def spawn(command: str, cwd: Optional[str] = None) -> dict[str, Any]:
         command=command,
         pid=proc.pid,
         start_time=time.strftime("%Y-%m-%d %H:%M:%S"),
+        owner_key=owner_key or "",
         proc=proc,
     )
     threading.Thread(
@@ -178,6 +180,7 @@ def spawn_via_env(
     command: str,
     execute_fn,
     cancel_fn=None,
+    owner_key: str = "",
 ) -> dict[str, Any]:
     """在远程环境（Daytona 等）后台执行命令（对齐 Hermes spawn_via_env 思路）。
 
@@ -191,6 +194,7 @@ def spawn_via_env(
         command=command,
         pid=0,
         start_time=time.strftime("%Y-%m-%d %H:%M:%S"),
+        owner_key=owner_key or "",
         proc=None,
         done=done,
         cancel_fn=cancel_fn,
@@ -318,6 +322,18 @@ def kill(session_id: str) -> dict[str, Any]:
         "pid": record.pid,
         "status": record.status,
     }
+
+
+def has_running(owner_key: str) -> bool:
+    """该聊天会话是否还有未结束的后台进程（切换终端后端前检查）。"""
+    key = (owner_key or "").strip()
+    if not key:
+        return False
+    with _registry_lock:
+        return any(
+            record.status == "running" and record.owner_key == key
+            for record in _registry.values()
+        )
 
 
 def shutdown_all() -> int:

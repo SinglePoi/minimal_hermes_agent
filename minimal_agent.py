@@ -269,12 +269,17 @@ def render_memory_block(target: str, entries: list[str]) -> str:
     return f"## {title} [{pct}% — {current:,}/{limit:,} chars]\n{content}"
 
 
-def build_system_prompt(manager: MemoryManager | None = None) -> str:
+def build_system_prompt(
+    manager: MemoryManager | None = None,
+    env_type: str | None = None,
+    session_key: str = "",
+) -> str:
     """组装系统提示词：基础人设 + 项目上下文（AGENTS.md）+ 记忆/用户画像 + 外部 provider。
 
     对齐 Hermes 的 system_prompt.py 分层：stable（人设）→ context（context files）
     → volatile（记忆快照 + USER.md）；技能索引按当前可用工具集做条件过滤
     （对齐 Hermes build_skills_system_prompt(available_tools=...)）。
+    env_type / session_key 用于注入当前会话的终端后端说明。
     """
     prompt = load_system_prompt()
     context_block = load_context_files()
@@ -291,7 +296,10 @@ def build_system_prompt(manager: MemoryManager | None = None) -> str:
         ext_block = manager.build_system_prompt()
         if ext_block:
             prompt += "\n\n" + ext_block
-    backend_block = environments.build_terminal_backend_prompt()
+    resolved = env_type or (
+        resolve_session_terminal_env(session_key) if session_key else environments.get_terminal_env()
+    )
+    backend_block = environments.build_terminal_backend_prompt(resolved)
     if backend_block:
         prompt += "\n\n" + backend_block
     return prompt
@@ -403,7 +411,9 @@ def _db_conn() -> sqlite3.Connection:
         )
     if "title" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
-    if "archived" not in cols or "title" not in cols:
+    if "terminal_env" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN terminal_env TEXT")
+    if "archived" not in cols or "title" not in cols or "terminal_env" not in cols:
         conn.commit()
     return conn
 
@@ -437,6 +447,107 @@ def load_session_prompt(session_id: str) -> str | None:
         return row[0] if row else None
     finally:
         conn.close()
+
+
+def load_session_terminal_env(session_id: str) -> str | None:
+    """读取会话显式保存的终端后端；未设置则返回 None（跟随进程 TERMINAL_ENV）。"""
+    if not (session_id or "").strip():
+        return None
+    conn = _db_conn()
+    try:
+        row = conn.execute(
+            "SELECT terminal_env FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return environments.normalize_backend(row[0]) or None
+    finally:
+        conn.close()
+
+
+def resolve_session_terminal_env(session_id: str = "") -> str:
+    """解析该会话实际使用的终端后端：会话覆盖优先，否则进程默认。"""
+    stored = load_session_terminal_env(session_id)
+    return stored or environments.get_terminal_env()
+
+
+def save_session_terminal_env(session_id: str, env_type: str | None) -> bool:
+    """写入会话的终端后端覆盖值；None 表示恢复跟随进程默认。会话不存在返回 False。"""
+    conn = _db_conn()
+    try:
+        cur = conn.execute(
+            "UPDATE sessions SET terminal_env = ?, updated_at = datetime('now') "
+            "WHERE session_id = ?",
+            (env_type, session_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def set_session_terminal_env(
+    session_id: str,
+    env_type: str,
+    manager: MemoryManager | None = None,
+    messages: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """把会话终端后端设为 local 或 daytona，并重建系统提示词里的后端说明。
+
+    该会话还有后台进程在跑时拒绝切换。切到 daytona 前检查 SDK/密钥。
+    返回 dict：ok / error / code / terminal_env。
+    """
+    if load_session_prompt(session_id) is None:
+        return {
+            "ok": False,
+            "code": "not_found",
+            "error": "session not found",
+            "terminal_env": environments.get_terminal_env(),
+        }
+    resolved = environments.normalize_backend(env_type)
+    if not resolved:
+        supported = ", ".join(sorted(environments.SUPPORTED_BACKENDS))
+        return {
+            "ok": False,
+            "code": "invalid",
+            "error": f"backend 必须是 {supported}",
+            "terminal_env": resolve_session_terminal_env(session_id),
+        }
+    current = resolve_session_terminal_env(session_id)
+    if current == resolved:
+        return {"ok": True, "terminal_env": resolved, "unchanged": True}
+    if process_registry.has_running(session_id):
+        return {
+            "ok": False,
+            "code": "busy_process",
+            "error": "该会话还有后台进程在运行，结束后再切换终端后端",
+            "terminal_env": current,
+        }
+    if resolved == "daytona":
+        ready, err = environments.check_backend_ready("daytona")
+        if not ready:
+            return {
+                "ok": False,
+                "code": "not_ready",
+                "error": err,
+                "terminal_env": current,
+            }
+    if not save_session_terminal_env(session_id, resolved):
+        return {
+            "ok": False,
+            "code": "not_found",
+            "error": "session not found",
+            "terminal_env": current,
+        }
+    stored = load_session_terminal_env(session_id)
+    prompt = build_system_prompt(manager, env_type=resolved)
+    save_session_prompt(session_id, prompt)
+    if messages and messages[0].get("role") == "system":
+        messages[0]["content"] = prompt
+    if stored != "daytona":
+        environments.release_environment(environments.sandbox_task_id(session_id))
+    return {"ok": True, "terminal_env": resolved}
 
 
 def prune_sessions(
@@ -593,7 +704,7 @@ def fork_session(source_id: str, new_id: str, title: str = "") -> bool:
     conn = _db_conn()
     try:
         src = conn.execute(
-            "SELECT system_prompt, title FROM sessions WHERE session_id = ?",
+            "SELECT system_prompt, title, terminal_env FROM sessions WHERE session_id = ?",
             (source_id,),
         ).fetchone()
         if src is None:
@@ -602,14 +713,15 @@ def fork_session(source_id: str, new_id: str, title: str = "") -> bool:
             "SELECT 1 FROM sessions WHERE session_id = ?", (new_id,)
         ).fetchone():
             return False
-        system_prompt, src_title = src
+        system_prompt, src_title, src_env = src
         fork_title = title.strip() if title.strip() else (
             f"{src_title.strip()} fork" if (src_title or "").strip() else "fork"
         )
         conn.execute(
-            "INSERT INTO sessions (session_id, system_prompt, updated_at, archived, title) "
-            "VALUES (?, ?, datetime('now'), 0, ?)",
-            (new_id, system_prompt, fork_title),
+            "INSERT INTO sessions "
+            "(session_id, system_prompt, updated_at, archived, title, terminal_env) "
+            "VALUES (?, ?, datetime('now'), 0, ?, ?)",
+            (new_id, system_prompt, fork_title, src_env),
         )
         conn.execute(
             "INSERT INTO messages (session_id, role, content, created_at) "
@@ -736,7 +848,7 @@ def list_sessions(
     conn = _db_conn()
     try:
         rows = conn.execute(
-            f"""SELECT s.session_id, s.updated_at, s.archived, s.title,
+            f"""SELECT s.session_id, s.updated_at, s.archived, s.title, s.terminal_env,
                       COUNT(m.id) AS message_count,
                       (SELECT m2.content FROM messages m2
                        WHERE m2.session_id = s.session_id AND m2.role = 'user'
@@ -749,14 +861,16 @@ def list_sessions(
                LIMIT ?""",
             (max(1, min(int(limit), 200)),),
         ).fetchall()
+        process_default = environments.get_terminal_env()
         return [
             {
                 "session_id": r[0],
                 "updated_at": r[1] or "",
                 "archived": bool(r[2]),
                 "title": r[3] or "",
-                "message_count": r[4] or 0,
-                "preview": (r[5] or "").strip()[:80],
+                "terminal_env": environments.normalize_backend(r[4]) or process_default,
+                "message_count": r[5] or 0,
+                "preview": (r[6] or "").strip()[:80],
             }
             for r in rows
         ]
@@ -1206,9 +1320,9 @@ TOOLS = [
             "description": (
                 "执行一条 shell 命令。默认在本机执行（Windows 下为系统默认 shell cmd；"
                 "PowerShell 专属命令请写成 powershell -Command \"...\"）。"
-                "当 TERMINAL_ENV=daytona 时在 Daytona 云沙箱（Linux）中执行，"
-                "危险命令审批会跳过（沙箱即隔离边界）；文件工具仍操作本机，"
-                "要在沙箱里放文件请用本工具写入（cat/heredoc）。"
+                "当前会话可切换到 Daytona 云沙箱（Linux）；沙箱内危险命令审批会跳过"
+                "（沙箱即隔离边界）。文件工具仍操作本机，要在沙箱里放文件请用本工具写入"
+                "（cat/heredoc）。进程默认由 TERMINAL_ENV 决定。"
                 "危险命令（删除、格式化、关机、SQL DROP 等）在本机模式下会先征求用户批准；"
                 "返回 JSON，含 exit_code 与 output。"
                 "长任务（构建/安装/起服务等）设 background=true 转后台立即返回 "
@@ -1651,13 +1765,17 @@ def run_terminal(
 ) -> str:
     """执行 shell 命令：先过审批门卫，再在本机或 Daytona 沙箱运行。
 
-    对齐 Hermes terminal_tool：TERMINAL_ENV 选择后端；隔离后端（daytona）
-    跳过危险命令审批。审批逻辑在 approval.check_dangerous_command()。
+    对齐 Hermes terminal_tool：进程 TERMINAL_ENV 为默认；会话可覆盖。
+    隔离后端（daytona）跳过危险命令审批。审批逻辑在 approval.check_dangerous_command()。
     client 供 APPROVAL_MODE=smart 时辅助 LLM 评估用。
     interrupt_event 置位时立即中断（本机杀进程树 / Daytona sandbox.stop）。
     返回 JSON：output / exit_code / error，Daytona 额外带 backend=daytona。
     """
-    env_type = environments.get_terminal_env()
+    env_type = resolve_session_terminal_env(session_key)
+    stored = load_session_terminal_env(session_key)
+    sandbox_id = (
+        environments.sandbox_task_id(session_key) if stored == "daytona" else None
+    )
     approval = check_dangerous_command(
         command, session_key, client=client, env_type=env_type
     )
@@ -1693,7 +1811,7 @@ def run_terminal(
                 ensure_ascii=False,
             )
         try:
-            env = environments.get_environment()
+            env = environments.get_environment(env_type=env_type, task_id=sandbox_id)
         except Exception as exc:
             return json.dumps(
                 {
@@ -1722,6 +1840,7 @@ def run_terminal(
                     command,
                     execute_fn=lambda: env.execute(command, timeout=timeout),
                     cancel_fn=env.cancel,
+                    owner_key=session_key,
                 ),
                 ensure_ascii=False,
             )
@@ -1745,7 +1864,10 @@ def run_terminal(
     # 后台模式：登记到 process_registry 立即返回 session_id，
     # 后续用 process 工具 poll/wait/kill 管理（对齐 Hermes terminal background=true）
     if background:
-        return json.dumps(process_registry.spawn(command), ensure_ascii=False)
+        return json.dumps(
+            process_registry.spawn(command, owner_key=session_key),
+            ensure_ascii=False,
+        )
 
     try:
         if interrupt_event is not None:
@@ -2129,7 +2251,9 @@ def run_agent_turn(
                 # 对齐 Hermes：压缩后重建系统提示词（刷新记忆快照/项目上下文/技能索引），
                 # 并同步持久化，供 --resume 恢复最新版本
                 if messages and messages[0].get("role") == "system":
-                    messages[0]["content"] = build_system_prompt(manager)
+                    messages[0]["content"] = build_system_prompt(
+                        manager, session_key=session_key
+                    )
                     save_session_prompt(session_key, messages[0]["content"])
 
         console.print(f"\n[bold blue]--- 第 {turn + 1} 轮：调用大模型 ---[/bold blue]")
@@ -2543,7 +2667,7 @@ def _slash_resume_text(arg: str, state: ReplState) -> str:
         return f"未找到会话 {target} 或它没有消息。"
     system_prompt = load_session_prompt(target)
     if system_prompt is None:
-        system_prompt = build_system_prompt(state.memory_manager)
+        system_prompt = build_system_prompt(state.memory_manager, session_key=target)
         save_session_prompt(target, system_prompt)
     state.messages = [{"role": "system", "content": system_prompt}] + history
     hydrate_todo_store(state.messages, target)
@@ -2682,7 +2806,7 @@ def main():
     # （对齐 Hermes 的 _restore_or_build_system_prompt：先查库，没有再构建）
     system_prompt = load_session_prompt(session_id) if resume_id else None
     if system_prompt is None:
-        system_prompt = build_system_prompt(memory_manager)
+        system_prompt = build_system_prompt(memory_manager, session_key=session_id)
         save_session_prompt(session_id, system_prompt)
     messages.insert(0, {"role": "system", "content": system_prompt})
 
